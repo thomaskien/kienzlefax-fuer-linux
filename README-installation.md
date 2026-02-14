@@ -185,6 +185,18 @@ CFG
 # kienzlefax shares anhängen (falls nicht schon da)
 grep -q '^\[pdf-zu-fax\]' "$SMB" || cat >> "$SMB" <<'CFG'
 
+[fax-eingang]
+   path = /var/spool/asterisk/fax
+   browseable = yes
+   writable = yes
+   read only = no
+   guest ok = yes
+   public = yes
+   create mask = 0777
+   directory mask = 0777
+   force user = nobody
+   force group = nogroup
+
 [pdf-zu-fax]
    path = /srv/kienzlefax/pdf-zu-fax
    browseable = yes
