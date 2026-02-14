@@ -1,7 +1,3 @@
-sudo bash -euxo pipefail <<'EOF'
-WORKER="/usr/local/bin/kienzlefax-worker.py"
-
-cat > "$WORKER" <<'PY'
 
 #!/usr/bin/env python3
 # kienzlefax-worker.py
@@ -672,7 +668,6 @@ if __name__ == "__main__":
         log("stopped by user")
         sys.exit(0)
 
-PY
 
 
 
