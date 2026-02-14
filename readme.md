@@ -568,6 +568,9 @@ faxstat -s || true
 EOF
 ```
 ### 9.2 Asterisk
+
+- vielleicht läuift das so,. ich musste kompilieren!!! siehe 9.3 bzw. separate datei!!
+
 ```bash
 sudo bash -euxo pipefail <<'EOF'
 apt-get update
@@ -576,6 +579,11 @@ systemctl enable --now asterisk
 systemctl status asterisk --no-pager
 EOF
 ```
+
+### 9.3. Astersik kompilieren
+
+siehe separate .md-datei!
+
 ## 10) Troubleshooting Quick Checks
 
 ### 10.1-4 logs
