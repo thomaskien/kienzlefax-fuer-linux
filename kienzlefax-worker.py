@@ -1,14 +1,11 @@
-
 #!/usr/bin/env python3
 # kienzlefax-worker.py
-# Version 1.2.1
+# Version 1.2.2
 #
-# Minimal changes vs 1.2:
-# - Cancel requests are now handled BOTH in processing/ and queue/
-#   * processing/: if jid exists -> faxrm, wait 3s, delete doneq/q<JID>, set cancel.handled_at
-#   * queue/:    no HylaFAX interaction; mark cancel.handled_at, restore PDF back to its source
-#               directory, then remove the queued jobdir.
-# - No other JSON/status/result behavior changed beyond setting cancel.handled_at (idempotency marker).
+# Change vs 1.2.1 (minimal, targeted fix):
+# - When cancelling a job in processing/, we DO NOT delete /var/spool/hylafax/doneq/q<JID>.
+#   Reason: finalize_job() requires q<JID> to generate report/merge and move the job out of processing/.
+# - Everything else remains unchanged. JSON is only modified to set cancel.handled_at (idempotency marker).
 
 import json
 import os
@@ -36,7 +33,6 @@ FAIL_OUT = BASE / "sendefehler" / "berichte"
 HYLAFAX_DONEQ = Path("/var/spool/hylafax/doneq")
 
 SEND_FAX_BIN = "sendfax"
-FAXSTAT_BIN = "faxstat"
 FAXRM_BIN = "faxrm"
 
 FAX_HOST = "localhost"
@@ -170,6 +166,7 @@ def parse_doneq_file(qfile: Path) -> DoneqInfo:
                 continue
             k, v = line.split(":", 1)
             raw[k.strip()] = v.strip()
+
     def geti(k: str) -> Optional[int]:
         v = raw.get(k)
         if v is None or v == "":
@@ -178,6 +175,7 @@ def parse_doneq_file(qfile: Path) -> DoneqInfo:
             return int(v)
         except:
             return None
+
     return DoneqInfo(
         statuscode=geti("statuscode"),
         npages=geti("npages"),
@@ -254,7 +252,7 @@ def build_report_pdf(job: Dict[str, Any], doneq: Optional[DoneqInfo], out_pdf: P
             pass
 
     c.setFont("Helvetica", 9)
-    c.drawString(50, 40, f"Erzeugt: {now_iso()}  |  kienzlefax-worker v1.2.1")
+    c.drawString(50, 40, f"Erzeugt: {now_iso()}  |  kienzlefax-worker v1.2.2")
     c.showPage()
     c.save()
 
@@ -354,15 +352,6 @@ def hylafax_cancel(jid: int) -> Tuple[int, str, str]:
     rc, so, se = run_cmd(cmd, env=env, timeout=FAXRM_TIMEOUT_SEC)
     return rc, so, se
 
-def delete_doneq_qfile(jid: int) -> None:
-    qfile = HYLAFAX_DONEQ / f"q{jid}"
-    if qfile.exists():
-        try:
-            qfile.unlink()
-            log(f"doneq cleaned: {qfile.name}")
-        except Exception as e:
-            log(f"doneq cleanup failed for {qfile.name}: {e}")
-
 def source_dir_from_src(src_key: str) -> Path:
     src_key = (src_key or "").strip()
     if re.fullmatch(r"fax[1-5]", src_key):
@@ -409,7 +398,6 @@ def handle_cancel_in_queue() -> None:
         if not cancel_requested(job) or cancel_handled(job):
             continue
 
-        # mark handled_at (only mutation)
         mark_cancel_handled(job)
         try:
             write_json(jp, job)
@@ -417,13 +405,11 @@ def handle_cancel_in_queue() -> None:
             log(f"queue-cancel: cannot write handled_at for {jdir.name}: {e}")
             continue
 
-        # restore pdf back to original source dir
         try:
             restore_doc_to_source(jdir, job)
         except Exception as e:
             log(f"queue-cancel: restore failed for {jdir.name}: {e}")
 
-        # remove queued jobdir
         shutil.rmtree(jdir, ignore_errors=True)
         log(f"queue-cancel: removed jobdir {jdir.name}")
 
@@ -448,7 +434,8 @@ def handle_cancel_in_processing(jdir: Path) -> None:
         except subprocess.TimeoutExpired:
             log(f"faxrm timeout for jid={jid}")
         time.sleep(CANCEL_POSTWAIT_SEC)
-        delete_doneq_qfile(int(jid))
+        # IMPORTANT (v1.2.2): DO NOT delete doneq/q<JID> here.
+        # finalize_job() relies on it to generate report/merge and move job out of processing/.
 
     mark_cancel_handled(job)
     try:
@@ -468,7 +455,6 @@ def submit_job(jobdir: Path) -> None:
 
     job = read_json(jp)
 
-    # cancel pre-submit: just mark handled; do not submit
     if cancel_requested(job) and not cancel_handled(job):
         log(f"cancel requested pre-submit: {job.get('job_id','')} -> not submitting")
         mark_cancel_handled(job)
@@ -535,6 +521,15 @@ def finalize_job(jobdir: Path) -> bool:
 
     qfile = HYLAFAX_DONEQ / f"q{jid}"
     if not qfile.exists():
+        # (kept unchanged) - optional timeout logging only
+        claimed_at = job.get("claimed_at") or job.get("submitted_at")
+        if claimed_at:
+            try:
+                s = datetime.fromisoformat(str(claimed_at).replace("Z", "+00:00"))
+                if (datetime.now(timezone.utc) - s).total_seconds() > FINALIZE_TIMEOUT_SEC:
+                    log(f"finalize: timeout waiting doneq for jid={jid} job={job.get('job_id','')}")
+            except Exception:
+                pass
         return False
 
     doneq = parse_doneq_file(qfile)
@@ -617,7 +612,6 @@ def step_processing() -> None:
             log(f"finalize exception {jdir.name}: {e}")
 
 def step_submit() -> None:
-    # NEW in 1.2.1: handle cancel requests still waiting in queue/
     handle_cancel_in_queue()
 
     inflight = count_inflight()
@@ -652,7 +646,7 @@ def step_submit() -> None:
 def main() -> None:
     ensure_dirs()
     acquire_lock()
-    log("started (v1.2.1)")
+    log("started (v1.2.2)")
     try:
         while True:
             step_processing()
@@ -667,10 +661,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log("stopped by user")
         sys.exit(0)
-
-
-
-
-
-
-
