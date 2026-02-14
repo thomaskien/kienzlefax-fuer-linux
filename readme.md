@@ -13,7 +13,7 @@
 - Separater Worker-Dienst (systemd, eigener User) sendet Jobs via HylaFAX (`sendfax`), erzeugt einen **PDF-Sendebericht**, merge’t ihn mit dem Dokument und legt Ergebnis in Archiv/Fehlerbereich ab.
 - **Archiv ist flach**, keine Unterverzeichnisse, **keine Redundanz**:
   - pro erfolgreichem Fax genau **2 Dateien**: `<...>__OK.pdf` und `<...>.json`.
-- Eingangsverzeichnis fax-eingang für den Import der Faxe ins PVS oder x.archiv oder was auch immer man benutzt.
+- Eingangsverzeichnis **fax-eingang** für den Import der Faxe ins PVS oder x.archiv oder was auch immer man benutzt.
 
 ---
 
