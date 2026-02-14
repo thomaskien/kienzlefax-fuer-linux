@@ -672,9 +672,7 @@ if __name__ == "__main__":
         log("stopped by user")
         sys.exit(0)
 
-
-
-EOF
+PY
 
 
 
