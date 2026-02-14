@@ -1,3 +1,36 @@
+# kienzlefax
+**der ideale Faxserver für die Arztpraxis**
+
+- läuft einfach in einer VM auf dem server
+- alles open source und unter linux
+- angebunden per SIP direkt an die eigene nummer
+- optimal für den workflow von arztpraxen
+- stabiler empfang und senden
+- voll anpassbar
+- papierfreies fax: ende der zettelwirtschaft
+- optimale lesbarkeit der wichtigen befunde da nicht z.B "mal wieder bei fast leerem toner ausgedruckt und anschließend gefaxt" wird
+- clients drucken einfach auf einem freigegebenen windows-drucker aus (geht von windows, linux, mac, ega)
+- separater faxdrucker für jeden arbeitsplatz
+
+**Einfach was ausdrucken auf einem der faxdrucker:**
+
+<img src="Screenshot 2026-02-14 at 11.57.13.png" alt="drawing" width="800"/>
+
+**Eine oder mehrere Dateien zum versenden auswählen:**
+
+<img src="Screenshot 2026-02-14 at 11.57.36.png" alt="drawing" width="800"/>
+
+**Faxe werden je datei einzeln abgeschickt, ggf mehrere an die selbe Nummer hintereinander:**
+<img src="Screenshot 2026-02-14 at 11.58.14.png" alt="drawing" width="800"/>
+
+**Sendeberichte:**
+
+<img src="Screenshot 2026-02-14 at 12.08.20.png" alt="drawing" width="800"/>
+
+
+
+
+
 # kienzlefax – Systemdesign (README.md)
 **Stand:** 2026-02-13  
 **Ziel:** Ubuntu LTS Fax-Workflow mit maximaler Robustheit (SMB→PDF→Web-UI→Queue→Worker→HylaFAX→Archiv/Fehler).
