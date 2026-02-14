@@ -24,7 +24,7 @@
 - debug-logs usw in einer der anderen dateien, da bekommt man alle infos wenn was nicht läuft
 
 
-**Vorbereitung des systems, anlage von ordnern und beispieldateien**
+## Vorbereitung des systems, anlage von ordnern und beispieldateien
 
 - config-dateien-bootstrap.sh laden und ausführen
 
