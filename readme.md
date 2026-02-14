@@ -471,4 +471,95 @@ CFG
 testparm -s
 systemctl restart smbd || systemctl restart samba
 EOF
+```
+
+## Drucker fax1..fax5 anlegen
+```bash
+sudo bash -euxo pipefail <<'EOF'
+systemctl restart cups
+sleep 1
+lpstat -r
+
+for i in 1 2 3 4 5; do
+  mkdir -p "/srv/kienzlefax/incoming/fax$i"
+done
+
+MODEL="drv:///sample.drv/generic.ppd"
+
+for i in 1 2 3 4 5; do
+  PRN="fax$i"
+  lpadmin -x "$PRN" 2>/dev/null || true
+  lpadmin -p "$PRN" -E -v "kienzlefaxpdf:/$PRN" -m "$MODEL"
+  lpadmin -p "$PRN" -o printer-is-shared=true
+  cupsenable "$PRN"
+  cupsaccept "$PRN"
+done
+
+systemctl restart cups
+sleep 1
+lpstat -p
+lpstat -v | sed -n '1,120p'
+
+lp -d fax1 /etc/hosts
+sleep 3
+ls -la /srv/kienzlefax/incoming/fax1 | tail -n 10
+EOF
+```
+
+---
+
+## 8) Web-UI & Worker installieren
+> Diese beiden Artefakte wurden separat erstellt:
+- `/var/www/html/kienzlefax.php`
+- `/usr/local/bin/kienzlefax-worker.py` + systemd service
+
+Die Installation erfolgt jeweils als pastebarer Block aus den entsprechenden Artefakten.
+
+## 9) HylaFAX & Asterisk – notwendige Pakete (Basis)
+
+### 9.1 HylaFAX
+```bash
+sudo bash -euxo pipefail <<'EOF'
+apt-get update
+apt-get install -y \
+  hylafax-server \
+  hylafax-client \
+  faxstat \
+  lsof
+
+systemctl enable --now hylafax || true
+systemctl enable --now hylafax-server || true
+
+systemctl status hylafax* --no-pager || true
+faxstat -s || true
+EOF
+```
+### 9.2 Asterisk
+```bash
+sudo bash -euxo pipefail <<'EOF'
+apt-get update
+apt-get install -y asterisk
+systemctl enable --now asterisk
+systemctl status asterisk --no-pager
+EOF
+```
+## 10) Troubleshooting Quick Checks
+
+### 10.1-4 logs
+```bash
+CUPS Backend Log
+sudo tail -n 200 /var/log/kienzlefaxpdf-backend.log
+
+CUPS error_log
+sudo tail -n 200 /var/log/cups/error_log
+
+Worker Log
+sudo journalctl -u kienzlefax-worker -n 200 --no-pager
+
+HylaFAX Status
+faxstat -s
+
+```
+
+
 
