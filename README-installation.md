@@ -290,7 +290,8 @@ EOF
 ```
 ### 9.2 Asterisk
 
-- vielleicht läuift das so,. ich musste kompilieren!!! siehe 9.3 bzw. separate datei!!
+- vielleicht läuift das bei irgendwem auch so ich musste kompilieren!!! siehe 9.3 bzw. separate datei!!
+- für den empfang brauch man unbedringt zwei spezifische asterisk-module:
 
 ```bash
 sudo bash -euxo pipefail <<'EOF'
@@ -301,9 +302,141 @@ systemctl status asterisk --no-pager
 EOF
 ```
 
+prüfen auf die module:
+
+```bash
+asterisk -rvvv
+fax*CLI> module show like fax
+Module                         Description                              Use Count  Status      Support Level
+res_fax.so                     Generic FAX Applications                 1          Running              core
+res_fax_spandsp.so             Spandsp G.711 and T.38 FAX Technologies  0          Running          extended
+2 modules loaded
+fax*CLI> 
+```
+braucht man beide, geht sonst nicht.
+
 ### 9.3. Astersik kompilieren
 
 siehe separate .md-datei!
+
+
+### 9.4 Worker -service installieren
+
+- worker selbt siehe nochmal separate datei, das bitte zuerst machen!
+
+```bash
+sudo bash -euxo pipefail <<'EOF'
+# ==========================================
+# kienzlefax – Worker systemd Service Setup
+# (Worker-Skript wird separat installiert)
+# ==========================================
+
+# 1) Basis: User/Group anlegen (falls nicht vorhanden)
+getent group kienzlefax >/dev/null || groupadd --system kienzlefax
+
+if ! id faxworker >/dev/null 2>&1; then
+  useradd --system --home /var/lib/faxworker --create-home --shell /usr/sbin/nologin faxworker
+fi
+
+# In Gruppe aufnehmen (für /srv/kienzlefax/* Rechte)
+usermod -aG kienzlefax faxworker
+
+# 2) Verzeichnisse sicherstellen (Fresh system)
+mkdir -p /srv/kienzlefax/{staging,queue,processing,sendeberichte}
+mkdir -p /srv/kienzlefax/sendefehler/{eingang,berichte}
+
+# 3) Rechte: Gruppe + setgid + ACL Defaults (robust)
+apt-get update
+apt-get install -y acl
+
+chgrp -R kienzlefax /srv/kienzlefax
+find /srv/kienzlefax -type d -exec chmod 2775 {} \;
+find /srv/kienzlefax -type f -exec chmod 0664 {} \;
+
+setfacl -R -m g:kienzlefax:rwx /srv/kienzlefax
+setfacl -R -d -m g:kienzlefax:rwx /srv/kienzlefax
+setfacl -R -d -m u::rwx /srv/kienzlefax
+setfacl -R -d -m o::rx  /srv/kienzlefax
+
+# 4) Abhängigkeiten für Worker (Report+Merge)
+# - reportlab: PDF-Report
+# - qpdf: merge report+doc
+# - hylafax-client: sendfax
+apt-get install -y python3 python3-reportlab qpdf hylafax-client
+
+# Optional: falls dein Header-Skript Tools braucht, hier ergänzen (bewusst leer)
+
+# 5) Worker-Pfad prüfen (Skript kommt separat!)
+WORKER=/usr/local/bin/kienzlefax-worker.py
+if [ ! -x "$WORKER" ]; then
+  echo "HINWEIS: $WORKER fehlt oder ist nicht ausführbar."
+  echo "Bitte zuerst das Worker-Skript nach $WORKER installieren und chmod +x setzen."
+fi
+
+# 6) systemd Service-Datei schreiben
+cat > /etc/systemd/system/kienzlefax-worker.service <<'UNIT'
+[Unit]
+Description=kienzlefax worker (HylaFAX sendfax consumer)
+After=network-online.target
+Wants=network-online.target
+
+# HylaFAX muss nicht zwingend ein systemd-Unit-Name sein, daher kein hartes Requires=
+# Wenn HylaFAX später aktiv ist, sendfax funktioniert dann.
+
+[Service]
+Type=simple
+User=faxworker
+Group=kienzlefax
+
+# WICHTIG: Worker braucht Schreibrechte in /srv/kienzlefax/*, doneq wird nur gelesen.
+WorkingDirectory=/srv/kienzlefax
+
+# Umgebungsvariablen (kannst du später erweitern)
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=UTC
+
+ExecStart=/usr/bin/python3 /usr/local/bin/kienzlefax-worker.py
+
+# Robustheit
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=30
+StartLimitBurst=50
+
+# Hardening (pragmatisch, aber nicht zu hart, damit /var/spool/hylafax gelesen werden kann)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/srv/kienzlefax
+# doneq ist read-only, muss aber erreichbar sein:
+ReadOnlyPaths=/var/spool/hylafax
+
+# Logs: in journald
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# 7) systemd neu laden + aktivieren
+systemctl daemon-reload
+systemctl enable kienzlefax-worker.service
+
+# 8) Starten (falls Worker noch fehlt, wird das hier natürlich fehlschlagen – dann später erneut starten)
+systemctl restart kienzlefax-worker.service || true
+
+echo
+echo "== Status =="
+systemctl status kienzlefax-worker.service --no-pager || true
+
+echo
+echo "== Live-Log (Ctrl+C beendet) =="
+journalctl -u kienzlefax-worker -f
+EOF
+
+```
 
 ## 10) Troubleshooting Quick Checks
 
@@ -322,6 +455,9 @@ HylaFAX Status
 faxstat -s
 
 ```
+
+
+
 
 
 
