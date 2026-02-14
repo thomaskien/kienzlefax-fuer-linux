@@ -11,6 +11,7 @@
 - optimale lesbarkeit der wichtigen befunde da nicht z.B "mal wieder bei fast leerem toner ausgedruckt und anschließend gefaxt" wird
 - clients drucken einfach auf einem freigegebenen windows-drucker aus (geht von windows, linux, mac, ega)
 - separater faxdrucker für jeden arbeitsplatz
+- wenn der server läuft absichern nicht vergessen: sichere passwörter, ssh-mit key usw
 
 **Einfach was ausdrucken auf einem der faxdrucker:**
 
