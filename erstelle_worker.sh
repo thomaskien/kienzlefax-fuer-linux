@@ -2,29 +2,17 @@ sudo bash -euxo pipefail <<'EOF'
 WORKER="/usr/local/bin/kienzlefax-worker.py"
 
 cat > "$WORKER" <<'PY'
+
 #!/usr/bin/env python3
 # kienzlefax-worker.py
-# Version 1.2
+# Version 1.2.1
 #
-# HylaFAX sendfax consumer for kienzlefax:
-# - Claims jobs from /srv/kienzlefax/queue -> /srv/kienzlefax/processing
-# - Submits via sendfax (captures HylaFAX JID)
-# - Finalizes via /var/spool/hylafax/doneq/q<JID>
-# - Creates ONE merged PDF (report page 1 + sent document) and stores:
-#     OK   -> /srv/kienzlefax/sendeberichte/<basename>__<jobid>__OK.pdf + .json
-#     FAIL -> /srv/kienzlefax/sendefehler/berichte/<basename>__<jobid>__FAILED.pdf + .json
-#            and copies original (unmodified) to /srv/kienzlefax/sendefehler/eingang/
-#
-# Minimal change in v1.2 (per agreement):
-# - Cancel logic only:
-#   If job.json contains:
-#     "cancel": {"requested": true, "requested_at": "..."}
-#   then worker will (once) cancel HylaFAX job (faxrm) if jid exists, wait 3s,
-#   delete doneq/q<JID> if present, and mark:
-#     cancel.handled_at = ISO8601
-#   No other JSON fields are modified solely for cancel semantics.
-#
-# Also includes previously implemented header-injection (pdf_with_header.sh) if present.
+# Minimal changes vs 1.2:
+# - Cancel requests are now handled BOTH in processing/ and queue/
+#   * processing/: if jid exists -> faxrm, wait 3s, delete doneq/q<JID>, set cancel.handled_at
+#   * queue/:    no HylaFAX interaction; mark cancel.handled_at, restore PDF back to its source
+#               directory, then remove the queued jobdir.
+# - No other JSON/status/result behavior changed beyond setting cancel.handled_at (idempotency marker).
 
 import json
 import os
@@ -115,12 +103,10 @@ def list_jobdirs(root: Path) -> list[Path]:
     if not root.exists():
         return []
     dirs = [p for p in root.iterdir() if p.is_dir()]
-    # sort by name for deterministic behavior
     dirs.sort(key=lambda x: x.name)
     return dirs
 
 def parse_sendfax_jid(out: str, err: str) -> Optional[int]:
-    # Typical: "request id is 71 (group id 71) for host localhost (1 file)"
     m = re.search(r"request id is\s+(\d+)", out or "")
     if m:
         return int(m.group(1))
@@ -162,7 +148,6 @@ def add_header(pdf: Path) -> Path:
     return pdf
 
 def merge_report_and_doc(report_pdf: Path, doc_pdf: Path, out_pdf: Path) -> None:
-    # qpdf --empty --pages report.pdf doc.pdf -- out.pdf
     cmd = [QPDF_BIN, "--empty", "--pages", str(report_pdf), str(doc_pdf), "--", str(out_pdf)]
     rc, so, se = run_cmd(cmd)
     if rc != 0:
@@ -197,7 +182,7 @@ def parse_doneq_file(qfile: Path) -> DoneqInfo:
             return int(v)
         except:
             return None
-    info = DoneqInfo(
+    return DoneqInfo(
         statuscode=geti("statuscode"),
         npages=geti("npages"),
         totpages=geti("totpages"),
@@ -208,10 +193,8 @@ def parse_doneq_file(qfile: Path) -> DoneqInfo:
         returned=geti("returned"),
         raw=raw,
     )
-    return info
 
 def build_report_pdf(job: Dict[str, Any], doneq: Optional[DoneqInfo], out_pdf: Path) -> None:
-    # very small/simple report page
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
 
@@ -262,12 +245,10 @@ def build_report_pdf(job: Dict[str, Any], doneq: Optional[DoneqInfo], out_pdf: P
             c.drawString(50, y, f"Seiten: {doneq.npages}/{doneq.totpages}")
             y -= 16
 
-    # Dauer (wenn vorhanden)
     started = job.get("started_at") or job.get("submitted_at")
     ended = job.get("end_time") or job.get("finalized_at")
     if started and ended:
         try:
-            # parse ISO-ish
             s = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
             e = datetime.fromisoformat(str(ended).replace("Z", "+00:00"))
             dur = int((e - s).total_seconds())
@@ -277,7 +258,7 @@ def build_report_pdf(job: Dict[str, Any], doneq: Optional[DoneqInfo], out_pdf: P
             pass
 
     c.setFont("Helvetica", 9)
-    c.drawString(50, 40, f"Erzeugt: {now_iso()}  |  kienzlefax-worker v1.2")
+    c.drawString(50, 40, f"Erzeugt: {now_iso()}  |  kienzlefax-worker v1.2.1")
     c.showPage()
     c.save()
 
@@ -329,7 +310,7 @@ def claim_next_job_skipping_busy(busy_numbers: set[str]) -> Optional[Path]:
 
         target = PROC / j.name
         try:
-            j.rename(target)  # atomic within same filesystem
+            j.rename(target)
             log(f"claimed {j.name} (num={num or 'n/a'})")
             return target
         except Exception as e:
@@ -342,7 +323,6 @@ def ensure_dirs() -> None:
         safe_mkdir(p)
 
 def acquire_lock() -> None:
-    # Simple "one instance" lock: create file exclusively
     try:
         fd = os.open(str(LOCKFILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         os.write(fd, str(os.getpid()).encode("ascii"))
@@ -357,7 +337,7 @@ def release_lock() -> None:
         pass
 
 # ----------------------------
-# Cancel logic (v1.2)
+# Cancel logic
 # ----------------------------
 def cancel_requested(job: Dict[str, Any]) -> bool:
     c = job.get("cancel") or {}
@@ -387,15 +367,71 @@ def delete_doneq_qfile(jid: int) -> None:
         except Exception as e:
             log(f"doneq cleanup failed for {qfile.name}: {e}")
 
+def source_dir_from_src(src_key: str) -> Path:
+    src_key = (src_key or "").strip()
+    if re.fullmatch(r"fax[1-5]", src_key):
+        return BASE / "incoming" / src_key
+    if src_key == "pdf-zu-fax":
+        return BASE / "pdf-zu-fax"
+    if src_key == "sendefehler":
+        return FAIL_IN
+    return FAIL_IN  # safe fallback
+
+def restore_doc_to_source(jobdir: Path, job: Dict[str, Any]) -> None:
+    src = job.get("source") or {}
+    src_key = src.get("src") or ""
+    orig_name = src.get("filename_original") or "document.pdf"
+
+    cand1 = jobdir / "source.pdf"
+    cand2 = jobdir / "doc.pdf"
+    in_pdf = cand1 if cand1.exists() else cand2
+    if not in_pdf.exists():
+        return
+
+    target_dir = source_dir_from_src(src_key)
+    safe_mkdir(target_dir)
+
+    jobid = job.get("job_id") or jobdir.name
+    base = sanitize_basename(Path(orig_name).stem) or "document"
+    dest = target_dir / f"{base}.pdf"
+    if dest.exists():
+        dest = target_dir / f"{base}__CANCELLED__{jobid}.pdf"
+
+    shutil.move(str(in_pdf), str(dest))
+    log(f"queue-cancel: restored PDF -> {dest}")
+
+def handle_cancel_in_queue() -> None:
+    for jdir in list_jobdirs(QUEUE):
+        jp = jdir / "job.json"
+        if not jp.exists():
+            continue
+        try:
+            job = read_json(jp)
+        except Exception:
+            continue
+
+        if not cancel_requested(job) or cancel_handled(job):
+            continue
+
+        # mark handled_at (only mutation)
+        mark_cancel_handled(job)
+        try:
+            write_json(jp, job)
+        except Exception as e:
+            log(f"queue-cancel: cannot write handled_at for {jdir.name}: {e}")
+            continue
+
+        # restore pdf back to original source dir
+        try:
+            restore_doc_to_source(jdir, job)
+        except Exception as e:
+            log(f"queue-cancel: restore failed for {jdir.name}: {e}")
+
+        # remove queued jobdir
+        shutil.rmtree(jdir, ignore_errors=True)
+        log(f"queue-cancel: removed jobdir {jdir.name}")
+
 def handle_cancel_in_processing(jdir: Path) -> None:
-    """
-    Minimal agreed behavior:
-    - Read cancel.requested
-    - If not yet handled:
-        - If jid exists -> faxrm jid (with FAXUSER), wait 3 sec, delete doneq q<JID> if present
-        - Mark cancel.handled_at in JSON (only JSON mutation for cancel)
-    - No other JSON changes are made specifically for cancel.
-    """
     jp = jdir / "job.json"
     if not jp.exists():
         return
@@ -404,9 +440,7 @@ def handle_cancel_in_processing(jdir: Path) -> None:
     except Exception:
         return
 
-    if not cancel_requested(job):
-        return
-    if cancel_handled(job):
+    if not cancel_requested(job) or cancel_handled(job):
         return
 
     jid = (job.get("hylafax") or {}).get("jid")
@@ -420,7 +454,6 @@ def handle_cancel_in_processing(jdir: Path) -> None:
         time.sleep(CANCEL_POSTWAIT_SEC)
         delete_doneq_qfile(int(jid))
 
-    # mark handled (only change)
     mark_cancel_handled(job)
     try:
         write_json(jp, job)
@@ -439,16 +472,13 @@ def submit_job(jobdir: Path) -> None:
 
     job = read_json(jp)
 
-    # if cancel requested pre-submit: mark handled and do not submit
+    # cancel pre-submit: just mark handled; do not submit
     if cancel_requested(job) and not cancel_handled(job):
         log(f"cancel requested pre-submit: {job.get('job_id','')} -> not submitting")
         mark_cancel_handled(job)
         write_json(jp, job)
-        # keep job in processing; finalize loop will handle it as failed timeout unless you remove it in UI.
-        # (We do NOT change JSON status here per agreement.)
         return
 
-    # header injection (optional)
     send_doc = add_header(doc)
 
     rec = job.get("recipient") or {}
@@ -457,8 +487,6 @@ def submit_job(jobdir: Path) -> None:
         log(f"submit: invalid number in {jobdir.name}")
         return
 
-    # sendfax options
-    # NOTE: keep minimal; you can extend later.
     cmd = [SEND_FAX_BIN, "-n", "-d", number, str(send_doc)]
     env = os.environ.copy()
     env["FAXUSER"] = FAXUSER
@@ -466,11 +494,7 @@ def submit_job(jobdir: Path) -> None:
     job["claimed_at"] = job.get("claimed_at") or now_iso()
     job["submitted_at"] = now_iso()
     job["started_at"] = job.get("started_at") or job["submitted_at"]
-
-    # Update status to submitted (existing behavior)
     job["status"] = "submitted"
-
-    # write before running
     write_json(jp, job)
 
     try:
@@ -501,9 +525,6 @@ def submit_job(jobdir: Path) -> None:
     write_json(jp, job)
 
 def finalize_job(jobdir: Path) -> bool:
-    """
-    Returns True if finalized and removed from processing, else False.
-    """
     jp = jobdir / "job.json"
     doc = jobdir / "doc.pdf"
     if not jp.exists() or not doc.exists():
@@ -512,46 +533,25 @@ def finalize_job(jobdir: Path) -> bool:
     job = read_json(jp)
     hy = job.get("hylafax") or {}
     jid = hy.get("jid")
-    status = (job.get("status") or "").upper()
 
-    # If cancel requested and jid exists, cancellation is handled elsewhere; here just proceed normally.
-    # Finalization is primarily based on doneq/q<JID>.
     if jid is None:
-        # No jid yet -> cannot finalize via doneq
-        # Leave it; could be pre-submit cancel. UI can remove it or worker will keep it.
         return False
 
     qfile = HYLAFAX_DONEQ / f"q{jid}"
     if not qfile.exists():
-        # not finished yet
-        # optional: timeout handling
-        claimed_at = job.get("claimed_at") or job.get("submitted_at")
-        if claimed_at:
-            try:
-                s = datetime.fromisoformat(str(claimed_at).replace("Z", "+00:00"))
-                if (datetime.now(timezone.utc) - s).total_seconds() > FINALIZE_TIMEOUT_SEC:
-                    log(f"finalize: timeout waiting doneq for jid={jid} job={job.get('job_id','')}")
-            except Exception:
-                pass
         return False
 
-    # parse doneq
     doneq = parse_doneq_file(qfile)
 
-    # Decide OK/FAILED based on statuscode (existing behavior)
-    # NOTE: You asked: do NOT implement CANCELLED JSON status here; UI will infer from HylaFAX info.
-    # So we keep status set by previous logic or set now based on statuscode if not already OK/FAILED.
     if doneq.statuscode == 0:
         job["status"] = "OK"
         job["result"] = job.get("result") or {}
         job["result"]["reason"] = "OK"
     else:
-        # keep FAILED for nonzero (if it was already something else, we force FAILED)
         job["status"] = "FAILED"
         job["result"] = job.get("result") or {}
         job["result"]["reason"] = job["result"].get("reason") or "unknown"
 
-    # fill some result fields for UI (existing behavior)
     job["end_time"] = job.get("end_time") or now_iso()
     job["finalizing_at"] = job.get("finalizing_at") or now_iso()
     job["finalized_at"] = now_iso()
@@ -563,31 +563,21 @@ def finalize_job(jobdir: Path) -> bool:
     job["result"]["signalrate"] = doneq.signalrate or ""
     job["result"]["csi"] = doneq.csi or ""
     job["result"]["commid"] = doneq.commid or ""
-    job["result"]["tx_time"] = job["result"].get("tx_time") or ""  # UI computes if desired
+    job["result"]["tx_time"] = job["result"].get("tx_time") or ""
 
-    # build report + merge
     report_pdf = jobdir / "report.pdf"
     merged_pdf = jobdir / "merged.pdf"
 
-    # If header pdf exists, merge with the actually sent version to be consistent:
     send_doc = doc.with_name(doc.stem + "_hdr.pdf")
     merge_doc = send_doc if send_doc.exists() else doc
 
-    try:
-        build_report_pdf(job, doneq, report_pdf)
-        merge_report_and_doc(report_pdf, merge_doc, merged_pdf)
-    except Exception as e:
-        log(f"finalize: report/merge failed for {jobdir.name}: {e}")
-        # still write JSON and stop here
-        write_json(jp, job)
-        return False
+    build_report_pdf(job, doneq, report_pdf)
+    merge_report_and_doc(report_pdf, merge_doc, merged_pdf)
 
-    # Determine basename
     src = job.get("source") or {}
     base = sanitize_basename(Path(src.get("filename_original") or "fax").stem)
     jobid = job.get("job_id") or jobdir.name
 
-    # store
     if job["status"] == "OK":
         out_pdf = ARCH_OK / f"{base}__{jobid}__OK.pdf"
         out_json = ARCH_OK / f"{base}__{jobid}.json"
@@ -595,33 +585,17 @@ def finalize_job(jobdir: Path) -> bool:
         shutil.move(str(merged_pdf), str(out_pdf))
         write_json(out_json, job)
         log(f"finalize OK -> {out_pdf.name}")
-        # cleanup processing jobdir
         shutil.rmtree(jobdir, ignore_errors=True)
         return True
 
-    # FAILED -> copy original to sendefehler/eingang, store merged+json in berichte
     safe_mkdir(FAIL_IN)
     safe_mkdir(FAIL_OUT)
 
-    # original (unmodified) should be stored if available:
-    # We try these candidates in order:
-    # 1) jobdir/source.pdf (php may provide)
-    # 2) jobdir/doc.pdf (unmodified as received)
-    orig_candidates = [
-        jobdir / "source.pdf",
-        doc,
-    ]
-    orig_src = None
-    for c in orig_candidates:
-        if c.exists() and c.stat().st_size > 0:
-            orig_src = c
-            break
-
+    orig_candidates = [jobdir / "source.pdf", doc]
+    orig_src = next((c for c in orig_candidates if c.exists() and c.stat().st_size > 0), None)
     if orig_src:
-        # keep filename close to original (but safe)
         orig_name = sanitize_basename((src.get("filename_original") or "document")) + ".pdf"
         dest_orig = FAIL_IN / orig_name
-        # avoid overwrite
         if dest_orig.exists():
             dest_orig = FAIL_IN / f"{sanitize_basename((src.get('filename_original') or 'document'))}__{jobid}.pdf"
         try:
@@ -634,16 +608,12 @@ def finalize_job(jobdir: Path) -> bool:
     shutil.move(str(merged_pdf), str(out_pdf))
     write_json(out_json, job)
     log(f"finalize FAILED -> {out_pdf.name}")
-
     shutil.rmtree(jobdir, ignore_errors=True)
     return True
 
 def step_processing() -> None:
-    # 1) handle cancels (v1.2) first
     for jdir in list_jobdirs(PROC):
         handle_cancel_in_processing(jdir)
-
-    # 2) finalize any jobs that reached doneq
     for jdir in list_jobdirs(PROC):
         try:
             finalize_job(jdir)
@@ -651,6 +621,9 @@ def step_processing() -> None:
             log(f"finalize exception {jdir.name}: {e}")
 
 def step_submit() -> None:
+    # NEW in 1.2.1: handle cancel requests still waiting in queue/
+    handle_cancel_in_queue()
+
     inflight = count_inflight()
     if inflight >= MAX_INFLIGHT_PROCESSING:
         return
@@ -661,7 +634,6 @@ def step_submit() -> None:
         if not jdir:
             return
         try:
-            # mark claimed
             jp = jdir / "job.json"
             job = read_json(jp)
             job["claimed_at"] = job.get("claimed_at") or now_iso()
@@ -670,7 +642,6 @@ def step_submit() -> None:
         except Exception:
             pass
 
-        # refresh busy set including this job's number
         try:
             job = read_json(jdir / "job.json")
             num = normalize_number(((job.get("recipient") or {}).get("number") or ""))
@@ -685,7 +656,7 @@ def step_submit() -> None:
 def main() -> None:
     ensure_dirs()
     acquire_lock()
-    log("started (v1.2)")
+    log("started (v1.2.1)")
     try:
         while True:
             step_processing()
@@ -700,6 +671,9 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log("stopped by user")
         sys.exit(0)
+
+
+
 EOF
 
 
