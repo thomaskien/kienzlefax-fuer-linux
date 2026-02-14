@@ -3,14 +3,46 @@
  * kienzlefax.php
  * Producer Web-UI (sendet NICHT selbst).
  *
- * Stand: 2026-02-13
+ * Version: 1.2.1
+ * Author: Dr. Thomas Kienzle
+ * Stand: 2026-02-14
  *
- * Fixes/Änderungen:
- * - Bugfix: "Speichern im Telefonbuch" verursachte 500 (kaputter Restcode entfernt).
- * - Telefonbuch: Speichern im Editor funktioniert (sofern DB/Dir-Rechte korrekt).
- * - UI: mehr Abstand zwischen Empfängername/Faxnummer.
- * - Beauftragen: Original-PDF wird in queue/<jobid>/source.pdf verschoben (Quelle ist danach leer).
- * - Fehlerfälle erneut senden: weiterhin über Quelle "sendefehler" möglich; Fehlerberichte-View enthält Shortcut.
+ * Changelog (komplett):
+ * - 1.2.1 (2026-02-14):
+ *   - FIX: Robustere Erkennung "⛔ Abgebrochen" in Fehlerberichte UND Sendeprotokoll:
+ *          • cancel.requested=true UND cancel.handled_at vorhanden -> Abgebrochen
+ *          • ODER result.reason/status_text enthält "aborted"
+ *          • ODER statuscode==345 in Kombination mit cancel.requested
+ *   - FIX: Formfelder nutzen box-sizing:border-box (Faxnummer läuft nicht mehr über Begrenzung).
+ *   - UI: Abbruch-Button bei aktiven Jobs nun dezenter Icon-Button (kein großes rotes Feld).
+ *
+ * - 1.2 (2026-02-14):
+ *   - UI: Version + Autor als Footer unten mittig (nicht mehr im Header).
+ *   - UI: Empfänger-Layout korrigiert: deutlich mehr Abstand Name↔Fax, Gesamtbreite reduziert, Empfängernamefeld kürzer.
+ *   - UI: "Fax beauftragen" wieder auf Höhe des Auflösungs-Dropdowns (bündig).
+ *   - UI: PDF-Button in Dateiliste: Text nur "löschen" (Funktion unverändert).
+ *   - UI: PDF-Dateiliste zeigt zusätzlich Dateigröße (KB/MB).
+ *   - UI: Aktive Jobs können abgebrochen werden (⛔-Button je Job, mit Rückfrage).
+ *   - JSON: Abbruch setzt in job.json: cancel.requested=true + cancel.requested_at=ISO8601 (kein Statuswechsel; Worker übernimmt).
+ *   - UI: Status-Anzeige "⛔ Abgebrochen" (statt "Fehlgeschlagen") in Fehlerberichte UND Sendeprotokoll,
+ *         wenn JSON result.reason/status_text "aborted" enthält (z.B. "Job aborted by request").
+ *   - UI: Fehlerberichte-Tab pulsiert weiterhin deutlich, wenn Fehler vorhanden (unverändert – nur beibehalten).
+ *
+ * - 1.1 (2026-02-14):
+ *   - UI: Subtitle ersetzt durch "Der ideale Server für Arztpraxen".
+ *   - UI: "Bitte wählen:" über der Ordnerauswahl.
+ *   - UI: Refresh-Button in der Kopfzeile.
+ *   - UI: PDF-Auswahl: Button zum Löschen ausgewählter PDFs (Quelle) hinzugefügt.
+ *   - UI: Sendeprotokoll: Option "alle anzeigen" (aus Performancegründen gecappt).
+ *   - UI: Fehlerberichte: Checkboxen + Aktionen "Ausgewählte löschen" und "Fehler in Sendeprotokoll übernehmen".
+ *   - UI: Tab "Fehlerberichte" pulsiert deutlich, wenn Fehler vorhanden sind.
+ *
+ * - 1.0 (2026-02-13):
+ *   - Bugfix: "Speichern im Telefonbuch" verursachte 500 (kaputter Restcode entfernt).
+ *   - Telefonbuch: Speichern im Editor funktioniert (sofern DB/Dir-Rechte korrekt).
+ *   - UI: mehr Abstand zwischen Empfängername/Faxnummer.
+ *   - Beauftragen: Original-PDF wird in queue/<jobid>/source.pdf verschoben (Quelle ist danach leer).
+ *   - Fehlerfälle erneut senden: weiterhin über Quelle "sendefehler" möglich; Fehlerberichte-View enthält Shortcut.
  */
 
 declare(strict_types=1);
@@ -51,7 +83,9 @@ $MAX_ACTIVE_JOBS  = 12;
 $MAX_FAIL_LIST    = 200;
 $MAX_ARCHIVE_LIST = 25;
 
-$APP_TITLE = 'kienzlefax';
+$APP_TITLE   = 'kienzlefax';
+$APP_VERSION = '1.2.1';
+$APP_AUTHOR  = 'Dr. Thomas Kienzle';
 
 // -------------------- Helpers --------------------
 function h(string $s): string { return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
@@ -223,6 +257,75 @@ function format_duration(?int $sec): string {
   $s = $sec % 60;
   if ($m <= 0) return $s . ' s';
   return $m . ' min ' . $s . ' s';
+}
+
+function count_json_files(string $dir, int $cap = 999): int {
+  $n = 0;
+  if (!is_dir($dir)) return 0;
+  $dh = opendir($dir);
+  if ($dh === false) return 0;
+  while (($e = readdir($dh)) !== false) {
+    if (!preg_match('/\.json\z/i', $e)) continue;
+    $p = $dir . '/' . $e;
+    if (!is_file($p)) continue;
+    $n++;
+    if ($n >= $cap) break;
+  }
+  closedir($dh);
+  return $n;
+}
+
+function validate_job_id(string $id): bool {
+  return (bool)preg_match('/\AJOB-\d{8}-\d{6}-[a-z0-9]{6}\z/', $id);
+}
+
+function read_json_file(string $path): ?array {
+  if (!is_file($path)) return null;
+  $raw = @file_get_contents($path);
+  if ($raw === false) return null;
+  $j = json_decode($raw, true);
+  return is_array($j) ? $j : null;
+}
+
+/**
+ * 1.2.1: Abbruch robust erkennen:
+ * - cancel.requested && cancel.handled_at
+ * - oder "aborted" in result.reason/status_text
+ * - oder statuscode==345 && cancel.requested
+ */
+function is_aborted_job(array $j): bool {
+  if (isset($j['cancel']) && is_array($j['cancel'])) {
+    $req = (bool)($j['cancel']['requested'] ?? false);
+    $handledAt = (string)($j['cancel']['handled_at'] ?? '');
+    if ($req && $handledAt !== '') return true;
+  }
+
+  $reason = '';
+  $text = '';
+  if (isset($j['result']) && is_array($j['result'])) {
+    $reason = (string)($j['result']['reason'] ?? '');
+    $text   = (string)($j['result']['status_text'] ?? '');
+  }
+  if (stripos($reason, 'aborted') !== false) return true;
+  if (stripos($text, 'aborted') !== false) return true;
+
+  $code = null;
+  if (isset($j['result']) && is_array($j['result']) && isset($j['result']['statuscode'])) {
+    $code = (int)$j['result']['statuscode'];
+  }
+  $req2 = (bool)($j['cancel']['requested'] ?? false);
+  if ($req2 && $code === 345) return true;
+
+  return false;
+}
+
+function format_size(?int $bytes): string {
+  if ($bytes === null || $bytes < 0) return '—';
+  if ($bytes < 1024) return $bytes . ' B';
+  $kb = $bytes / 1024;
+  if ($kb < 1024) return (string)round($kb) . ' KB';
+  $mb = $kb / 1024;
+  return number_format($mb, 1, '.', '') . ' MB';
 }
 
 // -------------------- Grundvalidierung --------------------
@@ -407,7 +510,6 @@ if ($action === 'create_jobs') {
         $created++;
 
         // 3) Quelle soll verschwinden: Original in queue/<jobid>/source.pdf verschieben (rename)
-        //    (wenn das fehlschlägt, ist der Job trotzdem erstellt; Quelle bleibt dann ausnahmsweise liegen)
         $destSource = $jobQueueDir . '/source.pdf';
         if (!file_exists($destSource)) {
           if (@rename($srcPath, $destSource)) {
@@ -474,6 +576,139 @@ if ($action === 'pb_delete') {
   }
 }
 
+if ($action === 'delete_source_files') {
+  $src = (string)($_POST['src'] ?? '');
+  $selected = $_POST['files'] ?? [];
+  if (!is_array($selected)) $selected = [];
+
+  if (!isset($ALLOW_SOURCES[$src])) {
+    add_err("Ungültige Quelle.");
+  } else {
+    $srcDir = $ALLOW_SOURCES[$src];
+    $deleted = 0;
+    foreach ($selected as $fn) {
+      $fn = (string)$fn;
+      if (!filename_is_sendable_pdf($fn, $EXCLUDE_SUFFIXES, $EXCLUDE_CONTAINS)) continue;
+      $path = $srcDir . '/' . $fn;
+      if (!within_dir($path, $srcDir)) continue;
+      if (!is_file($path)) continue;
+      if (@unlink($path)) $deleted++;
+    }
+    if ($deleted > 0) add_ok("🗑️ Gelöscht: $deleted Datei(en) aus Quelle " . $src . ".");
+    else add_err("Keine Dateien gelöscht (keine Auswahl / keine Rechte).");
+  }
+}
+
+if ($action === 'fail_cleanup') {
+  $op = (string)($_POST['op'] ?? '');
+  $selected = $_POST['failjson'] ?? [];
+  if (!is_array($selected)) $selected = [];
+
+  $selected = array_values(array_unique(array_map('strval', $selected)));
+  if (count($selected) === 0) {
+    add_err("Keine Fehler ausgewählt.");
+  } elseif (!in_array($op, ['delete', 'adopt'], true)) {
+    add_err("Ungültige Aktion.");
+  } else {
+    $done = 0;
+    $moved = 0;
+    $deleted = 0;
+
+    foreach ($selected as $jsonFn) {
+      if ($jsonFn === '' || !preg_match('/\.json\z/i', $jsonFn)) continue;
+
+      $jsonPath = $DIR_FAIL_REP . '/' . $jsonFn;
+      if (!within_dir($jsonPath, $DIR_FAIL_REP)) continue;
+      if (!is_file($jsonPath)) continue;
+
+      $pdfFn = '';
+      if (preg_match('/\A(.+)\.json\z/i', $jsonFn, $m)) {
+        $stem = $m[1];
+        $cand = $stem . '__FAILED.pdf';
+        if (is_file($DIR_FAIL_REP . '/' . $cand)) $pdfFn = $cand;
+      }
+
+      if ($op === 'delete') {
+        $ok = true;
+        if (!@unlink($jsonPath)) $ok = false;
+        if ($pdfFn !== '') {
+          $pdfPath = $DIR_FAIL_REP . '/' . $pdfFn;
+          if (within_dir($pdfPath, $DIR_FAIL_REP) && is_file($pdfPath)) {
+            @unlink($pdfPath);
+          }
+        }
+        if ($ok) { $deleted++; $done++; }
+      } else { // adopt
+        $destJson = $DIR_ARCHIVE . '/' . $jsonFn;
+        if (is_file($destJson)) {
+          $destJson = $DIR_ARCHIVE . '/' . preg_replace('/\.json\z/i', '', $jsonFn) . '.moved.' . random_suffix(6) . '.json';
+        }
+        $ok = @rename($jsonPath, $destJson);
+        if ($ok) {
+          $moved++;
+          $done++;
+          if ($pdfFn !== '') {
+            $srcPdf = $DIR_FAIL_REP . '/' . $pdfFn;
+            $destPdf = $DIR_ARCHIVE . '/' . $pdfFn;
+            if (is_file($destPdf)) {
+              $destPdf = $DIR_ARCHIVE . '/' . preg_replace('/\.pdf\z/i', '', $pdfFn) . '.moved.' . random_suffix(6) . '.pdf';
+            }
+            if (within_dir($srcPdf, $DIR_FAIL_REP) && is_file($srcPdf)) {
+              @rename($srcPdf, $destPdf);
+            }
+          }
+        }
+      }
+    }
+
+    if ($done <= 0) {
+      add_err("Keine Einträge verarbeitet (keine Rechte / Dateien nicht gefunden).");
+    } else {
+      if ($op === 'delete') add_ok("🗑️ Fehler entfernt: $deleted Eintrag(e).");
+      if ($op === 'adopt') add_ok("✅ Übernommen ins Sendeprotokoll: $moved Eintrag(e).");
+    }
+  }
+}
+
+if ($action === 'cancel_job') {
+  $jobId = trim((string)($_POST['job_id'] ?? ''));
+  $where = trim((string)($_POST['where'] ?? ''));
+
+  if (!validate_job_id($jobId)) {
+    add_err("Ungültige Job-ID.");
+  } elseif (!in_array($where, ['queue', 'processing'], true)) {
+    add_err("Ungültiger Job-Statusbereich.");
+  } else {
+    $baseDir = ($where === 'queue') ? $DIR_QUEUE : $DIR_PROC;
+    $jobDir = $baseDir . '/' . $jobId;
+
+    if (!within_dir($jobDir, $baseDir) || !is_dir($jobDir)) {
+      add_err("Job nicht gefunden.");
+    } else {
+      $jobJsonPath = $jobDir . '/job.json';
+      if (!within_dir($jobJsonPath, $jobDir) || !is_file($jobJsonPath)) {
+        add_err("job.json fehlt (kann nicht abbrechen).");
+      } else {
+        $j = read_json_file($jobJsonPath);
+        if (!is_array($j)) {
+          add_err("job.json ist nicht lesbar (kann nicht abbrechen).");
+        } else {
+          $j['cancel'] = [
+            'requested' => true,
+            'requested_at' => date('c'),
+          ];
+          try {
+            json_write_atomic($jobJsonPath, $j);
+            add_ok("⛔ Abbruch angefordert: " . $jobId);
+          } catch (Throwable $e) {
+            add_err("Konnte Abbruch nicht schreiben: " . $e->getMessage());
+          }
+        }
+      }
+    }
+  }
+}
+
 // -------------------- View / Source --------------------
 $view = (string)($_GET['view'] ?? '');
 $src  = (string)($_GET['src'] ?? 'fax1');
@@ -485,11 +720,7 @@ $procJobs  = list_job_dirs($DIR_PROC);
 
 function read_job_meta(string $jobDir): ?array {
   $p = $jobDir . '/job.json';
-  if (!is_file($p)) return null;
-  $raw = @file_get_contents($p);
-  if ($raw === false) return null;
-  $j = json_decode($raw, true);
-  return is_array($j) ? $j : null;
+  return read_json_file($p);
 }
 
 $activePreview = [];
@@ -508,6 +739,10 @@ foreach ($contacts as $c) {
   $contactMap[(string)$c['id']] = ['name' => (string)$c['name'], 'number' => (string)$c['number']];
 }
 
+// Fehler vorhanden? (für Puls-Tab)
+$failCount = count_json_files($DIR_FAIL_REP, 999);
+$hasFails = ($failCount > 0);
+
 ?>
 <!doctype html>
 <html lang="de">
@@ -522,20 +757,27 @@ foreach ($contacts as $c) {
       --shadow: 0 10px 30px rgba(18, 34, 64, .08);
       --r:14px;
     }
-    body{ margin:0; font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+    body{
+      margin:0;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
       background: radial-gradient(1200px 600px at 10% 0%, #eef6ff 0%, transparent 60%),
                   radial-gradient(900px 500px at 90% 0%, #e9fff7 0%, transparent 55%),
                   var(--bg);
       color:var(--ink);
+      min-height:100vh;
+      display:flex;
+      flex-direction:column;
     }
+
     header{ position:sticky; top:0; z-index:10; background: rgba(255,255,255,.85); backdrop-filter: blur(10px); border-bottom:1px solid var(--line); }
     .head-inner{ max-width:1200px; margin:0 auto; padding:14px 16px; display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
     .brand{ display:flex; align-items:center; gap:10px; font-weight:800; letter-spacing:.3px; }
     .logo{ width:34px; height:34px; border-radius:10px; background: linear-gradient(135deg, var(--primary) 0%, var(--primary2) 100%); box-shadow: var(--shadow); }
     .kpis{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-    .pill{ display:inline-flex; gap:8px; align-items:center; padding:8px 10px; border:1px solid var(--line); border-radius:999px; background:#fff; box-shadow: 0 6px 14px rgba(18,34,64,.04); font-size:14px; }
+    .pill{ display:inline-flex; gap:8px; align-items:center; padding:8px 10px; border:1px solid var(--line); border-radius:999px; background:#fff; box-shadow: 0 6px 14px rgba(18,34,64,.04); font-size:14px; color: var(--ink); text-decoration:none; }
     .pill b{ font-variant-numeric: tabular-nums; }
-    .wrap{ max-width:1200px; margin:0 auto; padding:14px 16px 26px; display:grid; grid-template-columns: 360px 1fr; gap:14px; }
+
+    .wrap{ max-width:1200px; margin:0 auto; padding:14px 16px 26px; display:grid; grid-template-columns: 360px 1fr; gap:14px; width:100%; flex:1 0 auto; }
     .card{ background:var(--card); border:1px solid var(--line); border-radius:var(--r); box-shadow: var(--shadow); padding:14px; }
     .tabs{ display:flex; flex-wrap:wrap; gap:10px; margin-bottom:12px; }
     .tab{ text-decoration:none; display:inline-flex; align-items:center; gap:8px; padding:10px 12px; border-radius:999px; border:1px solid var(--line); background:#fff; color:var(--ink); font-weight:700; font-size:14px; }
@@ -553,12 +795,29 @@ foreach ($contacts as $c) {
     .btn{ display:inline-flex; align-items:center; justify-content:center; gap:10px; padding:12px 14px; border-radius:14px; border:0; cursor:pointer; font-weight:800; letter-spacing:.2px; text-decoration:none; user-select:none; }
     .btn.primary{ background: linear-gradient(135deg, var(--primary) 0%, #4b8bff 100%); color:#fff; box-shadow: 0 14px 26px rgba(47,109,246,.25); }
     .btn.ghost{ background:#fff; border:1px solid var(--line); color:var(--ink); }
+    .btn.danger{ background: linear-gradient(135deg, rgba(255,77,109,.95) 0%, rgba(255,77,109,.80) 100%); color:#fff; box-shadow: 0 14px 26px rgba(255,77,109,.20); }
     .btn.small{ padding:10px 12px; border-radius:12px; font-weight:700; box-shadow:none; }
     .btn:disabled{ opacity:.55; cursor:not-allowed; }
-    input[type="text"], textarea, select{ width:100%; padding:12px 12px; border:1px solid var(--line); border-radius:12px; font-size:15px; background:#fff; }
+
+    /* 1.2.1 FIX: box-sizing verhindert Überbreite (Faxnummer) */
+    input[type="text"], textarea, select{
+      width:100%;
+      padding:12px 12px;
+      border:1px solid var(--line);
+      border-radius:12px;
+      font-size:15px;
+      background:#fff;
+      box-sizing:border-box;
+    }
     textarea{ min-height:80px; }
     label{ font-weight:800; font-size:13px; color:var(--mut); display:block; margin:10px 0 6px; }
-    .row{ display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:12px; } /* mehr Abstand */
+
+    .row{ display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:12px; }
+
+    /* Empfänger: bewusst schmaler + größerer Spaltabstand */
+    .recipient-limits{ max-width: 860px; }
+    .recipient-row{ display:grid; grid-template-columns: 1fr 1fr; column-gap: 32px; margin-top:12px; }
+
     .tbl{ width:100%; border-collapse:collapse; }
     .tbl th,.tbl td{ border-bottom:1px solid var(--line); padding:10px 8px; vertical-align:top; font-size:14px; }
     .tbl th{ color:var(--mut); text-align:left; font-weight:900; }
@@ -568,8 +827,60 @@ foreach ($contacts as $c) {
     .chip.ok{ background: rgba(24,169,87,.12); }
     .chip.fail{ background: rgba(255,77,109,.12); }
     .chip.warn{ background: rgba(255,176,32,.18); }
+    .chip.abort{ background: rgba(255,77,109,.10); border-color: rgba(255,77,109,.55); }
+
     .stack{ display:grid; gap:10px; }
-    .checkline{ display:flex; align-items:center; gap:14px; margin-top:12px; flex-wrap:wrap; }
+    .checkline{ display:flex; align-items:flex-end; gap:14px; margin-top:12px; flex-wrap:wrap; }
+    .optstack{ display:grid; gap:8px; align-content:start; }
+    .optstack label{ margin:0; font-weight:900; color:var(--ink); display:flex; align-items:center; gap:10px; }
+
+    /* Empfänger: Auflösung + Button gleiche Höhe */
+    .actionrow{
+      display:grid;
+      grid-template-columns: 1fr 220px auto;
+      gap:14px;
+      align-items:end;
+      margin-top:12px;
+      max-width: 860px;
+    }
+
+    /* Deutliches Pulsieren für Fehlerberichte-Tab */
+    @keyframes dangerPulse {
+      0%   { box-shadow: 0 0 0 rgba(255,77,109,0.0); border-color: var(--danger); transform: translateY(0); }
+      50%  { box-shadow: 0 0 26px rgba(255,77,109,0.55); border-color: rgba(255,77,109,0.95); transform: translateY(-1px); }
+      100% { box-shadow: 0 0 0 rgba(255,77,109,0.0); border-color: var(--danger); transform: translateY(0); }
+    }
+    .tab.pulse-danger{
+      border-color: var(--danger) !important;
+      background: rgba(255,77,109,.08);
+      animation: dangerPulse 1.05s ease-in-out infinite;
+    }
+
+    /* 1.2.1 UI: dezenter Icon-Abbruchknopf (kein großes rotes Feld) */
+    .btn.icon-danger{
+      padding:6px 8px;
+      border-radius:10px;
+      border:1px solid rgba(255,77,109,.5);
+      background:rgba(255,77,109,.08);
+      color:var(--danger);
+      font-weight:800;
+      box-shadow:none;
+      letter-spacing:0;
+    }
+    .btn.icon-danger:hover{
+      background:rgba(255,77,109,.18);
+    }
+
+    footer{
+      border-top:1px solid var(--line);
+      background: rgba(255,255,255,.65);
+      backdrop-filter: blur(10px);
+      padding: 10px 16px;
+      text-align:center;
+      color: var(--mut);
+      font-size: 12px;
+      margin-top:auto;
+    }
   </style>
 </head>
 <body>
@@ -579,10 +890,11 @@ foreach ($contacts as $c) {
       <div class="logo"></div>
       <div>
         <div style="font-size:18px; line-height:1;"><?=h($APP_TITLE)?></div>
-        <div class="mut" style="font-size:13px; margin-top:3px;">Fax beauftragen · Jobs sichtbar · Worker sendet im Hintergrund</div>
+        <div class="mut" style="font-size:13px; margin-top:3px;">Der ideale Server für Arztpraxen</div>
       </div>
     </div>
     <div class="kpis">
+      <a class="pill" href="<?=h($_SERVER['REQUEST_URI'] ?? '/')?>">🔄 refresh</a>
       <span class="pill">⏳ queue <b><?=count($queueJobs)?></b></span>
       <span class="pill">⚙️ processing <b><?=count($procJobs)?></b></span>
     </div>
@@ -592,13 +904,15 @@ foreach ($contacts as $c) {
 <div class="wrap">
   <!-- Sidebar -->
   <div class="card">
+    <div class="mut" style="font-size:13px; font-weight:900; margin-bottom:8px;">Bitte wählen:</div>
+
     <div class="tabs">
       <?php foreach (['fax1','fax2','fax3','fax4','fax5','pdf-zu-fax','sendefehler'] as $t): ?>
         <a class="tab <?=($view==='' && $src===$t)?'active':''?>" href="?src=<?=h($t)?>">📄 <?=h($t)?></a>
       <?php endforeach; ?>
       <a class="tab <?=($view==='sendelog')?'active':''?>" href="?view=sendelog">✅ Sendeprotokoll</a>
       <a class="tab <?=($view==='phonebook')?'active':''?>" href="?view=phonebook">📇 Telefonbuch</a>
-      <a class="tab <?=($view==='sendefehler-berichte')?'active':''?>" href="?view=sendefehler-berichte">⚠️ Fehlerberichte</a>
+      <a class="tab <?=($view==='sendefehler-berichte')?'active':''?> <?=($hasFails ? 'pulse-danger' : '')?>" href="?view=sendefehler-berichte">⚠️ Fehlerberichte</a>
     </div>
 
     <?php foreach ($flash['ok'] as $m): ?><div class="flash ok"><?=h($m)?></div><?php endforeach; ?>
@@ -625,11 +939,22 @@ foreach ($contacts as $c) {
               $st = is_array($meta) ? ($meta['status'] ?? $a['where']) : $a['where'];
             ?>
             <li>
-              <div>
-                <div class="mono"><?=h($a['id'])?></div>
-                <div class="mut" style="font-size:13px; margin-top:2px;"><?=h((string)$st)?> · <?=h((string)$name)?> · <span class="mono"><?=h((string)$to)?></span></div>
+              <div style="min-width:0;">
+                <div class="mono" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:240px;"><?=h($a['id'])?></div>
+                <div class="mut" style="font-size:13px; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:240px;">
+                  <?=h((string)$st)?> · <?=h((string)$name)?> · <span class="mono"><?=h((string)$to)?></span>
+                </div>
               </div>
-              <span class="chip"><?=h($a['where'])?></span>
+
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span class="chip"><?=h($a['where'])?></span>
+                <form method="post" style="display:inline;" onsubmit="return confirm('Job wirklich abbrechen?');">
+                  <input type="hidden" name="action" value="cancel_job">
+                  <input type="hidden" name="job_id" value="<?=h($a['id'])?>">
+                  <input type="hidden" name="where" value="<?=h($a['where'])?>">
+                  <button class="btn icon-danger" type="submit" title="Abbruch anfordern">⛔</button>
+                </form>
+              </div>
             </li>
           <?php endforeach; ?>
         <?php endif; ?>
@@ -701,7 +1026,18 @@ foreach ($contacts as $c) {
       </div>
 
     <?php elseif ($view === 'sendelog'): ?>
-      <h2 class="section-title">✅ Sendeprotokoll (letzte <?=$MAX_ARCHIVE_LIST?>)</h2>
+      <?php
+        $showAll = ((string)($_GET['all'] ?? '') === '1');
+        $limit = $showAll ? 500 : $MAX_ARCHIVE_LIST;
+      ?>
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+        <h2 class="section-title" style="margin:0;">✅ Sendeprotokoll (<?= $showAll ? 'alle' : ('letzte ' . $MAX_ARCHIVE_LIST) ?>)</h2>
+        <?php if (!$showAll): ?>
+          <a class="btn ghost small" href="?view=sendelog&amp;all=1">📚 alle anzeigen</a>
+        <?php else: ?>
+          <a class="btn ghost small" href="?view=sendelog">↩️ zurück (letzte)</a>
+        <?php endif; ?>
+      </div>
 
       <?php
         $items = [];
@@ -712,9 +1048,7 @@ foreach ($contacts as $c) {
               if (!preg_match('/\.json\z/i', $e)) continue;
               $p = $DIR_ARCHIVE . '/' . $e;
               if (!is_file($p)) continue;
-              $raw = @file_get_contents($p);
-              if ($raw === false) continue;
-              $j = json_decode($raw, true);
+              $j = read_json_file($p);
               if (!is_array($j)) continue;
               $end = (string)($j['end_time'] ?? $j['completed_at'] ?? $j['updated_at'] ?? '');
               $ts = parse_iso_time($end) ?? 0;
@@ -724,7 +1058,7 @@ foreach ($contacts as $c) {
           }
         }
         usort($items, fn($a,$b) => $b['ts'] <=> $a['ts']);
-        $items = array_slice($items, 0, $MAX_ARCHIVE_LIST);
+        $items = array_slice($items, 0, $limit);
       ?>
 
       <table class="tbl">
@@ -746,6 +1080,7 @@ foreach ($contacts as $c) {
               $num = (string)($j['recipient']['number'] ?? '');
               $status = (string)($j['status'] ?? '');
               $isOk = (strcasecmp($status, 'OK') === 0) || (stripos($status, 'ok') !== false);
+              $isAborted = (!$isOk) && is_aborted_job($j);
 
               $dur = '';
               $t1 = parse_iso_time($start);
@@ -759,13 +1094,16 @@ foreach ($contacts as $c) {
               $pdf = '';
               if (preg_match('/\A(.+)\.json\z/i', $it['json'], $m)) {
                 $stem = $m[1];
-                $cand = $stem . '__OK.pdf';
-                if (is_file($DIR_ARCHIVE . '/' . $cand)) $pdf = $cand;
+                $candOk = $stem . '__OK.pdf';
+                $candFail = $stem . '__FAILED.pdf';
+                if (is_file($DIR_ARCHIVE . '/' . $candOk)) $pdf = $candOk;
+                elseif (is_file($DIR_ARCHIVE . '/' . $candFail)) $pdf = $candFail;
               }
             ?>
             <tr>
               <td class="nowrap">
                 <?php if ($isOk): ?><span class="chip ok">✅ Senden erfolgreich</span>
+                <?php elseif ($isAborted): ?><span class="chip abort">⛔ Abgebrochen</span>
                 <?php else: ?><span class="chip fail">❌ Fehlgeschlagen</span><?php endif; ?>
               </td>
               <td class="nowrap"><?=h($end)?></td>
@@ -781,6 +1119,12 @@ foreach ($contacts as $c) {
         <?php endif; ?>
         </tbody>
       </table>
+
+      <?php if ($showAll): ?>
+        <div class="mut" style="font-size:12px; margin-top:10px;">
+          Hinweis: "alle anzeigen" ist aus Performance-Gründen auf 500 Einträge begrenzt.
+        </div>
+      <?php endif; ?>
 
     <?php elseif ($view === 'sendefehler-berichte'): ?>
       <h2 class="section-title">⚠️ Sendefehler-Berichte</h2>
@@ -804,9 +1148,7 @@ foreach ($contacts as $c) {
               if (!preg_match('/\.json\z/i', $e)) continue;
               $p = $DIR_FAIL_REP . '/' . $e;
               if (!is_file($p)) continue;
-              $raw = @file_get_contents($p);
-              if ($raw === false) continue;
-              $j = json_decode($raw, true);
+              $j = read_json_file($p);
               if (!is_array($j)) continue;
               $t = (string)($j['end_time'] ?? $j['updated_at'] ?? $j['created_at'] ?? '');
               $ts = parse_iso_time($t) ?? 0;
@@ -819,45 +1161,81 @@ foreach ($contacts as $c) {
         $fails = array_slice($fails, 0, $MAX_FAIL_LIST);
       ?>
 
-      <table class="tbl">
-        <thead><tr><th>Ergebnis</th><th>Zeit</th><th>Empfänger</th><th>Fehler</th><th class="right nowrap">Artefakte</th></tr></thead>
-        <tbody>
-        <?php if (count($fails) === 0): ?>
-          <tr><td colspan="5" class="mut">Keine Fehler-JSONs gefunden.</td></tr>
-        <?php else: ?>
-          <?php foreach ($fails as $it): ?>
-            <?php
-              $j = $it['data'];
-              $t = (string)($j['end_time'] ?? $j['updated_at'] ?? $j['created_at'] ?? '');
-              $name = (string)($j['recipient']['name'] ?? '');
-              $num = (string)($j['recipient']['number'] ?? '');
-              $err = '';
-              if (isset($j['result']) && is_array($j['result'])) {
-                $err = (string)($j['result']['error_message'] ?? $j['result']['stderr'] ?? '');
-              }
-              if ($err === '') $err = (string)($j['error'] ?? $j['error_message'] ?? 'FAILED');
+      <form method="post" id="failForm">
+        <input type="hidden" name="action" value="fail_cleanup">
+        <input type="hidden" name="op" id="failOp" value="">
 
-              $pdf = '';
-              if (preg_match('/\A(.+)\.json\z/i', $it['json'], $m)) {
-                $stem = $m[1];
-                $cand = $stem . '__FAILED.pdf';
-                if (is_file($DIR_FAIL_REP . '/' . $cand)) $pdf = $cand;
-              }
-            ?>
-            <tr>
-              <td class="nowrap"><span class="chip fail">❌ Fehlgeschlagen</span></td>
-              <td class="nowrap"><?=h($t)?></td>
-              <td><div style="font-weight:900;"><?=h($name)?></div><div class="mono mut"><?=h($num)?></div></td>
-              <td><?=h($err ?: '—')?></td>
-              <td class="right nowrap">
-                <?php if ($pdf !== ''): ?><a class="btn ghost small" href="?download=failedpdf&amp;file=<?=h($pdf)?>">📄 PDF</a><?php else: ?><span class="mut">—</span><?php endif; ?>
-                <a class="btn ghost small" href="?download=jsonfail&amp;file=<?=h($it['json'])?>">🧾 JSON</a>
-              </td>
-            </tr>
-          <?php endforeach; ?>
-        <?php endif; ?>
-        </tbody>
-      </table>
+        <div class="checkline" style="margin-top:0; justify-content:flex-end;">
+          <button type="button" class="btn ghost small" onclick="selectAllFail(true)">✅ alle</button>
+          <button type="button" class="btn ghost small" onclick="selectAllFail(false)">🧹 keine</button>
+          <button type="button" class="btn ghost small" onclick="submitFail('adopt')">📥 Fehler in Sendeprotokoll übernehmen</button>
+          <button type="button" class="btn danger small" onclick="submitFail('delete')">🗑️ Ausgewählte löschen</button>
+        </div>
+
+        <table class="tbl" style="margin-top:10px;">
+          <thead><tr><th class="nowrap"></th><th>Ergebnis</th><th>Zeit</th><th>Empfänger</th><th>Fehler</th><th class="right nowrap">Artefakte</th></tr></thead>
+          <tbody>
+          <?php if (count($fails) === 0): ?>
+            <tr><td colspan="6" class="mut">Keine Fehler-JSONs gefunden.</td></tr>
+          <?php else: ?>
+            <?php foreach ($fails as $it): ?>
+              <?php
+                $j = $it['data'];
+                $t = (string)($j['end_time'] ?? $j['updated_at'] ?? $j['created_at'] ?? '');
+                $name = (string)($j['recipient']['name'] ?? '');
+                $num = (string)($j['recipient']['number'] ?? '');
+                $isAborted = is_aborted_job($j);
+
+                $err = '';
+                if (isset($j['result']) && is_array($j['result'])) {
+                  $err = (string)($j['result']['error_message'] ?? $j['result']['stderr'] ?? '');
+                  if ($err === '') $err = (string)($j['result']['status_text'] ?? $j['result']['reason'] ?? '');
+                }
+                if ($err === '') $err = (string)($j['error'] ?? $j['error_message'] ?? 'FAILED');
+
+                $pdf = '';
+                if (preg_match('/\A(.+)\.json\z/i', $it['json'], $m)) {
+                  $stem = $m[1];
+                  $cand = $stem . '__FAILED.pdf';
+                  if (is_file($DIR_FAIL_REP . '/' . $cand)) $pdf = $cand;
+                }
+              ?>
+              <tr>
+                <td class="nowrap">
+                  <input type="checkbox" name="failjson[]" value="<?=h($it['json'])?>" class="failbox">
+                </td>
+                <td class="nowrap">
+                  <?php if ($isAborted): ?><span class="chip abort">⛔ Abgebrochen</span>
+                  <?php else: ?><span class="chip fail">❌ Fehlgeschlagen</span><?php endif; ?>
+                </td>
+                <td class="nowrap"><?=h($t)?></td>
+                <td><div style="font-weight:900;"><?=h($name)?></div><div class="mono mut"><?=h($num)?></div></td>
+                <td><?=h($err ?: '—')?></td>
+                <td class="right nowrap">
+                  <?php if ($pdf !== ''): ?><a class="btn ghost small" href="?download=failedpdf&amp;file=<?=h($pdf)?>">📄 PDF</a><?php else: ?><span class="mut">—</span><?php endif; ?>
+                  <a class="btn ghost small" href="?download=jsonfail&amp;file=<?=h($it['json'])?>">🧾 JSON</a>
+                </td>
+              </tr>
+            <?php endforeach; ?>
+          <?php endif; ?>
+          </tbody>
+        </table>
+      </form>
+
+      <script>
+        function selectAllFail(on) {
+          document.querySelectorAll('.failbox').forEach(b => b.checked = on);
+        }
+        function submitFail(op) {
+          if (op === 'delete') {
+            if (!confirm('Ausgewählte Fehlerberichte wirklich löschen? (JSON + ggf. PDF)')) return;
+          } else if (op === 'adopt') {
+            if (!confirm('Ausgewählte Fehlerberichte ins Sendeprotokoll übernehmen?')) return;
+          }
+          document.getElementById('failOp').value = op;
+          document.getElementById('failForm').submit();
+        }
+      </script>
 
     <?php else: ?>
       <?php
@@ -867,56 +1245,62 @@ foreach ($contacts as $c) {
 
       <h2 class="section-title">📄 Quelle: <?=h($src)?></h2>
 
-      <form method="post" class="stack">
-        <input type="hidden" name="action" value="create_jobs">
+      <form method="post" class="stack" id="srcForm">
+        <input type="hidden" name="action" id="srcAction" value="create_jobs">
         <input type="hidden" name="src" value="<?=h($src)?>">
 
         <div class="subtle">
           <div style="font-weight:900; font-size:16px;">Empfänger</div>
 
-          <label>Telefonbuch (optional)</label>
-          <select name="contact_id" id="contact_id">
-            <option value="">— Kontakt wählen —</option>
-            <?php foreach ($contacts as $c): ?>
-              <option value="<?=(int)$c['id']?>"><?=h($c['name'])?> · <?=h($c['number'])?></option>
-            <?php endforeach; ?>
-          </select>
+          <div class="recipient-limits">
+            <label>Telefonbuch (optional)</label>
+            <select name="contact_id" id="contact_id">
+              <option value="">— Kontakt wählen —</option>
+              <?php foreach ($contacts as $c): ?>
+                <option value="<?=(int)$c['id']?>"><?=h($c['name'])?> · <?=h($c['number'])?></option>
+              <?php endforeach; ?>
+            </select>
 
-          <div class="row">
-            <div>
-              <label>Empfängername</label>
-              <input type="text" name="recipient_name" id="recipient_name" placeholder="z.B. Radiologie XY">
-            </div>
-            <div>
-              <label>Faxnummer</label>
-              <input type="text" name="recipient_number" id="recipient_number" placeholder="z.B. 02331...">
-            </div>
-          </div>
-
-          <div class="checkline">
-            <label style="margin:0; font-weight:900; color:var(--ink);">
-              <input type="checkbox" name="save_to_phonebook" id="save_to_phonebook">
-              Im Telefonbuch speichern
-            </label>
-
-            <label style="margin:0; font-weight:900; color:var(--ink);">
-              <input type="checkbox" name="ecm" checked>
-              ECM
-            </label>
-
-            <div style="min-width:220px;">
-              <label style="margin:0 0 6px;">Auflösung</label>
-              <select name="resolution">
-                <option value="fine" selected>fine</option>
-                <option value="standard">standard</option>
-              </select>
+            <div class="recipient-row">
+              <div>
+                <label>Empfängername</label>
+                <input type="text" name="recipient_name" id="recipient_name" placeholder="z.B. Radiologie XY">
+              </div>
+              <div>
+                <label>Faxnummer</label>
+                <input type="text" name="recipient_number" id="recipient_number" placeholder="z.B. 02331...">
+              </div>
             </div>
 
-            <button class="btn primary" type="submit">🚀 Fax beauftragen</button>
-          </div>
+            <div class="actionrow">
+              <div class="optstack">
+                <label>
+                  <input type="checkbox" name="save_to_phonebook" id="save_to_phonebook">
+                  Im Telefonbuch speichern
+                </label>
 
-          <div class="mut" style="font-size:13px; margin-top:10px;">
-            Kontakt auswählen → Felder werden übernommen (du kannst danach ändern).
+                <label>
+                  <input type="checkbox" name="ecm" checked>
+                  ECM
+                </label>
+              </div>
+
+              <div>
+                <label style="margin:0 0 6px;">Auflösung</label>
+                <select name="resolution">
+                  <option value="fine" selected>fine</option>
+                  <option value="standard">standard</option>
+                </select>
+              </div>
+
+              <div style="display:flex; justify-content:flex-end;">
+                <button class="btn primary" type="submit" onclick="document.getElementById('srcAction').value='create_jobs'">🚀 Fax beauftragen</button>
+              </div>
+            </div>
+
+            <div class="mut" style="font-size:13px; margin-top:10px;">
+              Kontakt auswählen → Felder werden übernommen (du kannst danach ändern).
+            </div>
           </div>
         </div>
 
@@ -929,19 +1313,29 @@ foreach ($contacts as $c) {
             <div class="checkline" style="margin:0;">
               <button type="button" class="btn ghost small" onclick="selectAll(true)">✅ Alle</button>
               <button type="button" class="btn ghost small" onclick="selectAll(false)">🧹 Keine</button>
+              <button type="button" class="btn danger" onclick="submitDelete()">löschen</button>
             </div>
           </div>
 
           <table class="tbl" style="margin-top:10px;">
-            <thead><tr><th class="nowrap"></th><th>Datei</th><th class="right nowrap">Vorschau</th></tr></thead>
+            <thead><tr><th class="nowrap"></th><th>Datei</th><th class="nowrap">Größe</th><th class="right nowrap">Vorschau</th></tr></thead>
             <tbody>
             <?php if (count($pdfs) === 0): ?>
-              <tr><td colspan="3" class="mut">Keine sendbaren PDFs gefunden.</td></tr>
+              <tr><td colspan="4" class="mut">Keine sendbaren PDFs gefunden.</td></tr>
             <?php else: ?>
               <?php foreach ($pdfs as $fn): ?>
+                <?php
+                  $p = $srcDir . '/' . $fn;
+                  $sizeStr = '—';
+                  if (within_dir($p, $srcDir) && is_file($p)) {
+                    $sz = @filesize($p);
+                    $sizeStr = format_size(($sz === false) ? null : (int)$sz);
+                  }
+                ?>
                 <tr>
                   <td class="nowrap"><input type="checkbox" name="files[]" value="<?=h($fn)?>" class="filebox"></td>
                   <td style="font-weight:900;"><?=h($fn)?></td>
+                  <td class="mono nowrap"><?=h($sizeStr)?></td>
                   <td class="right nowrap"><a class="btn ghost small" href="?download=srcpdf&amp;src=<?=h($src)?>&amp;file=<?=h($fn)?>">👁️ PDF</a></td>
                 </tr>
               <?php endforeach; ?>
@@ -969,10 +1363,22 @@ foreach ($contacts as $c) {
         function selectAll(on) {
           document.querySelectorAll('.filebox').forEach(b => b.checked = on);
         }
+
+        function submitDelete() {
+          const any = Array.from(document.querySelectorAll('.filebox')).some(b => b.checked);
+          if (!any) { alert('Bitte erst Dateien auswählen.'); return; }
+          if (!confirm('Ausgewählte Dateien wirklich löschen?')) return;
+          document.getElementById('srcAction').value = 'delete_source_files';
+          document.getElementById('srcForm').submit();
+        }
       </script>
 
     <?php endif; ?>
   </div>
 </div>
+
+<footer>
+  <?=h($APP_TITLE)?> · v<?=h($APP_VERSION)?> · <?=h($APP_AUTHOR)?>
+</footer>
 </body>
 </html>
