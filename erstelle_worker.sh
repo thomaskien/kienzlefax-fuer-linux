@@ -437,3 +437,173 @@ echo
 echo "==> Live-Log (Ctrl+C beendet):"
 journalctl -u kienzlefax-worker -f
 EOF
+
+
+sudo bash -euxo pipefail <<'EOF'
+# 1) Gruppen anlegen/ergänzen
+getent group kienzlefax >/dev/null || groupadd --system kienzlefax
+id faxworker >/dev/null 2>&1 || useradd --system --home /var/lib/faxworker --create-home --shell /usr/sbin/nologin faxworker
+
+usermod -aG kienzlefax faxworker
+
+# HylaFAX-Spool ist auf Ubuntu sehr oft uucp: -> faxworker dazu
+getent group uucp >/dev/null && usermod -aG uucp faxworker || true
+getent group fax >/dev/null && usermod -aG fax faxworker || true
+
+# optional, je nach späterem Modem/Gateway:
+getent group dialout >/dev/null && usermod -aG dialout faxworker || true
+
+# 2) Verzeichnisse kienzlefax absichern (wie gehabt)
+apt-get update
+apt-get install -y acl python3 python3-reportlab qpdf hylafax-client
+
+mkdir -p /srv/kienzlefax/{staging,queue,processing,sendeberichte}
+mkdir -p /srv/kienzlefax/sendefehler/{eingang,berichte}
+
+chgrp -R kienzlefax /srv/kienzlefax
+find /srv/kienzlefax -type d -exec chmod 2775 {} \;
+find /srv/kienzlefax -type f -exec chmod 0664 {} \;
+
+setfacl -R -m g:kienzlefax:rwx /srv/kienzlefax
+setfacl -R -d -m g:kienzlefax:rwx /srv/kienzlefax
+setfacl -R -d -m u::rwx /srv/kienzlefax
+setfacl -R -d -m o::rx  /srv/kienzlefax
+
+# 3) HylaFAX-Spool-Rechte prüfen (nur Anzeige)
+echo "== HylaFAX spool perms =="
+ls -ld /var/spool/hylafax /var/spool/hylafax/{sendq,docq,doneq} 2>/dev/null || true
+
+# 4) systemd Service korrigieren: HylaFAX spool MUSS schreibbar sein
+cat > /etc/systemd/system/kienzlefax-worker.service <<'UNIT'
+[Unit]
+Description=kienzlefax worker (HylaFAX sendfax consumer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=faxworker
+Group=kienzlefax
+WorkingDirectory=/srv/kienzlefax
+
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=UTC
+
+ExecStart=/usr/bin/python3 /usr/local/bin/kienzlefax-worker.py
+
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=30
+StartLimitBurst=50
+
+# Hardening (nicht zu hart):
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+# Wichtig: Worker schreibt in /srv/kienzlefax UND sendfax schreibt in HylaFAX-Spool:
+ReadWritePaths=/srv/kienzlefax /var/spool/hylafax
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable kienzlefax-worker.service
+systemctl restart kienzlefax-worker.service || true
+
+EOF
+
+
+
+sudo bash -euxo pipefail <<'EOF'
+# 1) Gruppen anlegen/ergänzen
+getent group kienzlefax >/dev/null || groupadd --system kienzlefax
+id faxworker >/dev/null 2>&1 || useradd --system --home /var/lib/faxworker --create-home --shell /usr/sbin/nologin faxworker
+
+usermod -aG kienzlefax faxworker
+
+# HylaFAX-Spool ist auf Ubuntu sehr oft uucp: -> faxworker dazu
+getent group uucp >/dev/null && usermod -aG uucp faxworker || true
+getent group fax >/dev/null && usermod -aG fax faxworker || true
+
+# optional, je nach späterem Modem/Gateway:
+getent group dialout >/dev/null && usermod -aG dialout faxworker || true
+
+# 2) Verzeichnisse kienzlefax absichern (wie gehabt)
+apt-get update
+apt-get install -y acl python3 python3-reportlab qpdf hylafax-client
+
+mkdir -p /srv/kienzlefax/{staging,queue,processing,sendeberichte}
+mkdir -p /srv/kienzlefax/sendefehler/{eingang,berichte}
+
+chgrp -R kienzlefax /srv/kienzlefax
+find /srv/kienzlefax -type d -exec chmod 2775 {} \;
+find /srv/kienzlefax -type f -exec chmod 0664 {} \;
+
+setfacl -R -m g:kienzlefax:rwx /srv/kienzlefax
+setfacl -R -d -m g:kienzlefax:rwx /srv/kienzlefax
+setfacl -R -d -m u::rwx /srv/kienzlefax
+setfacl -R -d -m o::rx  /srv/kienzlefax
+
+# 3) HylaFAX-Spool-Rechte prüfen (nur Anzeige)
+echo "== HylaFAX spool perms =="
+ls -ld /var/spool/hylafax /var/spool/hylafax/{sendq,docq,doneq} 2>/dev/null || true
+
+# 4) systemd Service korrigieren: HylaFAX spool MUSS schreibbar sein
+cat > /etc/systemd/system/kienzlefax-worker.service <<'UNIT'
+[Unit]
+Description=kienzlefax worker (HylaFAX sendfax consumer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=faxworker
+Group=kienzlefax
+WorkingDirectory=/srv/kienzlefax
+
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=UTC
+
+ExecStart=/usr/bin/python3 /usr/local/bin/kienzlefax-worker.py
+
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=30
+StartLimitBurst=50
+
+# Hardening (nicht zu hart):
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+# Wichtig: Worker schreibt in /srv/kienzlefax UND sendfax schreibt in HylaFAX-Spool:
+ReadWritePaths=/srv/kienzlefax /var/spool/hylafax
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable kienzlefax-worker.service
+systemctl restart kienzlefax-worker.service || true
+
+echo
+echo "== Status =="
+systemctl status kienzlefax-worker.service --no-pager || true
+EOF
+
+
+
+
+
+
