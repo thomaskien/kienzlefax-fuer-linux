@@ -1,7 +1,7 @@
 # kienzlefax
 **der ideale Faxserver für die Arztpraxis**
 
-https://github.com/thomaskien/kienzlefax-fuer-linux
+https://www.kienzlefax.de
 
 - läuft einfach in einer VM auf dem server
 - alles open source und unter linux
