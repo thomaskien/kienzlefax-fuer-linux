@@ -269,14 +269,3 @@ Drucker-Freigabe (SMB) erfolgt separat; im Setup werden CUPS-Queues bereitgestel
 ### Aktive Jobs immer sichtbar
 - Counts/Listen aus `queue/` und `processing/`
 
----
-
-## 14) Offene Punkte (für weitere README-Dateien)
-Die Einrichtung weiterer Komponenten (z.B. Asterisk/IAX/Modem/Gateway, HylaFAX-Modem-Setup, Firewall, TLS/Reverse Proxy) wird in **separaten README.md** dokumentiert und hier später verlinkt.
-
-Geplante weitere Dokumente:
-- **README-Asterisk.md** – Asterisk/IAX/Gateway-Setup für Fax
-- **README-HylaFAX.md** – HylaFAX-Konfiguration, Modems, Routing
-- **README-Samba.md** – Shares + Druckerfreigabe + Rechte/ACL
-- **README-Troubleshooting.md** – typische Fehlerbilder (CUPS/AppArmor, Worker, doneq, Rechte)
-
