@@ -3,11 +3,16 @@
  * kienzlefax.php
  * Producer Web-UI (sendet NICHT selbst).
  *
- * Version: 1.2.4
+ * Version: 1.3
  * Author: Dr. Thomas Kienzle
  * Stand: 2026-02-15
  *
  * Changelog (komplett):
+ * - 1.3 (2026-02-15):
+ *   - UI: 🔔 Glocke (Sound an/aus) in Kopfzeile; AUS-Zustand mit dickem rotem, schrägem Durchstreich-Strich.
+ *   - Audio: faxton.mp3 (liegt neben kienzlefax.php) wird nur bei NEUEM Sendefehler abgespielt (fail_count steigt, via AJAX-Status).
+ *   - Persistenz: Sound-Status + letzter fail_count via localStorage.
+ *
  * - 1.2.4 (2026-02-15):
  *   - UI (Aktive Jobs, weniger technisch): Job-ID ist nicht mehr sichtbar. Zeile 1 zeigt Empfängername (…),
  *     Tooltip enthält Faxnummer + Originaldatei + Job-ID.
@@ -46,7 +51,7 @@
  *   - UI: Fehlerberichte-Tab pulsiert deutlich bei Fehlern.
  *
  * - 1.1 (2026-02-14):
- *   - UI: Subtitle ersetzt durch "Der ideale Server für Arztpraxen".
+ *   - UI: Subtitle ersetzt durch "Der ideale Faxserver für Arztpraxen".
  *   - UI: "Bitte wählen:" über der Ordnerauswahl.
  *   - UI: Refresh-Button in der Kopfzeile.
  *   - UI: PDF-Auswahl: Button zum Löschen ausgewählter PDFs (Quelle).
@@ -101,8 +106,11 @@ $MAX_FAIL_LIST    = 200;
 $MAX_ARCHIVE_LIST = 25;
 
 $APP_TITLE   = 'kienzlefax';
-$APP_VERSION = '1.2.4';
+$APP_VERSION = '1.3';
 $APP_AUTHOR  = 'Dr. Thomas Kienzle';
+
+// Audio-Datei (liegt neben dieser PHP)
+$ALERT_MP3 = 'faxton.mp3';
 
 // -------------------- Helpers --------------------
 function h(string $s): string { return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
@@ -304,12 +312,6 @@ function read_json_file(string $path): ?array {
   return is_array($j) ? $j : null;
 }
 
-/**
- * Abbruch robust erkennen:
- * - cancel.requested && cancel.handled_at
- * - oder "aborted" in result.reason/status_text
- * - oder statuscode==345 && cancel.requested
- */
 function is_aborted_job(array $j): bool {
   if (isset($j['cancel']) && is_array($j['cancel'])) {
     $req = (bool)($j['cancel']['requested'] ?? false);
@@ -336,9 +338,6 @@ function is_aborted_job(array $j): bool {
   return false;
 }
 
-/**
- * 1.2.3: Seiten robust extrahieren (keine Design/Flow-Änderung).
- */
 function extract_pages(array $j): string {
   if (isset($j['result']) && is_array($j['result'])) {
     $rp = isset($j['result']['pages']) ? (string)$j['result']['pages'] : '';
@@ -374,9 +373,6 @@ function hhmm_from_iso(?string $iso): string {
   return date('H:i', $t);
 }
 
-/**
- * AJAX: schlankes Status-Payload (keine Seitenelemente anfassen).
- */
 function build_active_jobs_payload(array $activePreview): array {
   $out = [];
   foreach ($activePreview as $a) {
@@ -843,15 +839,8 @@ foreach (array_reverse($queueJobs) as $jid) {
   $activePreview[] = ['id' => $jid, 'where' => 'queue', 'meta' => read_job_meta($GLOBALS['DIR_QUEUE'] . '/' . $jid)];
 }
 
-// Fail state for pulse
 $failCount = count_json_files($DIR_FAIL_REP, 999);
 $hasFails = ($failCount > 0);
-
-// Contact map for JS
-$contactMap = [];
-foreach ($contacts as $c) {
-  $contactMap[(string)$c['id']] = ['name' => (string)$c['name'], 'number' => (string)$c['number']];
-}
 
 // -------------------- AJAX (Soft Refresh) --------------------
 $ajax = (string)($_GET['ajax'] ?? '');
@@ -868,6 +857,13 @@ if ($ajax === 'status') {
   exit;
 }
 
+// -------------------- Contact Map --------------------
+$contacts = get_contacts($pdo);
+$contactMap = [];
+foreach ($contacts as $c) {
+  $contactMap[(string)$c['id']] = ['name' => (string)$c['name'], 'number' => (string)$c['number']];
+}
+
 ?>
 <!doctype html>
 <html lang="de">
@@ -882,9 +878,7 @@ if ($ajax === 'status') {
       --shadow: 0 10px 30px rgba(18, 34, 64, .08);
       --r:14px;
     }
-    body{
-      margin:0;
-      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+    body{ margin:0; font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
       background: radial-gradient(1200px 600px at 10% 0%, #eef6ff 0%, transparent 60%),
                   radial-gradient(900px 500px at 90% 0%, #e9fff7 0%, transparent 55%),
                   var(--bg);
@@ -893,21 +887,32 @@ if ($ajax === 'status') {
       display:flex;
       flex-direction:column;
     }
-
     header{ position:sticky; top:0; z-index:10; background: rgba(255,255,255,.85); backdrop-filter: blur(10px); border-bottom:1px solid var(--line); }
     .head-inner{ max-width:1200px; margin:0 auto; padding:14px 16px; display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
     .brand{ display:flex; align-items:center; gap:10px; font-weight:800; letter-spacing:.3px; }
     .logo{ width:34px; height:34px; border-radius:10px; background: linear-gradient(135deg, var(--primary) 0%, var(--primary2) 100%); box-shadow: var(--shadow); }
     .kpis{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-    .pill{ display:inline-flex; gap:8px; align-items:center; padding:8px 10px; border:1px solid var(--line); border-radius:999px; background:#fff; box-shadow: 0 6px 14px rgba(18,34,64,.04); font-size:14px; color: var(--ink); text-decoration:none; }
+    .pill{ display:inline-flex; gap:8px; align-items:center; padding:8px 10px; border:1px solid var(--line); border-radius:999px; background:#fff; box-shadow: 0 6px 14px rgba(18,34,64,.04); font-size:14px; text-decoration:none; color:var(--ink); user-select:none; }
     .pill b{ font-variant-numeric: tabular-nums; }
 
-    .wrap{
-      max-width:1200px; margin:0 auto; padding:14px 16px 26px;
-      display:grid; grid-template-columns: 260px 1fr; gap:14px;
-      width:100%; flex:1 0 auto;
+    /* 1.3 Sound-Glocke */
+    .pill.bell{ position:relative; padding:8px 12px; cursor:pointer; }
+    .pill.bell.off{ opacity:.65; }
+    .pill.bell.off::after{
+      content:'';
+      position:absolute;
+      left:10%;
+      top:50%;
+      width:80%;
+      height:5px;               /* dicker Strich */
+      background: var(--danger);
+      border-radius: 6px;
+      transform: translateY(-50%) rotate(-22deg);  /* schräg */
+      box-shadow: 0 0 0 1px rgba(255,77,109,.15);
+      pointer-events:none;
     }
 
+    .wrap{ max-width:1200px; margin:0 auto; padding:14px 16px 26px; display:grid; grid-template-columns: 260px 1fr; gap:14px; width:100%; flex:1 0 auto; }
     .card{ background:var(--card); border:1px solid var(--line); border-radius:var(--r); box-shadow: var(--shadow); padding:14px; }
     .tabs{ display:flex; flex-wrap:wrap; gap:10px; margin-bottom:12px; }
     .tab{ text-decoration:none; display:inline-flex; align-items:center; gap:8px; padding:10px 12px; border-radius:999px; border:1px solid var(--line); background:#fff; color:var(--ink); font-weight:700; font-size:14px; }
@@ -929,23 +934,10 @@ if ($ajax === 'status') {
     .btn.small{ padding:10px 12px; border-radius:12px; font-weight:700; box-shadow:none; }
     .btn:disabled{ opacity:.55; cursor:not-allowed; }
 
-    input[type="text"], textarea, select{
-      width:100%;
-      padding:12px 12px;
-      border:1px solid var(--line);
-      border-radius:12px;
-      font-size:15px;
-      background:#fff;
-      box-sizing:border-box;
-    }
+    input[type="text"], textarea, select{ width:100%; padding:12px 12px; border:1px solid var(--line); border-radius:12px; font-size:15px; background:#fff; box-sizing:border-box; }
     textarea{ min-height:80px; }
     label{ font-weight:800; font-size:13px; color:var(--mut); display:block; margin:10px 0 6px; }
-
     .row{ display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:12px; }
-
-    .recipient-limits{ max-width: 860px; }
-    .recipient-row{ display:grid; grid-template-columns: 1fr 1fr; column-gap: 32px; margin-top:12px; }
-
     .tbl{ width:100%; border-collapse:collapse; }
     .tbl th,.tbl td{ border-bottom:1px solid var(--line); padding:10px 8px; vertical-align:top; font-size:14px; }
     .tbl th{ color:var(--mut); text-align:left; font-weight:900; }
@@ -1026,11 +1018,12 @@ if ($ajax === 'status') {
       <div class="logo"></div>
       <div>
         <div style="font-size:18px; line-height:1;"><?=h($APP_TITLE)?></div>
-        <div class="mut" style="font-size:13px; margin-top:3px;">Der ideale Server für Arztpraxen</div>
+        <div class="mut" style="font-size:13px; margin-top:3px;">Der ideale Faxserver für Arztpraxen</div>
       </div>
     </div>
     <div class="kpis">
       <a class="pill" href="<?=h($_SERVER['REQUEST_URI'] ?? '/')?>">🔄 refresh</a>
+      <span id="soundBell" class="pill bell" title="Fehlerton: an/aus">🔔</span>
       <span class="pill">⏳ queue <b id="kpiQueue"><?=count($queueJobs)?></b></span>
       <span class="pill">⚙️ processing <b id="kpiProc"><?=count($procJobs)?></b></span>
     </div>
@@ -1127,14 +1120,11 @@ if ($ajax === 'status') {
                   <span class="ellipsis sidebar" title="<?=h($tooltip1)?>"><?=h($rName !== '' ? $rName : '—')?></span>
                 </div>
                 <div class="mut" style="font-size:13px; margin-top:2px;">
-                  <span class="ellipsis sidebar" title="<?=h($tooltip2)?>"
+                  <span class="ellipsis sidebar"
+                        title="<?=h($tooltip2)?>"
                         data-started-at="<?=h($startedAt)?>"
-                        data-where="<?=h($where)?>"
-                        data-sent="<?=h($sent === null ? '' : (string)$sent)?>"
-                        data-total="<?=h($total === null ? '' : (string)$total)?>"
-                        data-done="<?=h($done === null ? '' : (string)$done)?>"
-                        data-max="<?=h($max === null ? '' : (string)$max)?>"
-                        data-submitted="<?=h($submittedAt)?>"><?=h($line2)?></span>
+                        data-submitted-at="<?=h($submittedAt)?>"
+                        data-where="<?=h($where)?>"><?=h($line2)?></span>
                 </div>
               </div>
 
@@ -1218,16 +1208,18 @@ if ($ajax === 'status') {
 
     <?php elseif ($view === 'sendelog'): ?>
       <?php
-        $showAll = ((string)($_GET['all'] ?? '') === '1');
+        $showAll = isset($_GET['all']) && ((string)$_GET['all'] === '1');
         $limit = $showAll ? 500 : $MAX_ARCHIVE_LIST;
       ?>
-      <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
-        <h2 class="section-title" style="margin:0;">✅ Sendeprotokoll (<?= $showAll ? 'alle' : ('letzte ' . $MAX_ARCHIVE_LIST) ?>)</h2>
-        <?php if (!$showAll): ?>
-          <a class="btn ghost small" href="?view=sendelog&amp;all=1">📚 alle anzeigen</a>
-        <?php else: ?>
-          <a class="btn ghost small" href="?view=sendelog">↩️ zurück (letzte)</a>
-        <?php endif; ?>
+      <div style="display:flex; justify-content:space-between; align-items:end; gap:12px; flex-wrap:wrap;">
+        <h2 class="section-title" style="margin:0;">✅ Sendeprotokoll (letzte <?=$showAll ? $limit : $MAX_ARCHIVE_LIST?>)</h2>
+        <div>
+          <?php if (!$showAll): ?>
+            <a class="btn ghost small" href="?view=sendelog&amp;all=1">alle anzeigen</a>
+          <?php else: ?>
+            <a class="btn ghost small" href="?view=sendelog">nur letzte <?=$MAX_ARCHIVE_LIST?></a>
+          <?php endif; ?>
+        </div>
       </div>
 
       <?php
@@ -1239,7 +1231,9 @@ if ($ajax === 'status') {
               if (!preg_match('/\.json\z/i', $e)) continue;
               $p = $DIR_ARCHIVE . '/' . $e;
               if (!is_file($p)) continue;
-              $j = read_json_file($p);
+              $raw = @file_get_contents($p);
+              if ($raw === false) continue;
+              $j = json_decode($raw, true);
               if (!is_array($j)) continue;
               $end = (string)($j['end_time'] ?? $j['completed_at'] ?? $j['updated_at'] ?? '');
               $ts = parse_iso_time($end) ?? 0;
@@ -1270,8 +1264,9 @@ if ($ajax === 'status') {
               $name = (string)($j['recipient']['name'] ?? '');
               $num = (string)($j['recipient']['number'] ?? '');
               $status = (string)($j['status'] ?? '');
+
+              $aborted = is_aborted_job($j);
               $isOk = (strcasecmp($status, 'OK') === 0) || (stripos($status, 'ok') !== false);
-              $isAborted = (!$isOk) && is_aborted_job($j);
 
               $dur = '';
               $t1 = parse_iso_time($start);
@@ -1283,37 +1278,29 @@ if ($ajax === 'status') {
               $pdf = '';
               if (preg_match('/\A(.+)\.json\z/i', $it['json'], $m)) {
                 $stem = $m[1];
-                $candOk = $stem . '__OK.pdf';
-                $candFail = $stem . '__FAILED.pdf';
-                if (is_file($DIR_ARCHIVE . '/' . $candOk)) $pdf = $candOk;
-                elseif (is_file($DIR_ARCHIVE . '/' . $candFail)) $pdf = $candFail;
+                $cand = $stem . '__OK.pdf';
+                if (is_file($DIR_ARCHIVE . '/' . $cand)) $pdf = $cand;
               }
             ?>
             <tr>
               <td class="nowrap">
-                <?php if ($isOk): ?><span class="chip ok">✅ Senden erfolgreich</span>
-                <?php elseif ($isAborted): ?><span class="chip abort">⛔ Abgebrochen</span>
+                <?php if ($aborted): ?><span class="chip abort">⛔ Abgebrochen</span>
+                <?php elseif ($isOk): ?><span class="chip ok">✅ Senden erfolgreich</span>
                 <?php else: ?><span class="chip fail">❌ Fehlgeschlagen</span><?php endif; ?>
               </td>
               <td class="nowrap"><?=h($end)?></td>
               <td><div style="font-weight:900;"><?=h($name)?></div><div class="mono mut"><?=h($num)?></div></td>
               <td class="nowrap"><?=h($dur ?: '—')?></td>
-              <td class="nowrap"><?=h($pages !== '' ? $pages : '—')?></td>
+              <td class="nowrap"><?=h($pages ?: '—')?></td>
               <td class="right nowrap">
-                <?php if ($pdf !== ''): ?><a class="btn ghost small" href="?download=okpdf&amp;file=<?=h($pdf)?>" title="<?=h($pdf)?>">📄 PDF</a><?php else: ?><span class="mut">—</span><?php endif; ?>
-                <a class="btn ghost small" href="?download=jsonok&amp;file=<?=h($it['json'])?>" title="<?=h($it['json'])?>">🧾 JSON</a>
+                <?php if ($pdf !== ''): ?><a class="btn ghost small" href="?download=okpdf&amp;file=<?=h($pdf)?>">📄 PDF</a><?php else: ?><span class="mut">—</span><?php endif; ?>
+                <a class="btn ghost small" href="?download=jsonok&amp;file=<?=h($it['json'])?>">🧾 JSON</a>
               </td>
             </tr>
           <?php endforeach; ?>
         <?php endif; ?>
         </tbody>
       </table>
-
-      <?php if ($showAll): ?>
-        <div class="mut" style="font-size:12px; margin-top:10px;">
-          Hinweis: "alle anzeigen" ist aus Performance-Gründen auf 500 Einträge begrenzt.
-        </div>
-      <?php endif; ?>
 
     <?php elseif ($view === 'sendefehler-berichte'): ?>
       <h2 class="section-title">⚠️ Sendefehler-Berichte</h2>
@@ -1337,7 +1324,9 @@ if ($ajax === 'status') {
               if (!preg_match('/\.json\z/i', $e)) continue;
               $p = $DIR_FAIL_REP . '/' . $e;
               if (!is_file($p)) continue;
-              $j = read_json_file($p);
+              $raw = @file_get_contents($p);
+              if ($raw === false) continue;
+              $j = json_decode($raw, true);
               if (!is_array($j)) continue;
               $t = (string)($j['end_time'] ?? $j['updated_at'] ?? $j['created_at'] ?? '');
               $ts = parse_iso_time($t) ?? 0;
@@ -1350,18 +1339,15 @@ if ($ajax === 'status') {
         $fails = array_slice($fails, 0, $MAX_FAIL_LIST);
       ?>
 
-      <form method="post" id="failForm">
+      <form method="post" class="stack">
         <input type="hidden" name="action" value="fail_cleanup">
-        <input type="hidden" name="op" id="failOp" value="">
 
-        <div class="checkline" style="margin-top:0; justify-content:flex-end;">
-          <button type="button" class="btn ghost small" onclick="selectAllFail(true)">✅ alle</button>
-          <button type="button" class="btn ghost small" onclick="selectAllFail(false)">🧹 keine</button>
-          <button type="button" class="btn ghost small" onclick="submitFail('adopt')">📥 Fehler in Sendeprotokoll übernehmen</button>
-          <button type="button" class="btn danger small" onclick="submitFail('delete')">🗑️ Ausgewählte löschen</button>
+        <div class="checkline" style="align-items:center;">
+          <button class="btn danger" type="submit" name="op" value="delete" onclick="return confirm('Ausgewählte Fehler wirklich löschen?');">🗑️ Ausgewählte löschen</button>
+          <button class="btn ghost" type="submit" name="op" value="adopt" onclick="return confirm('Ausgewählte Fehler ins Sendeprotokoll übernehmen?');">✅ Fehler in Sendeprotokoll übernehmen</button>
         </div>
 
-        <table class="tbl" style="margin-top:10px;">
+        <table class="tbl">
           <thead><tr><th class="nowrap"></th><th>Ergebnis</th><th>Zeit</th><th>Empfänger</th><th>Fehler</th><th class="right nowrap">Artefakte</th></tr></thead>
           <tbody>
           <?php if (count($fails) === 0): ?>
@@ -1373,12 +1359,13 @@ if ($ajax === 'status') {
                 $t = (string)($j['end_time'] ?? $j['updated_at'] ?? $j['created_at'] ?? '');
                 $name = (string)($j['recipient']['name'] ?? '');
                 $num = (string)($j['recipient']['number'] ?? '');
-                $isAborted = is_aborted_job($j);
+
+                $aborted = is_aborted_job($j);
 
                 $err = '';
                 if (isset($j['result']) && is_array($j['result'])) {
                   $err = (string)($j['result']['error_message'] ?? $j['result']['stderr'] ?? '');
-                  if ($err === '') $err = (string)($j['result']['status_text'] ?? $j['result']['reason'] ?? '');
+                  if ($err === '') $err = (string)($j['result']['reason'] ?? $j['result']['status_text'] ?? '');
                 }
                 if ($err === '') $err = (string)($j['error'] ?? $j['error_message'] ?? 'FAILED');
 
@@ -1390,19 +1377,17 @@ if ($ajax === 'status') {
                 }
               ?>
               <tr>
+                <td class="nowrap"><input type="checkbox" name="failjson[]" value="<?=h($it['json'])?>"></td>
                 <td class="nowrap">
-                  <input type="checkbox" name="failjson[]" value="<?=h($it['json'])?>" class="failbox">
-                </td>
-                <td class="nowrap">
-                  <?php if ($isAborted): ?><span class="chip abort">⛔ Abgebrochen</span>
+                  <?php if ($aborted): ?><span class="chip abort">⛔ Abgebrochen</span>
                   <?php else: ?><span class="chip fail">❌ Fehlgeschlagen</span><?php endif; ?>
                 </td>
                 <td class="nowrap"><?=h($t)?></td>
                 <td><div style="font-weight:900;"><?=h($name)?></div><div class="mono mut"><?=h($num)?></div></td>
                 <td><?=h($err ?: '—')?></td>
                 <td class="right nowrap">
-                  <?php if ($pdf !== ''): ?><a class="btn ghost small" href="?download=failedpdf&amp;file=<?=h($pdf)?>" title="<?=h($pdf)?>">📄 PDF</a><?php else: ?><span class="mut">—</span><?php endif; ?>
-                  <a class="btn ghost small" href="?download=jsonfail&amp;file=<?=h($it['json'])?>" title="<?=h($it['json'])?>">🧾 JSON</a>
+                  <?php if ($pdf !== ''): ?><a class="btn ghost small" href="?download=failedpdf&amp;file=<?=h($pdf)?>">📄 PDF</a><?php else: ?><span class="mut">—</span><?php endif; ?>
+                  <a class="btn ghost small" href="?download=jsonfail&amp;file=<?=h($it['json'])?>">🧾 JSON</a>
                 </td>
               </tr>
             <?php endforeach; ?>
@@ -1410,21 +1395,6 @@ if ($ajax === 'status') {
           </tbody>
         </table>
       </form>
-
-      <script>
-        function selectAllFail(on) {
-          document.querySelectorAll('.failbox').forEach(b => b.checked = on);
-        }
-        function submitFail(op) {
-          if (op === 'delete') {
-            if (!confirm('Ausgewählte Fehlerberichte wirklich löschen? (JSON + ggf. PDF)')) return;
-          } else if (op === 'adopt') {
-            if (!confirm('Ausgewählte Fehlerberichte ins Sendeprotokoll übernehmen?')) return;
-          }
-          document.getElementById('failOp').value = op;
-          document.getElementById('failForm').submit();
-        }
-      </script>
 
     <?php else: ?>
       <?php
@@ -1434,62 +1404,57 @@ if ($ajax === 'status') {
 
       <h2 class="section-title">📄 Quelle: <?=h($src)?></h2>
 
-      <form method="post" class="stack" id="srcForm">
-        <input type="hidden" name="action" id="srcAction" value="create_jobs">
+      <form method="post" class="stack">
+        <input type="hidden" name="action" value="create_jobs">
         <input type="hidden" name="src" value="<?=h($src)?>">
 
-        <div class="subtle">
+        <div class="subtle recipient-limits">
           <div style="font-weight:900; font-size:16px;">Empfänger</div>
 
-          <div class="recipient-limits">
-            <label>Telefonbuch (optional)</label>
-            <select name="contact_id" id="contact_id">
-              <option value="">— Kontakt wählen —</option>
-              <?php foreach ($contacts as $c): ?>
-                <option value="<?=(int)$c['id']?>"><?=h($c['name'])?> · <?=h($c['number'])?></option>
-              <?php endforeach; ?>
-            </select>
+          <label>Telefonbuch (optional)</label>
+          <select name="contact_id" id="contact_id">
+            <option value="">— Kontakt wählen —</option>
+            <?php foreach ($contacts as $c): ?>
+              <option value="<?=(int)$c['id']?>"><?=h($c['name'])?> · <?=h($c['number'])?></option>
+            <?php endforeach; ?>
+          </select>
 
-            <div class="recipient-row">
-              <div>
-                <label>Empfängername</label>
-                <input type="text" name="recipient_name" id="recipient_name" placeholder="z.B. Radiologie XY">
-              </div>
-              <div>
-                <label>Faxnummer</label>
-                <input type="text" name="recipient_number" id="recipient_number" placeholder="z.B. 02331...">
-              </div>
+          <div class="recipient-row">
+            <div>
+              <label>Empfängername</label>
+              <input type="text" name="recipient_name" id="recipient_name" placeholder="z.B. Radiologie XY">
+            </div>
+            <div>
+              <label>Faxnummer</label>
+              <input type="text" name="recipient_number" id="recipient_number" placeholder="z.B. 02331...">
+            </div>
+          </div>
+
+          <div class="actionrow">
+            <div class="optstack">
+              <label>
+                <input type="checkbox" name="save_to_phonebook" id="save_to_phonebook">
+                Im Telefonbuch speichern
+              </label>
+              <label>
+                <input type="checkbox" name="ecm" checked>
+                ECM
+              </label>
             </div>
 
-            <div class="actionrow">
-              <div class="optstack">
-                <label>
-                  <input type="checkbox" name="save_to_phonebook" id="save_to_phonebook">
-                  Im Telefonbuch speichern
-                </label>
-
-                <label>
-                  <input type="checkbox" name="ecm" checked>
-                  ECM
-                </label>
-              </div>
-
-              <div>
-                <label style="margin:0 0 6px;">Auflösung</label>
-                <select name="resolution">
-                  <option value="fine" selected>fine</option>
-                  <option value="standard">standard</option>
-                </select>
-              </div>
-
-              <div style="display:flex; justify-content:flex-end;">
-                <button class="btn primary" type="submit" onclick="document.getElementById('srcAction').value='create_jobs'">🚀 Fax beauftragen</button>
-              </div>
+            <div>
+              <label style="margin:0 0 6px;">Auflösung</label>
+              <select name="resolution">
+                <option value="fine" selected>fine</option>
+                <option value="standard">standard</option>
+              </select>
             </div>
 
-            <div class="mut" style="font-size:13px; margin-top:10px;">
-              Kontakt auswählen → Felder werden übernommen (du kannst danach ändern).
-            </div>
+            <button class="btn primary" type="submit">🚀 Fax beauftragen</button>
+          </div>
+
+          <div class="mut" style="font-size:13px; margin-top:10px;">
+            Kontakt auswählen → Felder werden übernommen (du kannst danach ändern).
           </div>
         </div>
 
@@ -1502,7 +1467,8 @@ if ($ajax === 'status') {
             <div class="checkline" style="margin:0;">
               <button type="button" class="btn ghost small" onclick="selectAll(true)">✅ Alle</button>
               <button type="button" class="btn ghost small" onclick="selectAll(false)">🧹 Keine</button>
-              <button type="button" class="btn danger" onclick="submitDelete()">löschen</button>
+              <button type="submit" class="btn danger small" formaction="" onclick="return confirm('Ausgewählte PDFs wirklich löschen?');"
+                      name="action" value="delete_source_files">🗑️ löschen</button>
             </div>
           </div>
 
@@ -1515,19 +1481,15 @@ if ($ajax === 'status') {
               <?php foreach ($pdfs as $fn): ?>
                 <?php
                   $p = $srcDir . '/' . $fn;
-                  $sizeStr = '—';
-                  if (within_dir($p, $srcDir) && is_file($p)) {
-                    $sz = @filesize($p);
-                    $sizeStr = format_size(($sz === false) ? null : (int)$sz);
-                  }
+                  $sz = is_file($p) ? filesize($p) : null;
                 ?>
                 <tr>
                   <td class="nowrap"><input type="checkbox" name="files[]" value="<?=h($fn)?>" class="filebox"></td>
                   <td style="font-weight:900;">
                     <span class="ellipsis fn" title="<?=h($fn)?>"><?=h($fn)?></span>
                   </td>
-                  <td class="mono nowrap"><?=h($sizeStr)?></td>
-                  <td class="right nowrap"><a class="btn ghost small" href="?download=srcpdf&amp;src=<?=h($src)?>&amp;file=<?=h($fn)?>" title="<?=h($fn)?>">👁️ PDF</a></td>
+                  <td class="nowrap"><?=h(format_size(is_int($sz) ? $sz : null))?></td>
+                  <td class="right nowrap"><a class="btn ghost small" href="?download=srcpdf&amp;src=<?=h($src)?>&amp;file=<?=h($fn)?>">👁️ PDF</a></td>
                 </tr>
               <?php endforeach; ?>
             <?php endif; ?>
@@ -1554,14 +1516,6 @@ if ($ajax === 'status') {
         function selectAll(on) {
           document.querySelectorAll('.filebox').forEach(b => b.checked = on);
         }
-
-        function submitDelete() {
-          const any = Array.from(document.querySelectorAll('.filebox')).some(b => b.checked);
-          if (!any) { alert('Bitte erst Dateien auswählen.'); return; }
-          if (!confirm('Ausgewählte Dateien wirklich löschen?')) return;
-          document.getElementById('srcAction').value = 'delete_source_files';
-          document.getElementById('srcForm').submit();
-        }
       </script>
 
     <?php endif; ?>
@@ -1573,8 +1527,36 @@ if ($ajax === 'status') {
 </footer>
 
 <script>
-  // 1.2.4 Live-AJAX: nur KPIs + aktive Jobs + Fehlerpuls (keine Formulare/Tabellen anfassen).
+  // 1.3 Live-AJAX (+ Sound): nur KPIs + aktive Jobs + Fehlerpuls (keine Formulare/Tabellen anfassen).
   (function(){
+    // -------------------- Sound (faxton.mp3) --------------------
+    const SOUND_URL = <?=json_encode($ALERT_MP3, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)?>;
+    const bell = document.getElementById('soundBell');
+
+    function soundEnabled(){
+      return localStorage.getItem('kf_sound') !== 'off';
+    }
+    function setSoundEnabled(on){
+      localStorage.setItem('kf_sound', on ? 'on' : 'off');
+      if (bell){
+        if (on) bell.classList.remove('off');
+        else bell.classList.add('off');
+      }
+    }
+
+    // Init UI state
+    setSoundEnabled(soundEnabled());
+
+    if (bell){
+      bell.addEventListener('click', () => {
+        setSoundEnabled(!soundEnabled());
+      });
+    }
+
+    // last fail_count (persist)
+    let lastFailCount = Number(localStorage.getItem('kf_last_fail_count') || '0');
+    if (!Number.isFinite(lastFailCount) || lastFailCount < 0) lastFailCount = 0;
+
     const kpiQueue = document.getElementById('kpiQueue');
     const kpiProc  = document.getElementById('kpiProc');
     const failTab  = document.getElementById('failTab');
@@ -1622,7 +1604,6 @@ if ($ajax === 'status') {
         return parts.join(' · ');
       }
 
-      // queue: kein "Sende:"
       if (where === 'queue') {
         const ca = safeText(job.created_at);
         let hm = '';
@@ -1636,7 +1617,6 @@ if ($ajax === 'status') {
         return 'queued' + (hm ? (' · erstellt ' + hm) : '');
       }
 
-      // fallback (selten): minimal
       return where || 'aktiv';
     }
 
@@ -1660,6 +1640,16 @@ if ($ajax === 'status') {
       return {t1, t2};
     }
 
+    function escapeHtml(s){
+      s = String(s);
+      return s
+        .replace(/&/g,'&amp;')
+        .replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;')
+        .replace(/"/g,'&quot;')
+        .replace(/'/g,'&#039;');
+    }
+
     function renderJobs(activeJobs){
       if (!listEl) return;
 
@@ -1676,7 +1666,6 @@ if ($ajax === 'status') {
         const line2 = buildLine2(job, nowMs);
         const tips = buildTooltips(job, line2);
 
-        // Cancel form (POST) bleibt wie gehabt
         const jobId = safeText(job.job_id);
         const where = safeText(job.where);
 
@@ -1687,9 +1676,7 @@ if ($ajax === 'status') {
       <span class="ellipsis sidebar" title="${escapeHtml(tips.t1)}">${escapeHtml(name)}</span>
     </div>
     <div class="mut" style="font-size:13px; margin-top:2px;">
-      <span class="ellipsis sidebar" title="${escapeHtml(tips.t2)}"
-            data-started-at="${escapeHtml(safeText(job.started_at))}"
-            data-where="${escapeHtml(where)}">${escapeHtml(line2)}</span>
+      <span class="ellipsis sidebar" title="${escapeHtml(tips.t2)}">${escapeHtml(line2)}</span>
     </div>
   </div>
 
@@ -1707,23 +1694,11 @@ if ($ajax === 'status') {
       listEl.innerHTML = itemsHtml;
     }
 
-    function escapeHtml(s){
-      s = String(s);
-      return s
-        .replace(/&/g,'&amp;')
-        .replace(/</g,'&lt;')
-        .replace(/>/g,'&gt;')
-        .replace(/"/g,'&quot;')
-        .replace(/'/g,'&#039;');
-    }
-
     async function poll(){
-      // nur wenn Tab sichtbar -> weniger Last
       if (document.visibilityState !== 'visible') return;
       try {
         const url = new URL(window.location.href);
         url.searchParams.set('ajax', 'status');
-        // cache bust
         url.searchParams.set('_', String(Date.now()));
 
         const res = await fetch(url.toString(), {cache: 'no-store'});
@@ -1733,20 +1708,28 @@ if ($ajax === 'status') {
         if (kpiQueue && typeof j.queue_count === 'number') kpiQueue.textContent = String(j.queue_count);
         if (kpiProc  && typeof j.processing_count === 'number') kpiProc.textContent = String(j.processing_count);
 
-        // Fehlerpuls (nur Klasse + Tooltip-Count)
         if (failTab && typeof j.fail_count === 'number') {
           failTab.title = 'Fehlerberichte (' + j.fail_count + ')';
           if (j.fail_count > 0) failTab.classList.add('pulse-danger');
           else failTab.classList.remove('pulse-danger');
+
+          // Sound nur bei Anstieg (Handlungsbedarf)
+          if (j.fail_count > lastFailCount && soundEnabled()) {
+            try {
+              const a = new Audio(SOUND_URL);
+              a.play().catch(() => {});
+            } catch (e) {}
+          }
+          lastFailCount = j.fail_count;
+          localStorage.setItem('kf_last_fail_count', String(lastFailCount));
         }
 
         renderJobs(j.active_jobs || []);
       } catch (e) {
-        // bewusst still (kein Flash) -> nächster Tick versucht erneut
+        // still
       }
     }
 
-    // Start: alle 3s (sehr defensiv)
     poll();
     setInterval(poll, 3000);
   })();
