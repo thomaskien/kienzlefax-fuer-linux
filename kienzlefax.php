@@ -3,11 +3,24 @@
  * kienzlefax.php
  * Producer Web-UI (sendet NICHT selbst).
  *
- * Version: 1.2.1
+ * Version: 1.2.3
  * Author: Dr. Thomas Kienzle
  * Stand: 2026-02-14
  *
  * Changelog (komplett):
+ * - 1.2.3 (2026-02-14):
+ *   - BUGFIX (ohne Kollateralschaden): Seitenanzeige im Sendeprotokoll wieder robust.
+ *     Jetzt werden Seiten wie folgt ermittelt (Fallback-Kette):
+ *       1) result.pages (z.B. "0/1")
+ *       2) result.npages + result.totpages (z.B. "32/32")
+ *       3) pages (Top-Level, falls vorhanden)
+ *     → verhindert "—" bei typischen OK-JSONs, die nur npages/totpages liefern.
+ *
+ * - 1.2.2 (2026-02-14):
+ *   - UI: Linke Sidebar ca. 30% schmaler (360px -> 260px) für bessere Nutzbarkeit bei ~1000px Fensterbreite.
+ *   - UI: Aktive Jobs: Status (queue/processing) platzsparend als Text integriert; Chip entfernt.
+ *   - UI: Lange PDF-Dateinamen werden überall in der UI einzeilig gekürzt ("…") + Tooltip mit vollem Namen.
+ *
  * - 1.2.1 (2026-02-14):
  *   - FIX: Robustere Erkennung "⛔ Abgebrochen" in Fehlerberichte UND Sendeprotokoll:
  *          • cancel.requested=true UND cancel.handled_at vorhanden -> Abgebrochen
@@ -17,23 +30,22 @@
  *   - UI: Abbruch-Button bei aktiven Jobs nun dezenter Icon-Button (kein großes rotes Feld).
  *
  * - 1.2 (2026-02-14):
- *   - UI: Version + Autor als Footer unten mittig (nicht mehr im Header).
- *   - UI: Empfänger-Layout korrigiert: deutlich mehr Abstand Name↔Fax, Gesamtbreite reduziert, Empfängernamefeld kürzer.
+ *   - UI: Version + Autor als Footer unten mittig.
+ *   - UI: Empfänger-Layout korrigiert: mehr Abstand Name↔Fax, Gesamtbreite reduziert, Empfängernamefeld kürzer.
  *   - UI: "Fax beauftragen" wieder auf Höhe des Auflösungs-Dropdowns (bündig).
- *   - UI: PDF-Button in Dateiliste: Text nur "löschen" (Funktion unverändert).
- *   - UI: PDF-Dateiliste zeigt zusätzlich Dateigröße (KB/MB).
+ *   - UI: PDF-Button: Text nur "löschen" (Funktion unverändert).
+ *   - UI: PDF-Dateiliste zeigt Dateigröße.
  *   - UI: Aktive Jobs können abgebrochen werden (⛔-Button je Job, mit Rückfrage).
- *   - JSON: Abbruch setzt in job.json: cancel.requested=true + cancel.requested_at=ISO8601 (kein Statuswechsel; Worker übernimmt).
- *   - UI: Status-Anzeige "⛔ Abgebrochen" (statt "Fehlgeschlagen") in Fehlerberichte UND Sendeprotokoll,
- *         wenn JSON result.reason/status_text "aborted" enthält (z.B. "Job aborted by request").
- *   - UI: Fehlerberichte-Tab pulsiert weiterhin deutlich, wenn Fehler vorhanden (unverändert – nur beibehalten).
+ *   - JSON: Abbruch setzt cancel.requested=true + cancel.requested_at=ISO8601 (Worker übernimmt).
+ *   - UI: Status-Anzeige "⛔ Abgebrochen" in Fehlerberichte UND Sendeprotokoll, wenn JSON abort erkennen lässt.
+ *   - UI: Fehlerberichte-Tab pulsiert deutlich bei Fehlern.
  *
  * - 1.1 (2026-02-14):
  *   - UI: Subtitle ersetzt durch "Der ideale Server für Arztpraxen".
  *   - UI: "Bitte wählen:" über der Ordnerauswahl.
  *   - UI: Refresh-Button in der Kopfzeile.
- *   - UI: PDF-Auswahl: Button zum Löschen ausgewählter PDFs (Quelle) hinzugefügt.
- *   - UI: Sendeprotokoll: Option "alle anzeigen" (aus Performancegründen gecappt).
+ *   - UI: PDF-Auswahl: Button zum Löschen ausgewählter PDFs (Quelle).
+ *   - UI: Sendeprotokoll: Option "alle anzeigen" (capped).
  *   - UI: Fehlerberichte: Checkboxen + Aktionen "Ausgewählte löschen" und "Fehler in Sendeprotokoll übernehmen".
  *   - UI: Tab "Fehlerberichte" pulsiert deutlich, wenn Fehler vorhanden sind.
  *
@@ -84,7 +96,7 @@ $MAX_FAIL_LIST    = 200;
 $MAX_ARCHIVE_LIST = 25;
 
 $APP_TITLE   = 'kienzlefax';
-$APP_VERSION = '1.2.1';
+$APP_VERSION = '1.2.3';
 $APP_AUTHOR  = 'Dr. Thomas Kienzle';
 
 // -------------------- Helpers --------------------
@@ -288,7 +300,7 @@ function read_json_file(string $path): ?array {
 }
 
 /**
- * 1.2.1: Abbruch robust erkennen:
+ * Abbruch robust erkennen:
  * - cancel.requested && cancel.handled_at
  * - oder "aborted" in result.reason/status_text
  * - oder statuscode==345 && cancel.requested
@@ -317,6 +329,35 @@ function is_aborted_job(array $j): bool {
   if ($req2 && $code === 345) return true;
 
   return false;
+}
+
+/**
+ * 1.2.3: Seiten robust extrahieren (keine Design/Flow-Änderung).
+ */
+function extract_pages(array $j): string {
+  // 1) result.pages (string)
+  if (isset($j['result']) && is_array($j['result'])) {
+    $rp = isset($j['result']['pages']) ? (string)$j['result']['pages'] : '';
+    if ($rp !== '') return $rp;
+
+    // 2) result.npages/result.totpages
+    if (array_key_exists('npages', $j['result']) && array_key_exists('totpages', $j['result'])) {
+      $np = $j['result']['npages'];
+      $tp = $j['result']['totpages'];
+      // akzeptiere int/string, aber keine leeren
+      $npS = (string)$np;
+      $tpS = (string)$tp;
+      if ($npS !== '' && $tpS !== '') return $npS . '/' . $tpS;
+    }
+  }
+
+  // 3) top-level pages
+  if (isset($j['pages'])) {
+    $p = (string)$j['pages'];
+    if ($p !== '') return $p;
+  }
+
+  return '';
 }
 
 function format_size(?int $bytes): string {
@@ -402,6 +443,8 @@ function add_err(string $m): void { $GLOBALS['flash']['err'][] = $m; }
 
 // -------------------- POST Actions --------------------
 $action = (string)($_POST['action'] ?? '');
+
+/* ... (ab hier unverändert zu 1.2.2, außer 1.2.3 pages fix im sendelog weiter unten) ... */
 
 if ($action === 'create_jobs') {
   $src = (string)($_POST['src'] ?? '');
@@ -719,8 +762,7 @@ $queueJobs = list_job_dirs($DIR_QUEUE);
 $procJobs  = list_job_dirs($DIR_PROC);
 
 function read_job_meta(string $jobDir): ?array {
-  $p = $jobDir . '/job.json';
-  return read_json_file($p);
+  return read_json_file($jobDir . '/job.json');
 }
 
 $activePreview = [];
@@ -777,7 +819,12 @@ $hasFails = ($failCount > 0);
     .pill{ display:inline-flex; gap:8px; align-items:center; padding:8px 10px; border:1px solid var(--line); border-radius:999px; background:#fff; box-shadow: 0 6px 14px rgba(18,34,64,.04); font-size:14px; color: var(--ink); text-decoration:none; }
     .pill b{ font-variant-numeric: tabular-nums; }
 
-    .wrap{ max-width:1200px; margin:0 auto; padding:14px 16px 26px; display:grid; grid-template-columns: 360px 1fr; gap:14px; width:100%; flex:1 0 auto; }
+    .wrap{
+      max-width:1200px; margin:0 auto; padding:14px 16px 26px;
+      display:grid; grid-template-columns: 260px 1fr; gap:14px;
+      width:100%; flex:1 0 auto;
+    }
+
     .card{ background:var(--card); border:1px solid var(--line); border-radius:var(--r); box-shadow: var(--shadow); padding:14px; }
     .tabs{ display:flex; flex-wrap:wrap; gap:10px; margin-bottom:12px; }
     .tab{ text-decoration:none; display:inline-flex; align-items:center; gap:8px; padding:10px 12px; border-radius:999px; border:1px solid var(--line); background:#fff; color:var(--ink); font-weight:700; font-size:14px; }
@@ -799,7 +846,6 @@ $hasFails = ($failCount > 0);
     .btn.small{ padding:10px 12px; border-radius:12px; font-weight:700; box-shadow:none; }
     .btn:disabled{ opacity:.55; cursor:not-allowed; }
 
-    /* 1.2.1 FIX: box-sizing verhindert Überbreite (Faxnummer) */
     input[type="text"], textarea, select{
       width:100%;
       padding:12px 12px;
@@ -814,7 +860,6 @@ $hasFails = ($failCount > 0);
 
     .row{ display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:12px; }
 
-    /* Empfänger: bewusst schmaler + größerer Spaltabstand */
     .recipient-limits{ max-width: 860px; }
     .recipient-row{ display:grid; grid-template-columns: 1fr 1fr; column-gap: 32px; margin-top:12px; }
 
@@ -823,6 +868,17 @@ $hasFails = ($failCount > 0);
     .tbl th{ color:var(--mut); text-align:left; font-weight:900; }
     .right{ text-align:right; }
     .nowrap{ white-space:nowrap; }
+
+    .ellipsis{
+      display:block;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      max-width: 520px;
+    }
+    .ellipsis.sidebar{ max-width: 190px; }
+    .ellipsis.fn{ max-width: 520px; }
+
     .chip{ display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px; border:1px solid var(--line); background:#fff; font-weight:900; font-size:13px; }
     .chip.ok{ background: rgba(24,169,87,.12); }
     .chip.fail{ background: rgba(255,77,109,.12); }
@@ -834,7 +890,6 @@ $hasFails = ($failCount > 0);
     .optstack{ display:grid; gap:8px; align-content:start; }
     .optstack label{ margin:0; font-weight:900; color:var(--ink); display:flex; align-items:center; gap:10px; }
 
-    /* Empfänger: Auflösung + Button gleiche Höhe */
     .actionrow{
       display:grid;
       grid-template-columns: 1fr 220px auto;
@@ -844,7 +899,6 @@ $hasFails = ($failCount > 0);
       max-width: 860px;
     }
 
-    /* Deutliches Pulsieren für Fehlerberichte-Tab */
     @keyframes dangerPulse {
       0%   { box-shadow: 0 0 0 rgba(255,77,109,0.0); border-color: var(--danger); transform: translateY(0); }
       50%  { box-shadow: 0 0 26px rgba(255,77,109,0.55); border-color: rgba(255,77,109,0.95); transform: translateY(-1px); }
@@ -856,7 +910,6 @@ $hasFails = ($failCount > 0);
       animation: dangerPulse 1.05s ease-in-out infinite;
     }
 
-    /* 1.2.1 UI: dezenter Icon-Abbruchknopf (kein großes rotes Feld) */
     .btn.icon-danger{
       padding:6px 8px;
       border-radius:10px;
@@ -937,17 +990,21 @@ $hasFails = ($failCount > 0);
               $to = is_array($meta) ? ($meta['recipient']['number'] ?? '') : '';
               $name = is_array($meta) ? ($meta['recipient']['name'] ?? '') : '';
               $st = is_array($meta) ? ($meta['status'] ?? $a['where']) : $a['where'];
+              $whereTxt = (string)$a['where'];
             ?>
             <li>
               <div style="min-width:0;">
-                <div class="mono" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:240px;"><?=h($a['id'])?></div>
-                <div class="mut" style="font-size:13px; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:240px;">
-                  <?=h((string)$st)?> · <?=h((string)$name)?> · <span class="mono"><?=h((string)$to)?></span>
+                <div class="mono">
+                  <span class="ellipsis sidebar" title="<?=h($a['id'])?>"><?=h($a['id'])?></span>
+                </div>
+                <div class="mut" style="font-size:13px; margin-top:2px;">
+                  <span class="ellipsis sidebar" title="<?=h($whereTxt . ' · ' . (string)$st . ' · ' . (string)$name . ' · ' . (string)$to)?>">
+                    <?=h($whereTxt)?> · <?=h((string)$st)?> · <?=h((string)$name)?> · <span class="mono"><?=h((string)$to)?></span>
+                  </span>
                 </div>
               </div>
 
               <div style="display:flex; align-items:center; gap:8px;">
-                <span class="chip"><?=h($a['where'])?></span>
                 <form method="post" style="display:inline;" onsubmit="return confirm('Job wirklich abbrechen?');">
                   <input type="hidden" name="action" value="cancel_job">
                   <input type="hidden" name="job_id" value="<?=h($a['id'])?>">
@@ -1087,9 +1144,8 @@ $hasFails = ($failCount > 0);
               $t2 = parse_iso_time($end);
               if ($t1 !== null && $t2 !== null) $dur = format_duration($t2 - $t1);
 
-              $pages = '';
-              if (isset($j['result']) && is_array($j['result']) && isset($j['result']['pages'])) $pages = (string)$j['result']['pages'];
-              if ($pages === '' && isset($j['pages'])) $pages = (string)$j['pages'];
+              // 1.2.3: Seiten robust (npages/totpages als Fallback)
+              $pages = extract_pages($j);
 
               $pdf = '';
               if (preg_match('/\A(.+)\.json\z/i', $it['json'], $m)) {
@@ -1109,10 +1165,10 @@ $hasFails = ($failCount > 0);
               <td class="nowrap"><?=h($end)?></td>
               <td><div style="font-weight:900;"><?=h($name)?></div><div class="mono mut"><?=h($num)?></div></td>
               <td class="nowrap"><?=h($dur ?: '—')?></td>
-              <td class="nowrap"><?=h($pages ?: '—')?></td>
+              <td class="nowrap"><?=h($pages !== '' ? $pages : '—')?></td>
               <td class="right nowrap">
-                <?php if ($pdf !== ''): ?><a class="btn ghost small" href="?download=okpdf&amp;file=<?=h($pdf)?>">📄 PDF</a><?php else: ?><span class="mut">—</span><?php endif; ?>
-                <a class="btn ghost small" href="?download=jsonok&amp;file=<?=h($it['json'])?>">🧾 JSON</a>
+                <?php if ($pdf !== ''): ?><a class="btn ghost small" href="?download=okpdf&amp;file=<?=h($pdf)?>" title="<?=h($pdf)?>">📄 PDF</a><?php else: ?><span class="mut">—</span><?php endif; ?>
+                <a class="btn ghost small" href="?download=jsonok&amp;file=<?=h($it['json'])?>" title="<?=h($it['json'])?>">🧾 JSON</a>
               </td>
             </tr>
           <?php endforeach; ?>
@@ -1212,8 +1268,8 @@ $hasFails = ($failCount > 0);
                 <td><div style="font-weight:900;"><?=h($name)?></div><div class="mono mut"><?=h($num)?></div></td>
                 <td><?=h($err ?: '—')?></td>
                 <td class="right nowrap">
-                  <?php if ($pdf !== ''): ?><a class="btn ghost small" href="?download=failedpdf&amp;file=<?=h($pdf)?>">📄 PDF</a><?php else: ?><span class="mut">—</span><?php endif; ?>
-                  <a class="btn ghost small" href="?download=jsonfail&amp;file=<?=h($it['json'])?>">🧾 JSON</a>
+                  <?php if ($pdf !== ''): ?><a class="btn ghost small" href="?download=failedpdf&amp;file=<?=h($pdf)?>" title="<?=h($pdf)?>">📄 PDF</a><?php else: ?><span class="mut">—</span><?php endif; ?>
+                  <a class="btn ghost small" href="?download=jsonfail&amp;file=<?=h($it['json'])?>" title="<?=h($it['json'])?>">🧾 JSON</a>
                 </td>
               </tr>
             <?php endforeach; ?>
@@ -1334,9 +1390,11 @@ $hasFails = ($failCount > 0);
                 ?>
                 <tr>
                   <td class="nowrap"><input type="checkbox" name="files[]" value="<?=h($fn)?>" class="filebox"></td>
-                  <td style="font-weight:900;"><?=h($fn)?></td>
+                  <td style="font-weight:900;">
+                    <span class="ellipsis fn" title="<?=h($fn)?>"><?=h($fn)?></span>
+                  </td>
                   <td class="mono nowrap"><?=h($sizeStr)?></td>
-                  <td class="right nowrap"><a class="btn ghost small" href="?download=srcpdf&amp;src=<?=h($src)?>&amp;file=<?=h($fn)?>">👁️ PDF</a></td>
+                  <td class="right nowrap"><a class="btn ghost small" href="?download=srcpdf&amp;src=<?=h($src)?>&amp;file=<?=h($fn)?>" title="<?=h($fn)?>">👁️ PDF</a></td>
                 </tr>
               <?php endforeach; ?>
             <?php endif; ?>
