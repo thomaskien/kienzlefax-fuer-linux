@@ -1,1 +1,357 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>kienzlefax – der ideale Faxserver für die Arztpraxis</title>
 
+  <style>
+    :root{
+      --bg:#f5f7f9;
+      --card:#ffffff;
+      --text:#0f172a;
+      --muted:#475569;
+      --line:#e2e8f0;
+      --accent:#2563eb;
+      --radius:16px;
+      --sans: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      --shadow: 0 12px 30px rgba(0,0,0,.12);
+    }
+
+    *{ box-sizing:border-box; }
+    body{
+      margin:0;
+      font-family:var(--sans);
+      background:var(--bg);
+      color:var(--text);
+      line-height:1.45;
+    }
+
+    .wrap{
+      max-width:1200px;
+      margin:24px auto 60px auto;
+      padding:0 16px;
+    }
+
+    header{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      margin-bottom:14px;
+    }
+
+    .brand{
+      font-weight:800;
+      display:flex;
+      align-items:center;
+      gap:10px;
+    }
+
+    .dot{
+      width:10px;
+      height:10px;
+      border-radius:50%;
+      background:var(--accent);
+    }
+
+    nav a{
+      margin-left:12px;
+      font-size:14px;
+      color:var(--muted);
+      text-decoration:none;
+    }
+    nav a:hover{ text-decoration:underline; }
+
+    .strip{
+      display:flex;
+      gap:0;
+      overflow:hidden;
+      border:1px solid var(--line);
+      border-radius:var(--radius);
+      box-shadow:var(--shadow);
+      background:#fff;
+      width:100%;
+      margin-bottom:22px;
+    }
+
+    .cell{
+      flex:0 0 auto;
+      overflow:hidden;
+    }
+
+    .cell img{
+      display:block;
+      width:100%;
+      height:100%;
+      object-fit:contain;
+      background:#fff;
+    }
+
+    .strip .cell:first-child img{
+      border-top-left-radius:var(--radius);
+      border-bottom-left-radius:var(--radius);
+    }
+    .strip .cell:last-child img{
+      border-top-right-radius:var(--radius);
+      border-bottom-right-radius:var(--radius);
+    }
+
+    h1{
+      font-size:36px;
+      margin:18px 0 8px 0;
+    }
+
+    .subtitle{
+      color:var(--muted);
+      margin-bottom:16px;
+    }
+
+    .cta a{
+      display:inline-block;
+      padding:10px 14px;
+      border-radius:10px;
+      border:1px solid var(--line);
+      text-decoration:none;
+      font-weight:600;
+      margin-right:8px;
+      color:var(--text);
+      background:#fff;
+    }
+
+    .cta a.primary{
+      background:var(--accent);
+      color:#fff;
+      border-color:var(--accent);
+    }
+
+    .infobox{
+      margin:22px 0;
+      padding:16px 18px;
+      background:#eef2ff;
+      border:1px solid #c7d2fe;
+      border-radius:var(--radius);
+      color:#1e3a8a;
+      font-size:15px;
+      box-shadow:0 6px 18px rgba(0,0,0,.08);
+    }
+
+    .install{
+      margin-top:18px;
+      background:#fff;
+      border-radius:var(--radius);
+      border:1px solid var(--line);
+      box-shadow:var(--shadow);
+      overflow:hidden;
+    }
+
+    .install header{
+      padding:14px 16px;
+      border-bottom:1px solid var(--line);
+      font-weight:800;
+    }
+
+    pre{
+      margin:0;
+      padding:16px;
+      background:#0f172a;
+      color:#e5e7eb;
+      overflow:auto;
+      font-size:14px;
+    }
+
+    .req{
+      padding:16px;
+      font-size:14px;
+      color:var(--muted);
+    }
+
+    .flow{
+      margin-top:18px;
+      background:#fff;
+      border-radius:var(--radius);
+      border:1px solid var(--line);
+      box-shadow:var(--shadow);
+      padding:16px;
+    }
+
+    footer{
+      margin-top:28px;
+      font-size:13px;
+      color:var(--muted);
+      display:flex;
+      justify-content:space-between;
+      border-top:1px solid var(--line);
+      padding-top:12px;
+    }
+
+    @media (max-width: 520px){
+      h1{ font-size:30px; }
+    }
+  </style>
+</head>
+
+<body>
+<div class="wrap">
+
+<header>
+  <div class="brand"><span class="dot"></span>kienzlefax</div>
+  <nav>
+    <a href="https://github.com/thomaskien/kienzlefax-fuer-linux">GitHub</a>
+    <a href="/impressum/">Impressum</a>
+  </nav>
+</header>
+
+<section class="strip" id="strip-top" data-minh="320" data-maxh="640">
+  <div class="cell">
+    <img src="IMG_2964.jpeg" alt="Faxdrucker Windows">
+  </div>
+  <div class="cell">
+    <img src="IMG_2963.jpeg" alt="Dateiauswahl Web-UI">
+  </div>
+  <div class="cell">
+    <img src="IMG_2965.jpeg" alt="Faxversand Status">
+  </div>
+</section>
+
+<h1>kienzlefax – der ideale Faxserver für die Arztpraxis</h1>
+
+<p class="subtitle">
+  <b>Workflow statt Zettelwirtschaft.</b><br>
+  Drucken, auswählen, senden – mit klarer Queue, zuverlässigem Versand und sauberem Archiv.<br>
+  <b>Für Arztpraxen optimiert – und für alle anderen, die viel faxen.</b><br>
+  Open Source. Linux. HylaFAX. Asterisk. Self-hosted.
+</p>
+
+<div class="cta">
+  <a class="primary" href="https://github.com/thomaskien/kienzlefax-fuer-linux">GitHub</a>
+  <a href="https://github.com/thomaskien/kienzlefax-fuer-linux#readme">Dokumentation</a>
+</div>
+
+<div class="infobox">
+  <b>Workflow statt Zettelwirtschaft:</b>
+  Kein „Fax auf Fax“, keine Toner-Überraschungen – wichtige Befunde bleiben lesbar und jedes Dokument landet nachvollziehbar im Archiv.
+</div>
+
+<section class="install">
+  <header>▶ Installation</header>
+  <pre>Installation und Konfiguration erfolgen direkt über das Repository:
+
+https://github.com/thomaskien/kienzlefax-fuer-linux
+
+Die README beschreibt:
+- Einrichtung unter Ubuntu LTS
+- SIP-Anbindung über Asterisk
+- Versand über HylaFAX
+- Einrichtung der Faxdrucker
+- Archiv- und Fehlerstruktur</pre>
+
+  <div class="req">
+    <b>Voraussetzungen</b>
+    <ul>
+      <li>Linux-Server oder VM (Ubuntu LTS empfohlen)</li>
+      <li>SIP-fähige Faxnummer</li>
+      <li>Netzwerkzugriff der Arbeitsplätze</li>
+      <li>Grundkenntnisse in Linux-Administration</li>
+    </ul>
+    <p>
+      Nach der Einrichtung sollte der Server abgesichert werden:
+      starke Passwörter, SSH nur mit Key, Firewall-Regeln, fail2ban zum Schutz vor Brute-Force-Angriffen.
+    </p>
+  </div>
+</section>
+
+<section class="flow">
+  <h2>Ablauf</h2>
+  <ol>
+    <li>Am Arbeitsplatz auf einen der Faxdrucker drucken oder eine PDF-Datei im vorgesehenen Ordner ablegen</li>
+    <li>Im Web-UI Empfänger auswählen und Versand starten</li>
+    <li>kienzlefax verschickt jedes Dokument einzeln – auch mehrere nacheinander an dieselbe Nummer</li>
+    <li>Sendebericht und Dokument werden automatisch zusammengeführt und archiviert</li>
+    <li><b>Optimales Management von Sendefehlern:</b>
+      Fehlgeschlagene Faxe werden klar getrennt abgelegt. Das Originaldokument bleibt unverändert erhalten,
+      der Sendebericht dokumentiert den Fehler eindeutig – volle Transparenz.</li>
+  </ol>
+</section>
+
+<section class="flow" style="margin-top:22px;">
+  <h2>Technische Einordnung</h2>
+  <ul>
+    <li>HylaFAX für den stabilen Faxversand</li>
+    <li>Asterisk für die SIP-Anbindung</li>
+    <li>Ghostscript für die PDF-Aufbereitung</li>
+    <li>CUPS für die Faxdrucker-Integration</li>
+    <li>Samba für die Windows-Anbindung</li>
+    <li>Getrennter Worker-Dienst mit klarer Queue-Struktur</li>
+  </ul>
+</section>
+
+<footer>
+  <div>© Dr. Thomas Kienzle · Open Source</div>
+  <div><a href="/impressum/">Impressum</a></div>
+</footer>
+
+</div>
+
+<script>
+(function(){
+  function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+
+  async function layoutStrip(strip){
+    const imgs = Array.from(strip.querySelectorAll('img'));
+    if (!imgs.length) return;
+
+    await Promise.all(imgs.map(img => {
+      if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+      return new Promise(res => {
+        img.addEventListener('load', res, {once:true});
+        img.addEventListener('error', res, {once:true});
+      });
+    }));
+
+    const W = strip.clientWidth;
+    const minH = parseInt(strip.dataset.minh || "0", 10);
+    const maxH = parseInt(strip.dataset.maxh || "10000", 10);
+
+    const ratios = imgs.map(img => {
+      const nw = img.naturalWidth || 1;
+      const nh = img.naturalHeight || 1;
+      return nw / nh;
+    });
+
+    const sumR = ratios.reduce((a,b) => a+b, 0);
+    let H = W / sumR;
+    H = clamp(H, minH, maxH);
+
+    const rawWidths = ratios.map(r => r * H);
+    const sumRaw = rawWidths.reduce((a,b)=>a+b, 0) || 1;
+    const scale = W / sumRaw;
+
+    const finalWidths = rawWidths.map(w => Math.floor(w * scale));
+    const used = finalWidths.slice(0, -1).reduce((a,b)=>a+b, 0);
+    finalWidths[finalWidths.length - 1] = Math.max(1, W - used);
+
+    strip.style.height = Math.round(H * scale) + "px";
+
+    const cells = Array.from(strip.querySelectorAll('.cell'));
+    cells.forEach((cell, i) => {
+      cell.style.width = finalWidths[i] + "px";
+      cell.style.height = "100%";
+    });
+  }
+
+  function layoutAll(){
+    const top = document.getElementById('strip-top');
+    if (top) layoutStrip(top);
+  }
+
+  window.addEventListener('resize', () => {
+    clearTimeout(window.__fpResizeT);
+    window.__fpResizeT = setTimeout(layoutAll, 80);
+  });
+
+  layoutAll();
+})();
+</script>
+
+</body>
+</html>
