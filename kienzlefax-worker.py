@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 # kienzlefax-worker.py
-# Version 1.2.3
+# Version 1.2.4
 #
-# Key behavior:
-# - Jobs are submitted via HylaFAX sendfax, then finalized by reading /var/spool/hylafax/doneq/q<JID>
-# - A "cancel" request ALWAYS results in an entry under:
-#     /srv/kienzlefax/sendefehler/berichte/  (merged report+document + json)
-#   and the original PDF is copied to:
-#     /srv/kienzlefax/sendefehler/eingang/   (unchanged original, sendable)
+# Changes (minimal, agreed):
+# 1) Live-Status-Felder aus `faxstat -sal` in job.json:
+#    job["live"] = {
+#      "updated_at": ISO8601,
+#      "progress": {"sent": int, "total": int, "raw": "6:32"},
+#      "dials":    {"done": int, "max": int, "raw": "1:12"},
+#      "tts": "…",
+#      "state": "R",
+#      "faxstat_status": "…"
+#    }
+#    -> Nur für Jobs in processing/ mit hylafax.jid.
+#    -> `faxstat` wird NUR abgefragt, wenn mindestens ein aktiver HylaFAX-Job existiert,
+#       und dann maximal alle FAXSTAT_REFRESH_SEC Sekunden.
 #
-# Cancel semantics:
-# - cancel in queue/:   no HylaFAX; directly create report+merged and move to sendefehler/*
-# - cancel in processing/: faxrm JID, wait 3s, then finalize from doneq; forced into sendefehler/*
-#
-# Note:
-# - cancel.handled_at is set as idempotency marker (prevents repeated handling)
-# - For cancelled jobs, job["status"] is set to "FAILED" and result.reason="cancelled"
-#   (storage and UI can still use the cancel block to show "CANCELLED").
+# 2) Lock reboot-sicher: statt "Lockfile existiert" wird ein Kernel-Lock via flock genutzt.
+#    Die Datei darf existieren; blockiert nur, wenn ein Prozess den Lock hält.
 
+import fcntl
 import json
 import os
 import re
@@ -44,6 +46,7 @@ HYLAFAX_DONEQ = Path("/var/spool/hylafax/doneq")
 
 SEND_FAX_BIN = "sendfax"
 FAXRM_BIN = "faxrm"
+FAXSTAT_BIN = "faxstat"
 
 FAX_HOST = "localhost"
 FAXUSER = "faxworker"
@@ -52,17 +55,22 @@ PDF_HEADER_SCRIPT = Path("/usr/local/bin/pdf_with_header.sh")  # optional
 QPDF_BIN = "qpdf"
 
 # concurrency knobs
-MAX_INFLIGHT_PROCESSING = 2        # how many jobs may be "submitted/running" at once
+MAX_INFLIGHT_PROCESSING = 2
 POLL_INTERVAL_SEC = 1.0
-FINALIZE_TIMEOUT_SEC = 60 * 30     # after 30min we only log, we don't delete
-SEND_TIMEOUT_SEC = 30              # sendfax should return quickly with request id
-FAXRM_TIMEOUT_SEC = 30             # cancel shouldn't hang forever
+FAXSTAT_REFRESH_SEC = 2.0
+FINALIZE_TIMEOUT_SEC = 60 * 30
+SEND_TIMEOUT_SEC = 30
+FAXRM_TIMEOUT_SEC = 30
 CANCEL_POSTWAIT_SEC = 3
 
-# lockfile (avoid /run permission issues)
+# lockfile (reboot-safe via flock)
 LOCKFILE = BASE / ".kienzlefax-worker.lock"
 
 LOG_PREFIX = "kienzlefax-worker"
+
+_lock_fd: Optional[int] = None
+_last_faxstat_ts: float = 0.0
+_last_faxstat_rows: Dict[int, Dict[str, str]] = {}
 
 
 # ----------------------------
@@ -128,10 +136,6 @@ def run_cmd(cmd: list[str], *, env: Optional[dict]=None, timeout: Optional[int]=
     return p.returncode, (p.stdout or ""), (p.stderr or "")
 
 def add_header(pdf: Path) -> Path:
-    """
-    Calls /usr/local/bin/pdf_with_header.sh in.pdf out.pdf
-    Returns out path. If script missing or fails -> returns original pdf.
-    """
     if not PDF_HEADER_SCRIPT.exists():
         return pdf
     out = pdf.with_name(pdf.stem + "_hdr.pdf")
@@ -155,6 +159,170 @@ def merge_report_and_doc(report_pdf: Path, doc_pdf: Path, out_pdf: Path) -> None
     if rc != 0:
         raise RuntimeError(f"qpdf merge failed rc={rc} out={so.strip()} err={se.strip()}")
 
+def parse_ratio(s: str) -> Tuple[Optional[int], Optional[int]]:
+    s = (s or "").strip()
+    m = re.fullmatch(r"(\d+)\s*:\s*(\d+)", s)
+    if not m:
+        return None, None
+    return int(m.group(1)), int(m.group(2))
+
+
+# ----------------------------
+# faxstat live parsing
+# ----------------------------
+def parse_faxstat_sal(text: str) -> Dict[int, Dict[str, str]]:
+    """
+    Parses `faxstat -sal` table into:
+      { jid: { "jid","pri","state","owner","number","pages","dials","tts","status" } }
+    """
+    rows: Dict[int, Dict[str, str]] = {}
+    lines = (text or "").splitlines()
+
+    # find header line starting with "JID"
+    start = None
+    for i, ln in enumerate(lines):
+        if ln.strip().startswith("JID"):
+            start = i + 1
+            break
+    if start is None:
+        return rows
+
+    for ln in lines[start:]:
+        if not ln.strip():
+            continue
+        toks = ln.split()
+        if len(toks) < 7:
+            continue
+
+        jid_s = toks[0]
+        if not jid_s.isdigit():
+            continue
+
+        jid = int(jid_s)
+        pri = toks[1] if len(toks) > 1 else ""
+        state = toks[2] if len(toks) > 2 else ""
+        owner = toks[3] if len(toks) > 3 else ""
+        number = toks[4] if len(toks) > 4 else ""
+        pages = toks[5] if len(toks) > 5 else ""
+        dials = toks[6] if len(toks) > 6 else ""
+        tts = toks[7] if len(toks) > 7 else ""
+        status = " ".join(toks[8:]) if len(toks) > 8 else ""
+
+        rows[jid] = {
+            "jid": str(jid),
+            "pri": pri,
+            "state": state,
+            "owner": owner,
+            "number": number,
+            "pages": pages,
+            "dials": dials,
+            "tts": tts,
+            "status": status,
+        }
+    return rows
+
+def has_active_hylafax_jobs() -> bool:
+    """
+    Only poll faxstat if at least one processing job has a JID and is not finalized.
+    """
+    for jdir in list_jobdirs(PROC):
+        jp = jdir / "job.json"
+        if not jp.exists():
+            continue
+        try:
+            job = read_json(jp)
+        except Exception:
+            continue
+        hy = job.get("hylafax") or {}
+        if not hy.get("jid"):
+            continue
+        if job.get("finalized_at") or job.get("end_time"):
+            continue
+        return True
+    return False
+
+def refresh_faxstat_cache_if_needed() -> None:
+    global _last_faxstat_ts, _last_faxstat_rows
+
+    if not has_active_hylafax_jobs():
+        return
+
+    now = time.time()
+    if (now - _last_faxstat_ts) < FAXSTAT_REFRESH_SEC and _last_faxstat_rows:
+        return
+
+    env = os.environ.copy()
+    env["FAXUSER"] = FAXUSER
+
+    # -a (all jobs), -l (long), -s (sendq status). User wanted -sal style.
+    cmd = [FAXSTAT_BIN, "-sal", "-h", FAX_HOST]
+    rc, so, se = run_cmd(cmd, env=env, timeout=10)
+    if rc != 0:
+        # Keep old cache; log once per refresh attempt
+        log(f"faxstat failed rc={rc} err='{se.strip()}' out='{so.strip()}'")
+        _last_faxstat_ts = now
+        return
+
+    _last_faxstat_rows = parse_faxstat_sal(so)
+    _last_faxstat_ts = now
+
+def update_processing_jobs_live() -> None:
+    """
+    Updates job.json live fields for processing jobs with a jid.
+    Only writes when a faxstat row for that jid exists.
+    """
+    refresh_faxstat_cache_if_needed()
+    if not _last_faxstat_rows:
+        return
+
+    updated_at = now_iso()
+
+    for jdir in list_jobdirs(PROC):
+        jp = jdir / "job.json"
+        if not jp.exists():
+            continue
+        try:
+            job = read_json(jp)
+        except Exception:
+            continue
+
+        hy = job.get("hylafax") or {}
+        jid = hy.get("jid")
+        if not isinstance(jid, int):
+            # sometimes jid stored as string
+            try:
+                jid = int(jid)
+            except Exception:
+                continue
+
+        row = _last_faxstat_rows.get(jid)
+        if not row:
+            continue
+
+        sent, total = parse_ratio(row.get("pages", ""))
+        d_done, d_max = parse_ratio(row.get("dials", ""))
+
+        live = job.setdefault("live", {})
+        live["updated_at"] = updated_at
+        live["progress"] = {"sent": sent if sent is not None else 0,
+                            "total": total if total is not None else 0,
+                            "raw": row.get("pages", "")}
+        live["dials"] = {"done": d_done if d_done is not None else 0,
+                         "max": d_max if d_max is not None else 0,
+                         "raw": row.get("dials", "")}
+        live["tts"] = row.get("tts", "")
+        live["state"] = row.get("state", "")
+        live["faxstat_status"] = row.get("status", "")
+
+        try:
+            write_json(jp, job)
+        except Exception as e:
+            log(f"live update failed for {jdir.name}: {e}")
+
+
+# ----------------------------
+# Doneq parsing + report
+# ----------------------------
 @dataclass
 class DoneqInfo:
     statuscode: Optional[int] = None
@@ -205,7 +373,6 @@ def build_report_pdf(job: Dict[str, Any], doneq: Optional[DoneqInfo], out_pdf: P
     c = canvas.Canvas(str(out_pdf), pagesize=A4)
     w, h = A4
 
-    # Friendly status label
     was_cancelled = bool((job.get("cancel") or {}).get("requested"))
     status = (job.get("status") or "").upper()
     if was_cancelled:
@@ -273,10 +440,199 @@ def build_report_pdf(job: Dict[str, Any], doneq: Optional[DoneqInfo], out_pdf: P
             pass
 
     c.setFont("Helvetica", 9)
-    c.drawString(50, 40, f"Erzeugt: {now_iso()}  |  kienzlefax-worker v1.2.3")
+    c.drawString(50, 40, f"Erzeugt: {now_iso()}  |  kienzlefax-worker v1.2.4")
     c.showPage()
     c.save()
 
+
+# ----------------------------
+# Lock (reboot-safe)
+# ----------------------------
+def acquire_lock() -> None:
+    global _lock_fd
+    safe_mkdir(BASE)
+
+    fd = os.open(str(LOCKFILE), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise SystemExit(f"{LOG_PREFIX}: already running (lock held: {LOCKFILE})")
+
+    # write pid for humans (not used for logic)
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode("ascii", errors="ignore"))
+        os.fsync(fd)
+    except Exception:
+        pass
+
+    _lock_fd = fd
+
+def release_lock() -> None:
+    global _lock_fd
+    if _lock_fd is None:
+        return
+    try:
+        fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        os.close(_lock_fd)
+    except Exception:
+        pass
+    _lock_fd = None
+
+
+# ----------------------------
+# Cancel / job handling (unchanged behavior)
+# ----------------------------
+def cancel_requested(job: Dict[str, Any]) -> bool:
+    c = job.get("cancel") or {}
+    return bool(c.get("requested") is True)
+
+def cancel_handled(job: Dict[str, Any]) -> bool:
+    c = job.get("cancel") or {}
+    return bool(c.get("handled_at"))
+
+def mark_cancel_handled(job: Dict[str, Any]) -> None:
+    c = job.setdefault("cancel", {})
+    c["handled_at"] = now_iso()
+
+def hylafax_cancel(jid: int) -> Tuple[int, str, str]:
+    env = os.environ.copy()
+    env["FAXUSER"] = FAXUSER
+    cmd = [FAXRM_BIN, "-h", FAX_HOST, str(jid)]
+    rc, so, se = run_cmd(cmd, env=env, timeout=FAXRM_TIMEOUT_SEC)
+    return rc, so, se
+
+def find_original_pdf_in_jobdir(jobdir: Path) -> Optional[Path]:
+    cand1 = jobdir / "source.pdf"
+    cand2 = jobdir / "doc.pdf"
+    for c in (cand1, cand2):
+        try:
+            if c.exists() and c.stat().st_size > 0:
+                return c
+        except Exception:
+            continue
+    return None
+
+def copy_original_to_fail_in(jobdir: Path, job: Dict[str, Any]) -> None:
+    safe_mkdir(FAIL_IN)
+    src = job.get("source") or {}
+    jobid = job.get("job_id") or jobdir.name
+
+    orig_path = find_original_pdf_in_jobdir(jobdir)
+    if not orig_path:
+        return
+
+    base = sanitize_basename(Path(src.get("filename_original") or "document").stem) or "document"
+    dest = FAIL_IN / f"{base}.pdf"
+    if dest.exists():
+        dest = FAIL_IN / f"{base}__{jobid}.pdf"
+
+    shutil.copy2(str(orig_path), str(dest))
+    log(f"cancel/fail: original copied -> {dest.name}")
+
+def write_failed_artifacts(jobdir: Path, job: Dict[str, Any], doneq: Optional[DoneqInfo]) -> None:
+    safe_mkdir(FAIL_OUT)
+
+    src = job.get("source") or {}
+    base = sanitize_basename(Path(src.get("filename_original") or "fax").stem)
+    jobid = job.get("job_id") or jobdir.name
+
+    job["finalizing_at"] = job.get("finalizing_at") or now_iso()
+    job["finalized_at"] = now_iso()
+    job["end_time"] = job.get("end_time") or job["finalized_at"]
+
+    job["status"] = "FAILED"
+    job.setdefault("result", {})
+    job["result"]["reason"] = job["result"].get("reason") or ("cancelled" if cancel_requested(job) else "unknown")
+
+    report_pdf = jobdir / "report.pdf"
+    merged_pdf = jobdir / "merged.pdf"
+
+    doc = jobdir / "doc.pdf"
+    send_doc = doc.with_name(doc.stem + "_hdr.pdf")
+    merge_doc = send_doc if send_doc.exists() else doc
+
+    build_report_pdf(job, doneq, report_pdf)
+    merge_report_and_doc(report_pdf, merge_doc, merged_pdf)
+
+    out_pdf = FAIL_OUT / f"{base}__{jobid}__FAILED.pdf"
+    out_json = FAIL_OUT / f"{base}__{jobid}.json"
+
+    shutil.move(str(merged_pdf), str(out_pdf))
+    write_json(out_json, job)
+    log(f"cancel/fail: written -> {out_pdf.name} + {out_json.name}")
+
+def finalize_cancel_in_queue(jdir: Path) -> None:
+    jp = jdir / "job.json"
+    if not jp.exists():
+        return
+
+    job = read_json(jp)
+    if not cancel_requested(job) or cancel_handled(job):
+        return
+
+    mark_cancel_handled(job)
+    job["claimed_at"] = job.get("claimed_at") or now_iso()
+    job["submitted_at"] = job.get("submitted_at") or job["claimed_at"]
+    job["started_at"] = job.get("started_at") or job["claimed_at"]
+    job["end_time"] = job.get("end_time") or now_iso()
+    job.setdefault("result", {})
+    job["result"]["reason"] = job["result"].get("reason") or "cancelled"
+
+    try:
+        copy_original_to_fail_in(jdir, job)
+    except Exception as e:
+        log(f"queue-cancel: copy original failed: {e}")
+
+    try:
+        write_failed_artifacts(jdir, job, doneq=None)
+    except Exception as e:
+        log(f"queue-cancel: write artifacts failed: {e}")
+        try:
+            write_json(jp, job)
+        except Exception:
+            pass
+        return
+
+    shutil.rmtree(jdir, ignore_errors=True)
+    log(f"queue-cancel: removed jobdir {jdir.name}")
+
+def handle_cancel_in_processing(jdir: Path) -> None:
+    jp = jdir / "job.json"
+    if not jp.exists():
+        return
+    try:
+        job = read_json(jp)
+    except Exception:
+        return
+
+    if not cancel_requested(job) or cancel_handled(job):
+        return
+
+    jid = (job.get("hylafax") or {}).get("jid")
+    if jid:
+        log(f"cancel requested -> faxrm jid={jid} job={job.get('job_id','')}")
+        try:
+            rc, so, se = hylafax_cancel(int(jid))
+            log(f"faxrm rc={rc} out='{so.strip()}' err='{se.strip()}'")
+        except subprocess.TimeoutExpired:
+            log(f"faxrm timeout for jid={jid}")
+        time.sleep(CANCEL_POSTWAIT_SEC)
+
+    mark_cancel_handled(job)
+    try:
+        write_json(jp, job)
+    except Exception as e:
+        log(f"failed to write cancel.handled_at for {jdir.name}: {e}")
+
+
+# ----------------------------
+# Workflow: claim/submit/finalize
+# ----------------------------
 def get_busy_numbers() -> set[str]:
     busy: set[str] = set()
     for jdir in list_jobdirs(PROC):
@@ -337,195 +693,6 @@ def ensure_dirs() -> None:
     for p in (QUEUE, PROC, ARCH_OK, FAIL_IN, FAIL_OUT):
         safe_mkdir(p)
 
-def acquire_lock() -> None:
-    try:
-        fd = os.open(str(LOCKFILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        os.write(fd, str(os.getpid()).encode("ascii"))
-        os.close(fd)
-    except FileExistsError:
-        raise SystemExit(f"{LOG_PREFIX}: already running (lock exists: {LOCKFILE})")
-
-def release_lock() -> None:
-    try:
-        LOCKFILE.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-
-# ----------------------------
-# Cancel logic + common "finalize to sendefehler"
-# ----------------------------
-def cancel_requested(job: Dict[str, Any]) -> bool:
-    c = job.get("cancel") or {}
-    return bool(c.get("requested") is True)
-
-def cancel_handled(job: Dict[str, Any]) -> bool:
-    c = job.get("cancel") or {}
-    return bool(c.get("handled_at"))
-
-def mark_cancel_handled(job: Dict[str, Any]) -> None:
-    c = job.setdefault("cancel", {})
-    c["handled_at"] = now_iso()
-
-def hylafax_cancel(jid: int) -> Tuple[int, str, str]:
-    env = os.environ.copy()
-    env["FAXUSER"] = FAXUSER
-    cmd = [FAXRM_BIN, "-h", FAX_HOST, str(jid)]
-    rc, so, se = run_cmd(cmd, env=env, timeout=FAXRM_TIMEOUT_SEC)
-    return rc, so, se
-
-def find_original_pdf_in_jobdir(jobdir: Path) -> Optional[Path]:
-    # Prefer source.pdf if present, else doc.pdf
-    cand1 = jobdir / "source.pdf"
-    cand2 = jobdir / "doc.pdf"
-    for c in (cand1, cand2):
-        try:
-            if c.exists() and c.stat().st_size > 0:
-                return c
-        except Exception:
-            continue
-    return None
-
-def copy_original_to_fail_in(jobdir: Path, job: Dict[str, Any]) -> None:
-    safe_mkdir(FAIL_IN)
-    src = job.get("source") or {}
-    jobid = job.get("job_id") or jobdir.name
-
-    orig_path = find_original_pdf_in_jobdir(jobdir)
-    if not orig_path:
-        return
-
-    base = sanitize_basename(Path(src.get("filename_original") or "document").stem) or "document"
-    dest = FAIL_IN / f"{base}.pdf"
-    if dest.exists():
-        dest = FAIL_IN / f"{base}__{jobid}.pdf"
-
-    shutil.copy2(str(orig_path), str(dest))
-    log(f"cancel/fail: original copied -> {dest.name}")
-
-def write_failed_artifacts(jobdir: Path, job: Dict[str, Any], doneq: Optional[DoneqInfo]) -> None:
-    """
-    Create report.pdf + merged.pdf and move both merged+json into FAIL_OUT.
-    Always uses FAIL_OUT naming with __FAILED.pdf + .json.
-    """
-    safe_mkdir(FAIL_OUT)
-
-    src = job.get("source") or {}
-    base = sanitize_basename(Path(src.get("filename_original") or "fax").stem)
-    jobid = job.get("job_id") or jobdir.name
-
-    # Ensure timestamps for report duration
-    job["finalizing_at"] = job.get("finalizing_at") or now_iso()
-    job["finalized_at"] = now_iso()
-    job["end_time"] = job.get("end_time") or job["finalized_at"]
-
-    # Force status for storage
-    job["status"] = "FAILED"
-    job.setdefault("result", {})
-    job["result"]["reason"] = job["result"].get("reason") or "cancelled" if cancel_requested(job) else job["result"].get("reason") or "unknown"
-
-    report_pdf = jobdir / "report.pdf"
-    merged_pdf = jobdir / "merged.pdf"
-
-    # Use header'ed version if present (it might have been created for sending)
-    doc = jobdir / "doc.pdf"
-    send_doc = doc.with_name(doc.stem + "_hdr.pdf")
-    merge_doc = send_doc if send_doc.exists() else doc
-
-    build_report_pdf(job, doneq, report_pdf)
-    merge_report_and_doc(report_pdf, merge_doc, merged_pdf)
-
-    out_pdf = FAIL_OUT / f"{base}__{jobid}__FAILED.pdf"
-    out_json = FAIL_OUT / f"{base}__{jobid}.json"
-
-    shutil.move(str(merged_pdf), str(out_pdf))
-    write_json(out_json, job)
-    log(f"cancel/fail: written -> {out_pdf.name} + {out_json.name}")
-
-
-def finalize_cancel_in_queue(jdir: Path) -> None:
-    """
-    Cancel requested while still in queue/: no HylaFAX interaction.
-    We still MUST place it under sendefehler/berichte and copy original to sendefehler/eingang.
-    """
-    jp = jdir / "job.json"
-    if not jp.exists():
-        return
-
-    job = read_json(jp)
-
-    if not cancel_requested(job) or cancel_handled(job):
-        return
-
-    # mark handled, ensure some timestamps for duration
-    mark_cancel_handled(job)
-    job["claimed_at"] = job.get("claimed_at") or now_iso()
-    job["submitted_at"] = job.get("submitted_at") or job["claimed_at"]
-    job["started_at"] = job.get("started_at") or job["claimed_at"]
-    job["end_time"] = job.get("end_time") or now_iso()
-    job.setdefault("result", {})
-    job["result"]["reason"] = job["result"].get("reason") or "cancelled"
-
-    # copy original to FAIL_IN
-    try:
-        copy_original_to_fail_in(jdir, job)
-    except Exception as e:
-        log(f"queue-cancel: copy original failed: {e}")
-
-    # write report+merged+json to FAIL_OUT
-    try:
-        write_failed_artifacts(jdir, job, doneq=None)
-    except Exception as e:
-        log(f"queue-cancel: write artifacts failed: {e}")
-        # If artifacts fail, do NOT delete the jobdir (avoid data loss)
-        try:
-            write_json(jp, job)
-        except Exception:
-            pass
-        return
-
-    # Remove jobdir from queue after successful materialization
-    shutil.rmtree(jdir, ignore_errors=True)
-    log(f"queue-cancel: removed jobdir {jdir.name}")
-
-
-def handle_cancel_in_processing(jdir: Path) -> None:
-    """
-    If cancel requested and job has jid -> faxrm. Do NOT delete doneq/q<JID>.
-    Set cancel.handled_at as idempotency marker.
-    Finalization to sendefehler/berichte happens in finalize_job() once doneq/q<JID> exists.
-    """
-    jp = jdir / "job.json"
-    if not jp.exists():
-        return
-    try:
-        job = read_json(jp)
-    except Exception:
-        return
-
-    if not cancel_requested(job) or cancel_handled(job):
-        return
-
-    jid = (job.get("hylafax") or {}).get("jid")
-    if jid:
-        log(f"cancel requested -> faxrm jid={jid} job={job.get('job_id','')}")
-        try:
-            rc, so, se = hylafax_cancel(int(jid))
-            log(f"faxrm rc={rc} out='{so.strip()}' err='{se.strip()}'")
-        except subprocess.TimeoutExpired:
-            log(f"faxrm timeout for jid={jid}")
-        time.sleep(CANCEL_POSTWAIT_SEC)
-
-    mark_cancel_handled(job)
-    try:
-        write_json(jp, job)
-    except Exception as e:
-        log(f"failed to write cancel.handled_at for {jdir.name}: {e}")
-
-
-# ----------------------------
-# Main workflow
-# ----------------------------
 def submit_job(jobdir: Path) -> None:
     jp = jobdir / "job.json"
     doc = jobdir / "doc.pdf"
@@ -534,9 +701,6 @@ def submit_job(jobdir: Path) -> None:
         return
 
     job = read_json(jp)
-
-    # If cancel already requested before submit: do NOT submit.
-    # We still must store it under sendefehler/berichte -> handled by finalize_cancel_in_queue
     if cancel_requested(job):
         return
 
@@ -587,13 +751,7 @@ def submit_job(jobdir: Path) -> None:
 
     write_json(jp, job)
 
-
 def finalize_job(jobdir: Path) -> bool:
-    """
-    Finalize jobs that have a HylaFAX JID once doneq/q<JID> exists.
-    Cancelled jobs are ALWAYS stored under sendefehler/berichte (forced),
-    regardless of HylaFAX statuscode.
-    """
     jp = jobdir / "job.json"
     doc = jobdir / "doc.pdf"
     if not jp.exists() or not doc.exists():
@@ -620,7 +778,6 @@ def finalize_job(jobdir: Path) -> bool:
 
     doneq = parse_doneq_file(qfile)
 
-    # Fill result info from doneq (always)
     job.setdefault("result", {})
     job["result"]["statuscode"] = doneq.statuscode
     job["result"]["npages"] = doneq.npages
@@ -634,26 +791,19 @@ def finalize_job(jobdir: Path) -> bool:
     job["finalized_at"] = now_iso()
     job["end_time"] = job.get("end_time") or job["finalized_at"]
 
-    # Decide storage:
     was_cancelled = bool((job.get("cancel") or {}).get("requested"))
 
     if was_cancelled:
-        # ALWAYS go to sendefehler/berichte
         job["status"] = "FAILED"
         job["result"]["reason"] = job["result"].get("reason") or "cancelled"
-
-        # Also place original under sendefehler/eingang
         try:
             copy_original_to_fail_in(jobdir, job)
         except Exception as e:
             log(f"cancel finalize: copy original failed: {e}")
-
-        # Write merged report+doc + json under FAIL_OUT
         write_failed_artifacts(jobdir, job, doneq)
         shutil.rmtree(jobdir, ignore_errors=True)
         return True
 
-    # Non-cancelled: regular OK/FAILED based on statuscode
     if doneq.statuscode == 0:
         job["status"] = "OK"
         job["result"]["reason"] = "OK"
@@ -678,22 +828,21 @@ def finalize_job(jobdir: Path) -> bool:
         shutil.rmtree(jobdir, ignore_errors=True)
         return True
 
-    # FAILED (not cancelled)
     job["status"] = "FAILED"
     job["result"]["reason"] = job["result"].get("reason") or "unknown"
-
     try:
         copy_original_to_fail_in(jobdir, job)
     except Exception as e:
         log(f"fail finalize: copy original failed: {e}")
-
     write_failed_artifacts(jobdir, job, doneq)
     shutil.rmtree(jobdir, ignore_errors=True)
     return True
 
 
+# ----------------------------
+# Steps
+# ----------------------------
 def step_queue_cancels() -> None:
-    # Cancel in queue is finalized immediately into sendefehler/*
     for jdir in list_jobdirs(QUEUE):
         jp = jdir / "job.json"
         if not jp.exists():
@@ -705,19 +854,18 @@ def step_queue_cancels() -> None:
         if cancel_requested(job) and not cancel_handled(job):
             finalize_cancel_in_queue(jdir)
 
-
 def step_processing() -> None:
-    # 1) handle cancel requests for jobs already in processing (faxrm)
+    # live update first (only when active sending)
+    update_processing_jobs_live()
+
     for jdir in list_jobdirs(PROC):
         handle_cancel_in_processing(jdir)
 
-    # 2) finalize anything that has a doneq/q<JID>
     for jdir in list_jobdirs(PROC):
         try:
             finalize_job(jdir)
         except Exception as e:
             log(f"finalize exception {jdir.name}: {e}")
-
 
 def step_submit() -> None:
     inflight = count_inflight()
@@ -730,13 +878,10 @@ def step_submit() -> None:
         if not jdir:
             return
 
-        # If cancel is already requested, don't submit; it will be finalized into sendefehler.
         try:
             job = read_json(jdir / "job.json")
             job["claimed_at"] = job.get("claimed_at") or now_iso()
             if cancel_requested(job):
-                # move it back to queue for queue-cancel finalization (consistent path)
-                # (We do not want to keep it in processing and block inflight slots.)
                 target = QUEUE / jdir.name
                 try:
                     jdir.rename(target)
@@ -756,23 +901,21 @@ def step_submit() -> None:
         inflight = count_inflight()
 
 
+# ----------------------------
+# Main
+# ----------------------------
 def main() -> None:
     ensure_dirs()
     acquire_lock()
-    log("started (v1.2.3)")
+    log("started (v1.2.4)")
     try:
         while True:
-            # Important order:
-            # 1) finalize queue cancels immediately into sendefehler/*
             step_queue_cancels()
-            # 2) handle processing cancels + finalize from doneq
             step_processing()
-            # 3) submit new jobs
             step_submit()
             time.sleep(POLL_INTERVAL_SEC)
     finally:
         release_lock()
-
 
 if __name__ == "__main__":
     try:
