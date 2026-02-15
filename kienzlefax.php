@@ -3,18 +3,26 @@
  * kienzlefax.php
  * Producer Web-UI (sendet NICHT selbst).
  *
- * Version: 1.2.3
+ * Version: 1.2.4
  * Author: Dr. Thomas Kienzle
- * Stand: 2026-02-14
+ * Stand: 2026-02-15
  *
  * Changelog (komplett):
+ * - 1.2.4 (2026-02-15):
+ *   - UI (Aktive Jobs, weniger technisch): Job-ID ist nicht mehr sichtbar. Zeile 1 zeigt Empfängername (…),
+ *     Tooltip enthält Faxnummer + Originaldatei + Job-ID.
+ *   - UI (Aktive Jobs, Statuszeile): Zeile 2 zeigt kompakt Live-Infos:
+ *       processing: "Sende: x/y · 5:23 · processing · submitted · Versuch a/b"
+ *       queue:       "queued · erstellt HH:MM" (ohne "Sende:", da noch nicht gestartet)
+ *     Tooltip zeigt die vollständige (ungekürzte) Statuszeile + live.faxstat_status/state (falls vorhanden).
+ *   - Live-Update ohne Browser-Refresh: Soft-Refresh per AJAX (polling), aktualisiert:
+ *       • KPI-Zähler (queue/processing)
+ *       • Sidebar "Aktive Jobs"
+ *       • Pulsieren Fehlerberichte (an/aus) + Fehleranzahl im Tooltip
+ *     Formulare/Tabellen werden nicht angefasst (kein Kollateralschaden).
+ *
  * - 1.2.3 (2026-02-14):
- *   - BUGFIX (ohne Kollateralschaden): Seitenanzeige im Sendeprotokoll wieder robust.
- *     Jetzt werden Seiten wie folgt ermittelt (Fallback-Kette):
- *       1) result.pages (z.B. "0/1")
- *       2) result.npages + result.totpages (z.B. "32/32")
- *       3) pages (Top-Level, falls vorhanden)
- *     → verhindert "—" bei typischen OK-JSONs, die nur npages/totpages liefern.
+ *   - BUGFIX: Seitenanzeige im Sendeprotokoll wieder robust (result.pages -> npages/totpages -> pages).
  *
  * - 1.2.2 (2026-02-14):
  *   - UI: Linke Sidebar ca. 30% schmaler (360px -> 260px) für bessere Nutzbarkeit bei ~1000px Fensterbreite.
@@ -22,12 +30,9 @@
  *   - UI: Lange PDF-Dateinamen werden überall in der UI einzeilig gekürzt ("…") + Tooltip mit vollem Namen.
  *
  * - 1.2.1 (2026-02-14):
- *   - FIX: Robustere Erkennung "⛔ Abgebrochen" in Fehlerberichte UND Sendeprotokoll:
- *          • cancel.requested=true UND cancel.handled_at vorhanden -> Abgebrochen
- *          • ODER result.reason/status_text enthält "aborted"
- *          • ODER statuscode==345 in Kombination mit cancel.requested
+ *   - FIX: Robustere Erkennung "⛔ Abgebrochen" in Fehlerberichte UND Sendeprotokoll (cancel/aborted/statuscode 345).
  *   - FIX: Formfelder nutzen box-sizing:border-box (Faxnummer läuft nicht mehr über Begrenzung).
- *   - UI: Abbruch-Button bei aktiven Jobs nun dezenter Icon-Button (kein großes rotes Feld).
+ *   - UI: Abbruch-Button bei aktiven Jobs dezenter Icon-Button (kein großes rotes Feld).
  *
  * - 1.2 (2026-02-14):
  *   - UI: Version + Autor als Footer unten mittig.
@@ -96,7 +101,7 @@ $MAX_FAIL_LIST    = 200;
 $MAX_ARCHIVE_LIST = 25;
 
 $APP_TITLE   = 'kienzlefax';
-$APP_VERSION = '1.2.3';
+$APP_VERSION = '1.2.4';
 $APP_AUTHOR  = 'Dr. Thomas Kienzle';
 
 // -------------------- Helpers --------------------
@@ -335,23 +340,17 @@ function is_aborted_job(array $j): bool {
  * 1.2.3: Seiten robust extrahieren (keine Design/Flow-Änderung).
  */
 function extract_pages(array $j): string {
-  // 1) result.pages (string)
   if (isset($j['result']) && is_array($j['result'])) {
     $rp = isset($j['result']['pages']) ? (string)$j['result']['pages'] : '';
     if ($rp !== '') return $rp;
 
-    // 2) result.npages/result.totpages
     if (array_key_exists('npages', $j['result']) && array_key_exists('totpages', $j['result'])) {
-      $np = $j['result']['npages'];
-      $tp = $j['result']['totpages'];
-      // akzeptiere int/string, aber keine leeren
-      $npS = (string)$np;
-      $tpS = (string)$tp;
+      $npS = (string)$j['result']['npages'];
+      $tpS = (string)$j['result']['totpages'];
       if ($npS !== '' && $tpS !== '') return $npS . '/' . $tpS;
     }
   }
 
-  // 3) top-level pages
   if (isset($j['pages'])) {
     $p = (string)$j['pages'];
     if ($p !== '') return $p;
@@ -367,6 +366,82 @@ function format_size(?int $bytes): string {
   if ($kb < 1024) return (string)round($kb) . ' KB';
   $mb = $kb / 1024;
   return number_format($mb, 1, '.', '') . ' MB';
+}
+
+function hhmm_from_iso(?string $iso): string {
+  $t = parse_iso_time($iso);
+  if ($t === null) return '';
+  return date('H:i', $t);
+}
+
+/**
+ * AJAX: schlankes Status-Payload (keine Seitenelemente anfassen).
+ */
+function build_active_jobs_payload(array $activePreview): array {
+  $out = [];
+  foreach ($activePreview as $a) {
+    $meta = $a['meta'] ?? null;
+    $jid = (string)($a['id'] ?? '');
+    $where = (string)($a['where'] ?? '');
+    if (!is_array($meta)) $meta = [];
+
+    $recipientName = (string)($meta['recipient']['name'] ?? '');
+    $recipientNum  = (string)($meta['recipient']['number'] ?? '');
+    $fileOrig      = (string)($meta['source']['filename_original'] ?? '');
+    $srcOrig       = (string)($meta['source']['src'] ?? '');
+    $status        = (string)($meta['status'] ?? '');
+
+    $startedAt     = (string)($meta['started_at'] ?? '');
+    $submittedAt   = (string)($meta['submitted_at'] ?? '');
+    $createdAt     = (string)($meta['created_at'] ?? '');
+
+    $live = (isset($meta['live']) && is_array($meta['live'])) ? $meta['live'] : null;
+
+    $progressSent = null;
+    $progressTotal = null;
+    $progressRaw = '';
+    $dialsDone = null;
+    $dialsMax = null;
+    $dialsRaw = '';
+    $state = '';
+    $faxstat = '';
+    $liveUpdatedAt = '';
+
+    if (is_array($live)) {
+      $liveUpdatedAt = (string)($live['updated_at'] ?? '');
+      if (isset($live['progress']) && is_array($live['progress'])) {
+        if (isset($live['progress']['sent']))  $progressSent  = (int)$live['progress']['sent'];
+        if (isset($live['progress']['total'])) $progressTotal = (int)$live['progress']['total'];
+        $progressRaw = (string)($live['progress']['raw'] ?? '');
+      }
+      if (isset($live['dials']) && is_array($live['dials'])) {
+        if (isset($live['dials']['done'])) $dialsDone = (int)$live['dials']['done'];
+        if (isset($live['dials']['max']))  $dialsMax  = (int)$live['dials']['max'];
+        $dialsRaw = (string)($live['dials']['raw'] ?? '');
+      }
+      $state = (string)($live['state'] ?? '');
+      $faxstat = (string)($live['faxstat_status'] ?? '');
+    }
+
+    $out[] = [
+      'job_id' => $jid,
+      'where' => $where,
+      'status' => $status,
+      'recipient' => ['name' => $recipientName, 'number' => $recipientNum],
+      'source' => ['src' => $srcOrig, 'filename_original' => $fileOrig],
+      'created_at' => $createdAt,
+      'submitted_at' => $submittedAt,
+      'started_at' => $startedAt,
+      'live' => $live ? [
+        'updated_at' => $liveUpdatedAt,
+        'progress' => ['sent' => $progressSent, 'total' => $progressTotal, 'raw' => $progressRaw],
+        'dials' => ['done' => $dialsDone, 'max' => $dialsMax, 'raw' => $dialsRaw],
+        'state' => $state,
+        'faxstat_status' => $faxstat,
+      ] : null,
+    ];
+  }
+  return $out;
 }
 
 // -------------------- Grundvalidierung --------------------
@@ -444,8 +519,6 @@ function add_err(string $m): void { $GLOBALS['flash']['err'][] = $m; }
 // -------------------- POST Actions --------------------
 $action = (string)($_POST['action'] ?? '');
 
-/* ... (ab hier unverändert zu 1.2.2, außer 1.2.3 pages fix im sendelog weiter unten) ... */
-
 if ($action === 'create_jobs') {
   $src = (string)($_POST['src'] ?? '');
   $selected = $_POST['files'] ?? [];
@@ -460,7 +533,6 @@ if ($action === 'create_jobs') {
 
     $save_to_phonebook = isset($_POST['save_to_phonebook']);
 
-    // Wenn Kontakt gewählt: Felder (falls leer) automatisch übernehmen
     if ($contact_id !== '') {
       $c = get_contact($pdo, (int)$contact_id);
       if ($c) {
@@ -508,7 +580,6 @@ if ($action === 'create_jobs') {
 
         $srcPath = $srcDir . '/' . $fn;
 
-        // 1) doc.pdf in staging erzeugen (copy, damit wir bei späteren Fehlern NICHT die Quelle verlieren)
         $docPath = $jobStagingDir . '/doc.pdf';
         if (!copy($srcPath, $docPath)) {
           @rmdir($jobStagingDir);
@@ -544,7 +615,6 @@ if ($action === 'create_jobs') {
           continue;
         }
 
-        // 2) staging -> queue (atomar)
         if (!rename($jobStagingDir, $jobQueueDir)) {
           add_err("Konnte Job nicht in queue verschieben ($jobid).");
           continue;
@@ -552,7 +622,6 @@ if ($action === 'create_jobs') {
 
         $created++;
 
-        // 3) Quelle soll verschwinden: Original in queue/<jobid>/source.pdf verschieben (rename)
         $destSource = $jobQueueDir . '/source.pdf';
         if (!file_exists($destSource)) {
           if (@rename($srcPath, $destSource)) {
@@ -561,7 +630,6 @@ if ($action === 'create_jobs') {
         }
       }
 
-      // 4) optional: ins Telefonbuch speichern
       if ($save_to_phonebook && count($flash['err']) === 0) {
         try {
           $cid = ($contact_id !== '') ? (int)$contact_id : null;
@@ -775,15 +843,30 @@ foreach (array_reverse($queueJobs) as $jid) {
   $activePreview[] = ['id' => $jid, 'where' => 'queue', 'meta' => read_job_meta($GLOBALS['DIR_QUEUE'] . '/' . $jid)];
 }
 
+// Fail state for pulse
+$failCount = count_json_files($DIR_FAIL_REP, 999);
+$hasFails = ($failCount > 0);
+
 // Contact map for JS
 $contactMap = [];
 foreach ($contacts as $c) {
   $contactMap[(string)$c['id']] = ['name' => (string)$c['name'], 'number' => (string)$c['number']];
 }
 
-// Fehler vorhanden? (für Puls-Tab)
-$failCount = count_json_files($DIR_FAIL_REP, 999);
-$hasFails = ($failCount > 0);
+// -------------------- AJAX (Soft Refresh) --------------------
+$ajax = (string)($_GET['ajax'] ?? '');
+if ($ajax === 'status') {
+  $payload = [
+    'now' => date('c'),
+    'queue_count' => count($queueJobs),
+    'processing_count' => count($procJobs),
+    'fail_count' => $failCount,
+    'active_jobs' => build_active_jobs_payload($activePreview),
+  ];
+  header('Content-Type: application/json; charset=utf-8');
+  echo json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n";
+  exit;
+}
 
 ?>
 <!doctype html>
@@ -948,8 +1031,8 @@ $hasFails = ($failCount > 0);
     </div>
     <div class="kpis">
       <a class="pill" href="<?=h($_SERVER['REQUEST_URI'] ?? '/')?>">🔄 refresh</a>
-      <span class="pill">⏳ queue <b><?=count($queueJobs)?></b></span>
-      <span class="pill">⚙️ processing <b><?=count($procJobs)?></b></span>
+      <span class="pill">⏳ queue <b id="kpiQueue"><?=count($queueJobs)?></b></span>
+      <span class="pill">⚙️ processing <b id="kpiProc"><?=count($procJobs)?></b></span>
     </div>
   </div>
 </header>
@@ -965,7 +1048,7 @@ $hasFails = ($failCount > 0);
       <?php endforeach; ?>
       <a class="tab <?=($view==='sendelog')?'active':''?>" href="?view=sendelog">✅ Sendeprotokoll</a>
       <a class="tab <?=($view==='phonebook')?'active':''?>" href="?view=phonebook">📇 Telefonbuch</a>
-      <a class="tab <?=($view==='sendefehler-berichte')?'active':''?> <?=($hasFails ? 'pulse-danger' : '')?>" href="?view=sendefehler-berichte">⚠️ Fehlerberichte</a>
+      <a id="failTab" class="tab <?=($view==='sendefehler-berichte')?'active':''?> <?=($hasFails ? 'pulse-danger' : '')?>" href="?view=sendefehler-berichte" title="Fehlerberichte (<?=$failCount?>)">⚠️ Fehlerberichte</a>
     </div>
 
     <?php foreach ($flash['ok'] as $m): ?><div class="flash ok"><?=h($m)?></div><?php endforeach; ?>
@@ -980,35 +1063,86 @@ $hasFails = ($failCount > 0);
         <span class="chip warn">live</span>
       </div>
 
-      <ul class="list">
+      <ul class="list" id="activeJobsList">
         <?php if (count($activePreview) === 0): ?>
           <li><span class="mut">Keine aktiven Jobs</span></li>
         <?php else: ?>
           <?php foreach ($activePreview as $a): ?>
             <?php
               $meta = $a['meta'] ?? null;
-              $to = is_array($meta) ? ($meta['recipient']['number'] ?? '') : '';
-              $name = is_array($meta) ? ($meta['recipient']['name'] ?? '') : '';
-              $st = is_array($meta) ? ($meta['status'] ?? $a['where']) : $a['where'];
-              $whereTxt = (string)$a['where'];
+              if (!is_array($meta)) $meta = [];
+              $jid = (string)$a['id'];
+              $where = (string)$a['where'];
+
+              $rName = (string)($meta['recipient']['name'] ?? '');
+              $rNum  = (string)($meta['recipient']['number'] ?? '');
+              $file  = (string)($meta['source']['filename_original'] ?? '');
+
+              $createdAt = (string)($meta['created_at'] ?? '');
+              $submittedAt = (string)($meta['submitted_at'] ?? '');
+              $startedAt = (string)($meta['started_at'] ?? '');
+
+              $live = (isset($meta['live']) && is_array($meta['live'])) ? $meta['live'] : null;
+
+              $sent = null; $total = null; $done = null; $max = null;
+              $faxstat = ''; $state = '';
+              if (is_array($live)) {
+                if (isset($live['progress']) && is_array($live['progress'])) {
+                  if (isset($live['progress']['sent'])) $sent = (int)$live['progress']['sent'];
+                  if (isset($live['progress']['total'])) $total = (int)$live['progress']['total'];
+                }
+                if (isset($live['dials']) && is_array($live['dials'])) {
+                  if (isset($live['dials']['done'])) $done = (int)$live['dials']['done'];
+                  if (isset($live['dials']['max'])) $max = (int)$live['dials']['max'];
+                }
+                $faxstat = (string)($live['faxstat_status'] ?? '');
+                $state = (string)($live['state'] ?? '');
+              }
+
+              $line2 = '';
+              if ($where === 'processing' && $sent !== null && $total !== null) {
+                $line2 = 'Sende: ' . $sent . '/' . $total;
+              } elseif ($where === 'queue') {
+                $hm = hhmm_from_iso($createdAt);
+                $line2 = 'queued' . ($hm !== '' ? (' · erstellt ' . $hm) : '');
+              } else {
+                $line2 = ($where !== '' ? $where : 'aktiv');
+              }
+
+              $tooltip1 = trim("Fax: $rNum\nDatei: $file\nJob: $jid");
+              $tooltip2 = $line2;
+              if ($where === 'processing') {
+                $parts = [];
+                if ($sent !== null && $total !== null) $parts[] = "Sende: $sent/$total";
+                if ($submittedAt !== '') $parts[] = "submitted";
+                if ($done !== null && $max !== null) $parts[] = "Versuch $done/$max";
+                if ($state !== '') $parts[] = "state $state";
+                $tooltip2 = implode(' · ', array_merge($parts, [$where]));
+                if ($faxstat !== '') $tooltip2 .= "\n" . $faxstat;
+              }
             ?>
             <li>
               <div style="min-width:0;">
-                <div class="mono">
-                  <span class="ellipsis sidebar" title="<?=h($a['id'])?>"><?=h($a['id'])?></span>
+                <div style="font-weight:900;">
+                  <span class="ellipsis sidebar" title="<?=h($tooltip1)?>"><?=h($rName !== '' ? $rName : '—')?></span>
                 </div>
                 <div class="mut" style="font-size:13px; margin-top:2px;">
-                  <span class="ellipsis sidebar" title="<?=h($whereTxt . ' · ' . (string)$st . ' · ' . (string)$name . ' · ' . (string)$to)?>">
-                    <?=h($whereTxt)?> · <?=h((string)$st)?> · <?=h((string)$name)?> · <span class="mono"><?=h((string)$to)?></span>
-                  </span>
+                  <span class="ellipsis sidebar" title="<?=h($tooltip2)?>"
+                        data-started-at="<?=h($startedAt)?>"
+                        data-where="<?=h($where)?>"
+                        data-sent="<?=h($sent === null ? '' : (string)$sent)?>"
+                        data-total="<?=h($total === null ? '' : (string)$total)?>"
+                        data-done="<?=h($done === null ? '' : (string)$done)?>"
+                        data-max="<?=h($max === null ? '' : (string)$max)?>"
+                        data-submitted="<?=h($submittedAt)?>"><?=h($line2)?></span>
                 </div>
               </div>
 
               <div style="display:flex; align-items:center; gap:8px;">
                 <form method="post" style="display:inline;" onsubmit="return confirm('Job wirklich abbrechen?');">
                   <input type="hidden" name="action" value="cancel_job">
-                  <input type="hidden" name="job_id" value="<?=h($a['id'])?>">
-                  <input type="hidden" name="where" value="<?=h($a['where'])?>">
+                  <input type="hidden" name="job_id" value="<?=h($jid)?>">
+                  <input type="hidden" name="where" value="<?=h($where)?>">
                   <button class="btn icon-danger" type="submit" title="Abbruch anfordern">⛔</button>
                 </form>
               </div>
@@ -1144,7 +1278,6 @@ $hasFails = ($failCount > 0);
               $t2 = parse_iso_time($end);
               if ($t1 !== null && $t2 !== null) $dur = format_duration($t2 - $t1);
 
-              // 1.2.3: Seiten robust (npages/totpages als Fallback)
               $pages = extract_pages($j);
 
               $pdf = '';
@@ -1438,5 +1571,186 @@ $hasFails = ($failCount > 0);
 <footer>
   <?=h($APP_TITLE)?> · v<?=h($APP_VERSION)?> · <?=h($APP_AUTHOR)?>
 </footer>
+
+<script>
+  // 1.2.4 Live-AJAX: nur KPIs + aktive Jobs + Fehlerpuls (keine Formulare/Tabellen anfassen).
+  (function(){
+    const kpiQueue = document.getElementById('kpiQueue');
+    const kpiProc  = document.getElementById('kpiProc');
+    const failTab  = document.getElementById('failTab');
+    const listEl   = document.getElementById('activeJobsList');
+
+    function pad2(n){ return (n<10?'0':'') + n; }
+
+    // "5:23"-artig (m:ss) oder (h:mm:ss)
+    function fmtHMS(sec){
+      sec = Math.max(0, Math.floor(sec));
+      const h = Math.floor(sec/3600);
+      const m = Math.floor((sec%3600)/60);
+      const s = sec%60;
+      if (h > 0) return h + ':' + pad2(m) + ':' + pad2(s);
+      return m + ':' + pad2(s);
+    }
+
+    function safeText(s){ return (s===null || s===undefined) ? '' : String(s); }
+
+    function buildLine2(job, nowMs){
+      const where = safeText(job.where);
+      const submitted = safeText(job.submitted_at) !== '';
+      const startedAt = safeText(job.started_at);
+      const live = job.live || null;
+
+      if (where === 'processing' && live && live.progress && live.dials) {
+        const sent  = (live.progress.sent !== null && live.progress.sent !== undefined) ? live.progress.sent : null;
+        const total = (live.progress.total !== null && live.progress.total !== undefined) ? live.progress.total : null;
+        const done  = (live.dials.done !== null && live.dials.done !== undefined) ? live.dials.done : null;
+        const max   = (live.dials.max !== null && live.dials.max !== undefined) ? live.dials.max : null;
+
+        const parts = [];
+
+        if (sent !== null && total !== null) parts.push('Sende: ' + sent + '/' + total);
+
+        if (startedAt) {
+          const t0 = Date.parse(startedAt);
+          if (!isNaN(t0)) parts.push(fmtHMS((nowMs - t0)/1000));
+        }
+
+        parts.push(where);
+        if (submitted) parts.push('submitted');
+        if (done !== null && max !== null) parts.push('Versuch ' + done + '/' + max);
+
+        return parts.join(' · ');
+      }
+
+      // queue: kein "Sende:"
+      if (where === 'queue') {
+        const ca = safeText(job.created_at);
+        let hm = '';
+        if (ca) {
+          const t = Date.parse(ca);
+          if (!isNaN(t)) {
+            const d = new Date(t);
+            hm = pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+          }
+        }
+        return 'queued' + (hm ? (' · erstellt ' + hm) : '');
+      }
+
+      // fallback (selten): minimal
+      return where || 'aktiv';
+    }
+
+    function buildTooltips(job, line2){
+      const r = job.recipient || {};
+      const s = job.source || {};
+      const t1 = [
+        'Fax: ' + safeText(r.number),
+        'Datei: ' + safeText(s.filename_original),
+        'Job: ' + safeText(job.job_id)
+      ].join('\n');
+
+      let t2 = line2;
+      const live = job.live || null;
+      if (live) {
+        const extra = [];
+        if (safeText(live.state)) extra.push('state ' + safeText(live.state));
+        if (safeText(live.faxstat_status)) extra.push(safeText(live.faxstat_status));
+        if (extra.length) t2 = t2 + '\n' + extra.join('\n');
+      }
+      return {t1, t2};
+    }
+
+    function renderJobs(activeJobs){
+      if (!listEl) return;
+
+      if (!Array.isArray(activeJobs) || activeJobs.length === 0) {
+        listEl.innerHTML = '<li><span class="mut">Keine aktiven Jobs</span></li>';
+        return;
+      }
+
+      const nowMs = Date.now();
+
+      const itemsHtml = activeJobs.map(job => {
+        const r = job.recipient || {};
+        const name = safeText(r.name) || '—';
+        const line2 = buildLine2(job, nowMs);
+        const tips = buildTooltips(job, line2);
+
+        // Cancel form (POST) bleibt wie gehabt
+        const jobId = safeText(job.job_id);
+        const where = safeText(job.where);
+
+        return `
+<li>
+  <div style="min-width:0;">
+    <div style="font-weight:900;">
+      <span class="ellipsis sidebar" title="${escapeHtml(tips.t1)}">${escapeHtml(name)}</span>
+    </div>
+    <div class="mut" style="font-size:13px; margin-top:2px;">
+      <span class="ellipsis sidebar" title="${escapeHtml(tips.t2)}"
+            data-started-at="${escapeHtml(safeText(job.started_at))}"
+            data-where="${escapeHtml(where)}">${escapeHtml(line2)}</span>
+    </div>
+  </div>
+
+  <div style="display:flex; align-items:center; gap:8px;">
+    <form method="post" style="display:inline;" onsubmit="return confirm('Job wirklich abbrechen?');">
+      <input type="hidden" name="action" value="cancel_job">
+      <input type="hidden" name="job_id" value="${escapeHtml(jobId)}">
+      <input type="hidden" name="where" value="${escapeHtml(where)}">
+      <button class="btn icon-danger" type="submit" title="Abbruch anfordern">⛔</button>
+    </form>
+  </div>
+</li>`;
+      }).join('');
+
+      listEl.innerHTML = itemsHtml;
+    }
+
+    function escapeHtml(s){
+      s = String(s);
+      return s
+        .replace(/&/g,'&amp;')
+        .replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;')
+        .replace(/"/g,'&quot;')
+        .replace(/'/g,'&#039;');
+    }
+
+    async function poll(){
+      // nur wenn Tab sichtbar -> weniger Last
+      if (document.visibilityState !== 'visible') return;
+      try {
+        const url = new URL(window.location.href);
+        url.searchParams.set('ajax', 'status');
+        // cache bust
+        url.searchParams.set('_', String(Date.now()));
+
+        const res = await fetch(url.toString(), {cache: 'no-store'});
+        if (!res.ok) return;
+        const j = await res.json();
+
+        if (kpiQueue && typeof j.queue_count === 'number') kpiQueue.textContent = String(j.queue_count);
+        if (kpiProc  && typeof j.processing_count === 'number') kpiProc.textContent = String(j.processing_count);
+
+        // Fehlerpuls (nur Klasse + Tooltip-Count)
+        if (failTab && typeof j.fail_count === 'number') {
+          failTab.title = 'Fehlerberichte (' + j.fail_count + ')';
+          if (j.fail_count > 0) failTab.classList.add('pulse-danger');
+          else failTab.classList.remove('pulse-danger');
+        }
+
+        renderJobs(j.active_jobs || []);
+      } catch (e) {
+        // bewusst still (kein Flash) -> nächster Tick versucht erneut
+      }
+    }
+
+    // Start: alle 3s (sehr defensiv)
+    poll();
+    setInterval(poll, 3000);
+  })();
+</script>
+
 </body>
 </html>
