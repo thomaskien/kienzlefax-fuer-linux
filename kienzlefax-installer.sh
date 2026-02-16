@@ -2051,7 +2051,45 @@ ls -lah /usr/local/bin/kienzlefax-worker.py
 head -n 40 /usr/local/bin/kienzlefax-worker.py
 
 
+cat >/etc/default/kienzlefax-worker <<'EOF'
+# kienzlefax-worker env
+KFX_BASE=/srv/kienzlefax
 
+KFX_AMI_HOST=127.0.0.1
+KFX_AMI_PORT=5038
+KFX_AMI_USER=kfx
+KFX_AMI_PASS=mysecret
+
+KFX_DIAL_CONTEXT=fax-out
+
+# optional tuning
+KFX_MAX_INFLIGHT=1
+KFX_POST_CALL_COOLDOWN_SEC=5
+EOF
+chmod 0644 /etc/default/kienzlefax-worker
+
+
+cat >/etc/systemd/system/kienzlefax-worker.service <<'EOF'
+[Unit]
+Description=kienzlefax worker (Asterisk SendFAX via AMI)
+After=network.target asterisk.service
+Requires=asterisk.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/kienzlefax-worker
+ExecStart=/usr/bin/python3 -u /usr/local/bin/kienzlefax-worker.py
+Restart=always
+RestartSec=2
+WorkingDirectory=/root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now kienzlefax-worker.service
+systemctl status kienzlefax-worker.service --no-pager -l
 
 
 
