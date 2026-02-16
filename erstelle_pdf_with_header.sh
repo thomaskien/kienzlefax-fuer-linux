@@ -54,7 +54,10 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 from reportlab.pdfbase.pdfmetrics import stringWidth
 
-from PyPDF2 import PdfReader, PdfWriter
+try:
+    from PyPDF2 import PdfReader, PdfWriter
+except ModuleNotFoundError:
+    from pypdf import PdfReader, PdfWriter
 
 in_path = Path(sys.argv[1])
 out_path = Path(sys.argv[2])
