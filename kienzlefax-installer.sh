@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # kienzlefax-installer.sh  (Raspberry Pi OS 13 / Debian 13)
-# Version: 2.1  (2026-02-17)
+#
+# Version: 2.1
+# Stand:   2026-02-17
 #
 # EIN-Datei-Installer (root-only, keine sudo-Aufrufe im Script).
 #
@@ -11,22 +13,27 @@
 #     - SIP Nummer (gleich Username)
 #     - SIP Passwort (2× verdeckt)
 #     - optional: FAX DID (Default = SIP Nummer)
+#     - AMI Secret für lokalen Asterisk-Manager (2× verdeckt)
 #  2) apt-get update + apt-get -y upgrade
 #  3) Installiert Pakete gebündelt am Anfang (OHNE HylaFAX, OHNE iaxmodem)
 #  4) Installiert Web (kienzlefax.php + faxton.mp3)
 #  5) Legt User admin (Login + sudo) an und fragt Passwörter ab (Linux 2×, Samba 2×)
-#  6) Installiert CUPS Backend + fax1..fax5 + Bonjour/DNS-SD + Samba Shares
-#     - inkl. Share [fax-eingang] -> /var/spool/asterisk/fax
+#  6) Installiert CUPS Backend + fax1..fax5 + Bonjour/DNS-SD + Samba Shares (inkl. fax-eingang)
 #  7) Baut SpanDSP + Asterisk (INTERAKTIV: make menuselect)
-#  8) Ganz am ENDE: schreibt Asterisk-Configs (integriert)
-#     - inkl. AMI manager.d + User kfx, bindaddr=127.0.0.1 (hardcoded lokal)
+#  8) Ganz am ENDE: schreibt Asterisk-Configs:
+#     - rtp.conf, pjsip.conf
+#     - manager.conf (robust, minimal-invasiv, bindaddr=127.0.0.1, enabled=yes)
+#     - manager.d/kfx.conf (lokal only)
+#     - extensions.conf (NEUE Vorlage: send_start/dial_end/send_end + Hangup-Handler)
+#     - installiert AGI (kfx_update_status.agi v1.3.6)
+#     - installiert Worker (kienzlefax-worker.py v1.3.5) + systemd service
 #  9) Ganz am ENDE: erstellt /usr/local/bin/pdf_with_header.sh (Header je Seite)
-# 10) Installiert kfx_update_status.agi + kienzlefax-worker + systemd service
 #
 # INTERAKTIV:
 #  - SIP Passwort (2×)
-#  - Linux admin Passwort (2× via passwd)
-#  - Samba admin Passwort (2× via smbpasswd)
+#  - AMI Secret (2×)
+#  - Linux admin Passwort (passwd)
+#  - Samba admin Passwort (smbpasswd)
 #  - make menuselect
 #
 # ==============================================================================
@@ -40,7 +47,7 @@ log(){ echo "[$(date -Is)] $*"; }
 sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
 
 require_root(){
-  [[ ${EUID:-0} -eq 0 ]] || die "Bitte als root ausführen (sudo)."
+  [[ ${EUID:-0} -eq 0 ]] || die "Bitte als root ausführen."
 }
 
 svc_exists(){
@@ -77,13 +84,23 @@ sanitize_digits(){
   echo "$1" | tr -cd '0-9'
 }
 
+backup_file_ts(){
+  # usage: backup_file_ts /path/to/file
+  local f="$1"
+  local stamp=".old.kienzlefax.$(date +%Y%m%d-%H%M%S)"
+  if [[ -e "$f" ]]; then
+    cp -a "$f" "${f}${stamp}"
+    log "backup: $f -> ${f}${stamp}"
+  fi
+}
+
 # ------------------------------------------------------------------------------
 # Preconditions + Parameterabfrage (GANZ AM ANFANG)
 # ------------------------------------------------------------------------------
 require_root
 export DEBIAN_FRONTEND=noninteractive
 
-sep "Provider-Parameter abfragen (DynDNS/FQDN, SIP Nummer, SIP Passwort)"
+sep "Provider-Parameter abfragen (DynDNS/FQDN, SIP Nummer, SIP Passwort, FAX DID, AMI Secret)"
 
 read -r -p "DynDNS / Public FQDN (z.B. myhost.dyndns.org): " PUBLIC_FQDN
 [[ -n "${PUBLIC_FQDN}" ]] || die "PUBLIC_FQDN darf nicht leer sein."
@@ -91,18 +108,24 @@ read -r -p "DynDNS / Public FQDN (z.B. myhost.dyndns.org): " PUBLIC_FQDN
 read -r -p "SIP Nummer (gleich Username, nur Ziffern, z.B. 4923...): " SIP_NUMBER_RAW
 SIP_NUMBER="$(sanitize_digits "${SIP_NUMBER_RAW}")"
 [[ -n "${SIP_NUMBER}" ]] || die "SIP Nummer ist leer/ungültig."
+unset SIP_NUMBER_RAW
 
 read_secret_twice "SIP Passwort" SIP_PASSWORD
 
 read -r -p "FAX DID (Enter = ${SIP_NUMBER}): " FAX_DID_IN
 FAX_DID="$(sanitize_digits "${FAX_DID_IN:-$SIP_NUMBER}")"
 [[ -n "${FAX_DID}" ]] || die "FAX_DID darf nicht leer sein."
-unset SIP_NUMBER_RAW FAX_DID_IN
+unset FAX_DID_IN
+
+echo
+echo "AMI (Asterisk Manager) läuft NUR lokal auf 127.0.0.1:5038. Bitte Secret setzen:"
+read_secret_twice "AMI Secret (User kfx)" AMI_SECRET
 
 log "[OK] Parameter gesetzt:"
 log " - PUBLIC_FQDN=${PUBLIC_FQDN}"
 log " - SIP_NUMBER=${SIP_NUMBER}"
 log " - FAX_DID=${FAX_DID}"
+log " - AMI: 127.0.0.1:5038 user=kfx (secret gesetzt)"
 
 # ------------------------------------------------------------------------------
 # Konstanten / URLs
@@ -122,6 +145,10 @@ ASTERISK_URL="http://downloads.asterisk.org/pub/telephony/asterisk/${ASTERISK_TG
 # SpanDSP (Freeswitch fork)
 SPANDSP_GIT="https://github.com/freeswitch/spandsp.git"
 
+# Asterisk runtime dirs for fax-in
+SPOOL_TIFF_DIR="/var/spool/asterisk/fax1"
+SPOOL_PDF_DIR="/var/spool/asterisk/fax"
+
 # ------------------------------------------------------------------------------
 # 1) apt update/upgrade + Pakete gebündelt
 # ------------------------------------------------------------------------------
@@ -130,7 +157,6 @@ sep "System aktualisieren + Pakete installieren (gebündelt, OHNE HylaFAX, OHNE 
 apt-get update
 apt-get -y upgrade
 
-# Hinweis: tiff2pdf wird in extensions.conf genutzt -> libtiff-tools nötig.
 apt-get install -y --no-install-recommends \
   ca-certificates curl wget jq \
   acl lsof coreutils iproute2 \
@@ -227,7 +253,7 @@ setfacl -R -d -m g:kienzlefax:rwx "${KZ_BASE}" || true
 log "[OK] Verzeichnisse/Rechte/ACL erledigt."
 
 # ------------------------------------------------------------------------------
-# 3) Admin-Account (Login + sudo + Samba) – interaktiv (2× + 2×)
+# 3) Admin-Account (Login + sudo + Samba) – interaktiv
 # ------------------------------------------------------------------------------
 sep "Admin-Account anlegen (Login + sudo + Samba)"
 
@@ -272,7 +298,7 @@ log "[OK] Web installiert: ${KZ_WEBROOT}/kienzlefax.php"
 # ------------------------------------------------------------------------------
 # 5) Appliance-Teil (CUPS Backend + fax1..fax5 + Bonjour + Samba Shares)
 # ------------------------------------------------------------------------------
-sep "CUPS Backend + fax1..fax5 + Bonjour + Samba Shares"
+sep "CUPS Backend + fax1..fax5 + Bonjour + Samba Shares (inkl. fax-eingang)"
 
 WORKGROUP="WORKGROUP"
 SAMBA_ADMIN_USER="admin"
@@ -442,10 +468,9 @@ echo "== Samba: minimale smb.conf schreiben (inkl. Shares) =="
 mkdir -p /var/spool/samba
 chmod 1777 /var/spool/samba
 
-# Fax-Eingang Share Ziel (Asterisk inbound PDFs)
-mkdir -p /var/spool/asterisk/fax
-chmod 0777 /var/spool/asterisk/fax
-chown nobody:nogroup /var/spool/asterisk/fax || true
+# fax-eingang path sicherstellen (Guest share)
+mkdir -p "${SPOOL_PDF_DIR}"
+chmod 0777 "${SPOOL_PDF_DIR}" || true
 
 cat > /etc/samba/smb.conf <<EOF
 [global]
@@ -527,7 +552,7 @@ cat > /etc/samba/smb.conf <<EOF
    directory mask = 2770
 
 [fax-eingang]
-   path = /var/spool/asterisk/fax
+   path = ${SPOOL_PDF_DIR}
    browseable = yes
    writable = yes
    read only = no
@@ -607,13 +632,13 @@ tar xzf "${ASTERISK_TGZ}"
 cd "asterisk-${ASTERISK_VER}"
 
 contrib/scripts/get_mp3_source.sh || true
-
 ./configure
 
 echo
 echo "======================================================================"
 echo "INTERAKTIV: Jetzt öffnet sich menuselect."
 echo "Bitte die benötigten Module/Optionen aktivieren und dann speichern/beenden."
+echo "Hinweis: Für Fax per SendFAX müssen die Fax-/Spandsp-Module aktiv sein."
 echo "======================================================================"
 echo
 make menuselect
@@ -625,114 +650,57 @@ make config
 ldconfig
 
 # ------------------------------------------------------------------------------
-# 8) Ganz am Ende: Asterisk-Config Bootstrap (integriert) + AMI lokal hardcoded
+# 8) Ganz am Ende: Asterisk-Config Bootstrap (rtp/pjsip/manager/extensions) + AGI + Worker
 # ------------------------------------------------------------------------------
-kienzlefax_bootstrap_asterisk_configs(){
-  local STAMP_SUFFIX="old.kienzlefax"
+sep "GANZ AM ENDE: Asterisk-Konfiguration + AMI lokal + Dialplan + AGI + Worker"
 
-  local PUBLIC_FQDN_LOCAL="${PUBLIC_FQDN}"
-  local SIP_BIND_IP="0.0.0.0"
-  local SIP_BIND_PORT="5070"
-  local LOCAL_NETS=("10.0.0.0/8" "192.168.0.0/16")
+# ---- 8.1) Backups relevanter Dateien (timestamp) ----
+for f in \
+  /etc/asterisk/rtp.conf \
+  /etc/asterisk/pjsip.conf \
+  /etc/asterisk/manager.conf \
+  /etc/asterisk/extensions.conf
+do
+  [[ -e "$f" ]] && backup_file_ts "$f" || true
+done
 
-  local RTP_START="12000"
-  local RTP_END="12049"
+# ---- 8.2) Spool-Verzeichnisse + Rechte ----
+mkdir -p "${SPOOL_TIFF_DIR}" "${SPOOL_PDF_DIR}"
+if id asterisk >/dev/null 2>&1; then
+  chown -R asterisk:asterisk "${SPOOL_TIFF_DIR}" "${SPOOL_PDF_DIR}" || true
+fi
+chmod 0755 "${SPOOL_TIFF_DIR}" "${SPOOL_PDF_DIR}" || true
 
-  local SIP_SERVER_URI="sip:sip.1und1.de"
-  local SIP_CLIENT_URI="sip:${SIP_NUMBER}@sip.1und1.de"
-  local SIP_CONTACT_USER="${SIP_NUMBER}"
-  local SIP_USERNAME="${SIP_NUMBER}"
-  local SIP_PASSWORD_LOCAL="${SIP_PASSWORD}"
-
-  local FROM_USER="${SIP_NUMBER}"
-  local FROM_DOMAIN="sip.1und1.de"
-
-  local FAX_DID_LOCAL="${FAX_DID}"
-  local PROVIDER_MATCH_NET="212.227.0.0/16"
-
-  local FAX_ECM="yes"
-  local FAX_MAXRATE="9600"
-
-  local SPOOL_TIFF_DIR="/var/spool/asterisk/fax1"
-  local SPOOL_PDF_DIR="/var/spool/asterisk/fax"
-
-  # AMI: hardcoded lokal (wie von dir gewünscht)
-  local AMI_USER="kfx"
-  local AMI_SECRET="mysecret"
-  local AMI_PORT="5038"
-
-  say(){ echo -e "\n### $*"; }
-
-  backup_file(){
-    local f="$1"
-    if [ -e "$f" ] && [ ! -e "${f}.${STAMP_SUFFIX}" ]; then
-      cp -a "$f" "${f}.${STAMP_SUFFIX}"
-      echo "backup: $f -> ${f}.${STAMP_SUFFIX}"
-    fi
-  }
-
-  install_dir(){
-    local d="$1" owner="$2" mode="$3"
-    install -d -m "$mode" "$d"
-    chown "$owner" "$d" || true
-  }
-
-  write_file(){
-    local f="$1"
-    install -d -m 0755 "$(dirname "$f")"
-    printf '%s' "${KZ_CONTENT}" >"$f"
-  }
-
-  say "1) Backups der relevanten Konfigurationsdateien (*.${STAMP_SUFFIX})"
-  for f in \
-    /etc/asterisk/pjsip.conf \
-    /etc/asterisk/extensions.conf \
-    /etc/asterisk/rtp.conf \
-    /etc/asterisk/manager.conf
-  do
-    backup_file "$f"
-  done
-
-  say "2) Spool-Verzeichnisse + Rechte"
-  install_dir "$SPOOL_TIFF_DIR" asterisk:asterisk 0755
-  install_dir "$SPOOL_PDF_DIR"  asterisk:asterisk 0755
-
-  say "3) /etc/asterisk/rtp.conf schreiben"
-  KZ_CONTENT="$(cat <<EOF
+# ---- 8.3) /etc/asterisk/rtp.conf schreiben ----
+cat >/etc/asterisk/rtp.conf <<EOF
 [general]
-rtpstart=${RTP_START}
-rtpend=${RTP_END}
+rtpstart=12000
+rtpend=12049
 icesupport=no
 strictrtp=yes
 EOF
-)"
-  write_file /etc/asterisk/rtp.conf
 
-  say "4) /etc/asterisk/pjsip.conf schreiben"
-  local LOCAL_NET_LINES=""
-  local n
-  for n in "${LOCAL_NETS[@]}"; do
-    LOCAL_NET_LINES+=$'local_net = '"$n"$'\n'
-  done
-
-  KZ_CONTENT="$(cat <<EOF
+# ---- 8.4) /etc/asterisk/pjsip.conf schreiben ----
+# minimal, wie dein Stand – Provider 1und1, bind 0.0.0.0:5070, external via FQDN
+cat >/etc/asterisk/pjsip.conf <<EOF
 [transport-udp]
 type=transport
 protocol=udp
-bind=${SIP_BIND_IP}:${SIP_BIND_PORT}
+bind=0.0.0.0:5070
 
-external_signaling_address = ${PUBLIC_FQDN_LOCAL}
-external_media_address     = ${PUBLIC_FQDN_LOCAL}
+external_signaling_address = ${PUBLIC_FQDN}
+external_media_address     = ${PUBLIC_FQDN}
 
-${LOCAL_NET_LINES%$'\n'}
+local_net = 10.0.0.0/8
+local_net = 192.168.0.0/16
 
 [1und1]
 type=registration
 transport=transport-udp
 outbound_auth=1und1-auth
-server_uri=${SIP_SERVER_URI}
-client_uri=${SIP_CLIENT_URI}
-contact_user=${SIP_CONTACT_USER}
+server_uri=sip:sip.1und1.de
+client_uri=sip:${SIP_NUMBER}@sip.1und1.de
+contact_user=${SIP_NUMBER}
 retry_interval=60
 forbidden_retry_interval=600
 expiration=300
@@ -740,12 +708,12 @@ expiration=300
 [1und1-auth]
 type=auth
 auth_type=userpass
-username=${SIP_USERNAME}
-password=${SIP_PASSWORD_LOCAL}
+username=${SIP_NUMBER}
+password=${SIP_PASSWORD}
 
 [1und1-aor]
 type=aor
-contact=${SIP_SERVER_URI}
+contact=sip:sip.1und1.de
 
 [1und1-endpoint]
 type=endpoint
@@ -763,8 +731,8 @@ force_rport=yes
 t38_udptl=no
 t38_udptl_nat=no
 
-from_user=${FROM_USER}
-from_domain=${FROM_DOMAIN}
+from_user=${SIP_NUMBER}
+from_domain=sip.1und1.de
 
 send_pai=yes
 send_rpid=yes
@@ -773,148 +741,65 @@ trust_id_outbound=yes
 [1und1-identify]
 type=identify
 endpoint=1und1-endpoint
-match=${PROVIDER_MATCH_NET}
+match=212.227.0.0/16
 EOF
-)"
-  write_file /etc/asterisk/pjsip.conf
 
-  say "5) /etc/asterisk/extensions.conf schreiben (UniqueID Zählerteil)"
-  KZ_CONTENT="$(cat <<'EOF'
-[general]
-static=yes
-writeprotect=no
-clearglobalvars=no
+# ---- 8.5) AMI (manager.conf) robust sicherstellen + manager.d/kfx.conf ----
+MANAGER_CONF="/etc/asterisk/manager.conf"
+mkdir -p /etc/asterisk/manager.d
 
+# include manager.d sicherstellen (genau wie gewünscht)
+if ! grep -qE '^\s*#include\s+"/etc/asterisk/manager\.d/\*\.conf"\s*$' "${MANAGER_CONF}" 2>/dev/null; then
+  echo '#include "/etc/asterisk/manager.d/*.conf"' >> "${MANAGER_CONF}"
+fi
 
-[fax-out]
-
-exten => kfx_missing_file,1,NoOp(FAX OUT ERROR: missing KFX_FILE | jobid=${KFX_JOBID})
- same => n,Hangup()
-
-; 49... -> 0...
-exten => _49X.,1,NoOp(FAX OUT normalize 49... -> national | jobid=${KFX_JOBID} file=${KFX_FILE})
- same => n,Set(JITTERBUFFER(adaptive)=default)
- same => n,Set(NORM=0${EXTEN:2})
- same => n,NoOp(NORMALIZED=${NORM})
- same => n,GotoIf($[ "${KFX_FILE}" = "" ]?kfx_missing_file,1)
-
- same => n,Set(FAXOPT(ecm)=yes)
- same => n,Set(FAXOPT(maxrate)=9600)
- same => n,Set(CALLERID(num)=4923319265248)
- same => n,Set(CALLERID(name)=Fax)
- same => n,Set(CDR(userfield)=kfx:${KFX_JOBID})
-
- same => n,Dial(PJSIP/${NORM}@1und1-endpoint,60,gU(kfx_sendfax^${KFX_JOBID}^${KFX_FILE}))
-
- same => n,NoOp(FAX OUT post-dial | jobid=${KFX_JOBID} DIALSTATUS=${DIALSTATUS} HANGUPCAUSE=${HANGUPCAUSE} KFX_FAXSTATUS=${KFX_FAXSTATUS} KFX_FAXERROR=${KFX_FAXERROR})
- same => n,AGI(kfx_update_status.agi,${KFX_JOBID},${DIALSTATUS},${HANGUPCAUSE},${KFX_FAXSTATUS},${KFX_FAXERROR},${KFX_FAXPAGES},${KFX_FAXBITRATE},${KFX_FAXECM})
- same => n,Hangup()
-
-; national 0...
-exten => _0X.,1,NoOp(FAX OUT national | jobid=${KFX_JOBID} file=${KFX_FILE})
- same => n,Set(JITTERBUFFER(adaptive)=default)
- same => n,GotoIf($[ "${KFX_FILE}" = "" ]?kfx_missing_file,1)
-
- same => n,Set(FAXOPT(ecm)=__FAX_ECM__)
- same => n,Set(FAXOPT(maxrate)=__FAX_MAXRATE__)
- same => n,Set(CALLERID(num)=__FROM_USER__)
- same => n,Set(CALLERID(name)=Fax)
- same => n,Set(CDR(userfield)=kfx:${KFX_JOBID})
-
- same => n,Dial(PJSIP/${EXTEN}@1und1-endpoint,60,gU(kfx_sendfax^${KFX_JOBID}^${KFX_FILE}))
-
- same => n,NoOp(FAX OUT post-dial | jobid=${KFX_JOBID} DIALSTATUS=${DIALSTATUS} HANGUPCAUSE=${HANGUPCAUSE} KFX_FAXSTATUS=${KFX_FAXSTATUS} KFX_FAXERROR=${KFX_FAXERROR})
- same => n,AGI(kfx_update_status.agi,${KFX_JOBID},${DIALSTATUS},${HANGUPCAUSE},${KFX_FAXSTATUS},${KFX_FAXERROR},${KFX_FAXPAGES},${KFX_FAXBITRATE},${KFX_FAXECM})
- same => n,Hangup()
-
-
-[kfx_sendfax]
-exten => s,1,NoOp(kfx_sendfax | jobid=${ARG1} file=${ARG2})
-
- same => n,TryExec(SendFAX(${ARG2}))
-
- same => n,NoOp(FAX done | FAXSTATUS=${FAXSTATUS} FAXERROR=${FAXERROR} FAXPAGES=${FAXPAGES} FAXBITRATE=${FAXBITRATE} FAXECM=${FAXECM})
-
- same => n,Set(MASTER_CHANNEL(KFX_FAXSTATUS)=${FAXSTATUS})
- same => n,Set(MASTER_CHANNEL(KFX_FAXERROR)=${FAXERROR})
- same => n,Set(MASTER_CHANNEL(KFX_FAXPAGES)=${FAXPAGES})
- same => n,Set(MASTER_CHANNEL(KFX_FAXBITRATE)=${FAXBITRATE})
- same => n,Set(MASTER_CHANNEL(KFX_FAXECM)=${FAXECM})
-
- same => n,Return()
-
-
-
-
-[fax-in]
-exten => __FAX_DID__,1,NoOp(Inbound Fax)
- same => n,Answer()
- same => n,Set(FAXOPT(ecm)=__FAX_ECM__)
- same => n,Set(FAXOPT(maxrate)=__FAX_MAXRATE__)
- same => n,Set(JITTERBUFFER(adaptive)=default)
-
- same => n,Set(FAXSTAMP=${STRFTIME(${EPOCH},,%Y%m%d-%H%M%S)})
- same => n,Set(FROMRAW=${CALLERID(num)})
- same => n,Set(FROM=${FILTER(0-9,${FROMRAW})})
- same => n,ExecIf($["${FROM}"=""]?Set(FROM=unknown))
-
- same => n,Set(UID=${CUT(UNIQUEID,.,2)})
- same => n,ExecIf($["${UID}"=""]?Set(UID=${UNIQUEID}))
-
- same => n,Set(FAXBASE=${FAXSTAMP}_${FROM}_${UID})
- same => n,Set(TIFF=__SPOOL_TIFF_DIR__/${FAXBASE}.tif)
- same => n,Set(PDF=__SPOOL_PDF_DIR__/${FAXBASE}.pdf)
-
- same => n,ReceiveFAX(${TIFF})
- same => n,NoOp(FAXSTATUS=${FAXSTATUS} FAXERROR=${FAXERROR} PAGES=${FAXPAGES})
-
- same => n,Set(HASFILE=${STAT(e,${TIFF})})
- same => n,Set(SIZE=${STAT(s,${TIFF})})
- same => n,GotoIf($[${HASFILE} & ${SIZE} > 0]?to_pdf:no_file)
-
- same => n(to_pdf),System(tiff2pdf -o ${PDF} ${TIFF})
- same => n,GotoIf($["${SYSTEMSTATUS}"="SUCCESS"]?cleanup:keep_tiff)
-
- same => n(cleanup),System(rm -f ${TIFF})
- same => n,Hangup()
-
- same => n(keep_tiff),NoOp(PDF failed or partial - keeping TIFF: ${TIFF})
- same => n,Hangup()
-
- same => n(no_file),NoOp(No TIFF created. Nothing to convert.)
- same => n,Hangup()
-EOF
-)"
-  KZ_CONTENT="${KZ_CONTENT//__FAX_ECM__/${FAX_ECM}}"
-  KZ_CONTENT="${KZ_CONTENT//__FAX_MAXRATE__/${FAX_MAXRATE}}"
-  KZ_CONTENT="${KZ_CONTENT//__FROM_USER__/${FROM_USER}}"
-  KZ_CONTENT="${KZ_CONTENT//__FAX_DID__/${FAX_DID_LOCAL}}"
-  KZ_CONTENT="${KZ_CONTENT//__SPOOL_TIFF_DIR__/${SPOOL_TIFF_DIR}}"
-  KZ_CONTENT="${KZ_CONTENT//__SPOOL_PDF_DIR__/${SPOOL_PDF_DIR}}"
-  write_file /etc/asterisk/extensions.conf
-
-  say "6) AMI (manager.d) hardcoded lokal aktivieren + User ${AMI_USER}"
-  install -d -m 0755 /etc/asterisk/manager.d
-
-  # include manager.d aktivieren
-  if ! grep -qE '^\s*#include\s+"/etc/asterisk/manager\.d/\*\.conf"\s*$' /etc/asterisk/manager.conf 2>/dev/null; then
-    echo '#include "/etc/asterisk/manager.d/*.conf"' >> /etc/asterisk/manager.conf
-  fi
-
-  # general nur ergänzen, falls bindaddr fehlt (lokal hardcoded)
-  if ! grep -qE '^\s*bindaddr\s*=' /etc/asterisk/manager.conf 2>/dev/null; then
-    cat >>/etc/asterisk/manager.conf <<EOF
+# helper: set or add key within [general] (minimal-invasiv)
+ensure_manager_general_key(){
+  local key="$1" val="$2"
+  # gibt es [general]?
+  if ! grep -qE '^\s*\[general\]\s*$' "${MANAGER_CONF}" 2>/dev/null; then
+    cat >> "${MANAGER_CONF}" <<EOF
 
 [general]
 enabled = yes
 webenabled = no
 bindaddr = 127.0.0.1
-port = ${AMI_PORT}
+port = 5038
 EOF
+    return 0
   fi
 
-  cat >/etc/asterisk/manager.d/kfx.conf <<EOF
-[${AMI_USER}]
+  # innerhalb [general] key setzen/ergänzen
+  # 1) key existiert in [general] -> ersetzen
+  if awk -v k="$key" '
+    BEGIN{in=0;found=0}
+    /^\s*\[general\]\s*$/ {in=1; next}
+    /^\s*\[/ {if(in){exit} }
+    { if(in && $0 ~ "^[[:space:]]*"k"[[:space:]]*=") {found=1; exit} }
+    END{ exit(found?0:1) }
+  ' "${MANAGER_CONF}"; then
+    # ersetze nur innerhalb [general]
+    perl -0777 -pe '
+      my ($k,$v)=@ARGV;
+      s/(\[general\][^\[]*?)^\s*\Q$k\E\s*=.*?$/$1$k = $v/mgse;
+    ' "$key" "$val" -i "${MANAGER_CONF}"
+  else
+    # 2) key fehlt in [general] -> nach [general]-Zeile einfügen (oder ans Ende des blocks)
+    perl -0777 -pe '
+      my ($k,$v)=@ARGV;
+      s/(\[general\]\s*\n)/$1$k = $v\n/s;
+    ' "$key" "$val" -i "${MANAGER_CONF}"
+  fi
+}
+
+ensure_manager_general_key "enabled"   "yes"
+ensure_manager_general_key "webenabled" "no"
+ensure_manager_general_key "bindaddr"  "127.0.0.1"
+ensure_manager_general_key "port"      "5038"
+
+# kfx user (lokal) + secret
+cat >/etc/asterisk/manager.d/kfx.conf <<EOF
+[kfx]
 secret = ${AMI_SECRET}
 
 ; nur lokal (weil AMI bindaddr=127.0.0.1)
@@ -924,159 +809,219 @@ permit=127.0.0.1/255.255.255.255
 read = system,call,log,command,reporting
 write = system,call,command,reporting,originate
 EOF
-  chmod 0644 /etc/asterisk/manager.d/kfx.conf
-  chown root:root /etc/asterisk/manager.d/kfx.conf
+chmod 0644 /etc/asterisk/manager.d/kfx.conf
+chown root:root /etc/asterisk/manager.d/kfx.conf
 
-  # reload AMI + sanity
-  asterisk -rx "manager reload" || true
-  asterisk -rx "manager show user ${AMI_USER}" || true
+# ---- 8.6) extensions.conf (NEUE Vorlage) schreiben + dialplan reload ----
+CONF="/etc/asterisk/extensions.conf"
+STAMP=".old.kienzlefax.$(date +%Y%m%d-%H%M%S)"
+cp -a "$CONF" "${CONF}${STAMP}" 2>/dev/null || true
 
-  say "7) Asterisk restart"
-  systemctl restart asterisk.service || true
-}
+# Vorlage: wie gepastet, aber Nummern dynamisch befüllt:
+# - fax-in exten => ${FAX_DID}
+# - CALLERID(num) => ${SIP_NUMBER}
+cat >"$CONF" <<EOF
+[general]
+static=yes
+writeprotect=no
+clearglobalvars=no
 
-sep "GANZ AM ENDE: Asterisk-Konfiguration"
-kienzlefax_bootstrap_asterisk_configs
+; =============================================================================
+; kienzlefax — Asterisk Dialplan
+; - Fax-Out: Dial() + SendFAX() im callee Gosub
+; - Status/Result "Quelle der Wahrheit": kfx_update_status.agi (send_start / dial_end / send_end)
+; - Robust: Hangup-Handler auf PJSIP-Kanal als Fallback (weil FAX* Variablen dort gültig sind)
+;
+; WICHTIG:
+; - Der Worker originiert via AMI auf: Local/<exten>@fax-out/n und hält den Originate-Channel per Wait lange genug.
+; - DIALSTATUS=CANCEL + HANGUPCAUSE=19 wird im AGI als NOANSWER behandelt (Retry 3x).
+; =============================================================================
 
-# ------------------------------------------------------------------------------
-# 9) GANZ AM ENDE: /usr/local/bin/pdf_with_header.sh
-# ------------------------------------------------------------------------------
-sep "GANZ AM ENDE: /usr/local/bin/pdf_with_header.sh erstellen"
 
-tee /usr/local/bin/pdf_with_header.sh >/dev/null <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
+; =============================================================================
+; FAX-OUT
+; =============================================================================
+[fax-out]
 
-# Usage:
-#   pdf_with_header.sh INPUT.pdf OUTPUT.pdf
-#
-# Header on EACH page:
-#   Left:  "<DATE>"
-#   Center:"<PRACTICE_NAME>"
-#   Right: "Seite X/Y"
-#
-# Customize via env:
-#   PRACTICE_NAME="Praxis Dr. Thomas Mustermann"
-#   DATE_FMT="%d.%m.%Y %H:%M"
-#   TOP_OFFSET_MM="6"     # distance from top edge to text baseline (smaller => higher)
-#   FONT_NAME="Helvetica"
-#   FONT_SIZE="9"
-#   LEFT_MARGIN_MM="12"
-#   RIGHT_MARGIN_MM="12"
+; --- falls Datei fehlt ---
+exten => kfx_missing_file,1,NoOp(FAX OUT ERROR: missing KFX_FILE | jobid=\${KFX_JOBID})
+ same => n,AGI(kfx_update_status.agi,\${KFX_JOBID},dial_end,CHANUNAVAIL,0)
+ same => n,Hangup()
 
-IN="${1:-}"
-OUT="${2:-}"
-[[ -n "$IN" && -n "$OUT" ]] || { echo "Usage: pdf_with_header.sh INPUT.pdf OUTPUT.pdf" >&2; exit 2; }
-[[ -f "$IN" ]] || { echo "Input not found: $IN" >&2; exit 2; }
+; --- h-extension: wird bei Hangup des Local-Channels ausgeführt ---
+; Nicht mit Return() enden (kein Gosub-Stack!). Einfach Hangup.
+exten => h,1,NoOp(fax-out h-extension | jobid=\${KFX_JOBID} DIALSTATUS=\${DIALSTATUS} HANGUPCAUSE=\${HANGUPCAUSE})
+ ; Dial-End immer melden (aber: wenn ANSWER, finalisiert AGI NICHT, sondern wartet auf send_end/hangup)
+ same => n,AGI(kfx_update_status.agi,\${KFX_JOBID},dial_end,\${DIALSTATUS},\${HANGUPCAUSE})
+ same => n,Hangup()
 
-PRACTICE_NAME="${PRACTICE_NAME:-Praxis}"
-DATE_FMT="${DATE_FMT:-%d.%m.%Y %H:%M}"
-TOP_OFFSET_MM="${TOP_OFFSET_MM:-6}"
-FONT_NAME="${FONT_NAME:-Helvetica}"
-FONT_SIZE="${FONT_SIZE:-9}"
-LEFT_MARGIN_MM="${LEFT_MARGIN_MM:-12}"
-RIGHT_MARGIN_MM="${RIGHT_MARGIN_MM:-12}"
+; --- 49... -> 0... ---
+exten => _49X.,1,NoOp(FAX OUT normalize 49... -> national | jobid=\${KFX_JOBID} file=\${KFX_FILE})
+ same => n,Set(JITTERBUFFER(adaptive)=default)
+ same => n,Set(NORM=0\${EXTEN:2})
+ same => n,NoOp(NORMALIZED=\${NORM})
+ same => n,GotoIf(\$[ "\${KFX_FILE}" = "" ]?kfx_missing_file,1)
 
-export PRACTICE_NAME DATE_FMT TOP_OFFSET_MM FONT_NAME FONT_SIZE LEFT_MARGIN_MM RIGHT_MARGIN_MM
-export INFILE="$IN" OUTFILE="$OUT"
+ ; Job-Tagging (wichtig für Cancel/Orphan-Reconcile)
+ same => n,Set(CHANNEL(accountcode)=\${KFX_JOBID})
+ same => n,Set(CDR(userfield)=kfx:\${KFX_JOBID})
 
-python3 - <<'PY'
-import os, io, datetime
-from reportlab.pdfgen import canvas
-from reportlab.lib.units import mm
+ ; Fax-Optionen
+ same => n,Set(FAXOPT(ecm)=yes)
+ same => n,Set(FAXOPT(maxrate)=9600)
 
-# Prefer pypdf (new), fallback to PyPDF2 (old)
-try:
-    from pypdf import PdfReader, PdfWriter
-except Exception:
-    from PyPDF2 import PdfReader, PdfWriter  # type: ignore
+ ; CallerID
+ same => n,Set(CALLERID(num)=${SIP_NUMBER})
+ same => n,Set(CALLERID(name)=Fax)
 
-IN = os.environ.get("INFILE")
-OUT = os.environ.get("OUTFILE")
-if not IN or not OUT:
-    raise SystemExit("missing INFILE/OUTFILE env")
+ ; Dial: callee Gosub führt SendFAX auf PJSIP-Kanal aus
+ ; g = weiter im Dialplan nach Auflegen
+ ; U() = Gosub auf callee channel (PJSIP), dort sind FAX* gültig
+ same => n,Dial(PJSIP/\${NORM}@1und1-endpoint,60,gU(kfx_sendfax^\${KFX_JOBID}^\${KFX_FILE}))
+ same => n,Hangup()
 
-PRACTICE_NAME = os.environ.get("PRACTICE_NAME", "Praxis")
-DATE_FMT = os.environ.get("DATE_FMT", "%d.%m.%Y %H:%M")
-TOP_OFFSET_MM = float(os.environ.get("TOP_OFFSET_MM", "6"))
-FONT_NAME = os.environ.get("FONT_NAME", "Helvetica")
-FONT_SIZE = float(os.environ.get("FONT_SIZE", "9"))
-LEFT_MARGIN_MM = float(os.environ.get("LEFT_MARGIN_MM", "12"))
-RIGHT_MARGIN_MM = float(os.environ.get("RIGHT_MARGIN_MM", "12"))
+; --- national 0... ---
+exten => _0X.,1,NoOp(FAX OUT national | jobid=\${KFX_JOBID} file=\${KFX_FILE})
+ same => n,Set(JITTERBUFFER(adaptive)=default)
+ same => n,GotoIf(\$[ "\${KFX_FILE}" = "" ]?kfx_missing_file,1)
 
-reader = PdfReader(IN)
-writer = PdfWriter()
+ same => n,Set(CHANNEL(accountcode)=\${KFX_JOBID})
+ same => n,Set(CDR(userfield)=kfx:\${KFX_JOBID})
 
-total = len(reader.pages)
-date_str = datetime.datetime.now().strftime(DATE_FMT)
+ same => n,Set(FAXOPT(ecm)=yes)
+ same => n,Set(FAXOPT(maxrate)=9600)
 
-for i, page in enumerate(reader.pages, start=1):
-    media = page.mediabox
-    w = float(media.width)
-    h = float(media.height)
+ same => n,Set(CALLERID(num)=${SIP_NUMBER})
+ same => n,Set(CALLERID(name)=Fax)
 
-    packet = io.BytesIO()
-    c = canvas.Canvas(packet, pagesize=(w, h))
-    c.setFont(FONT_NAME, FONT_SIZE)
+ same => n,Dial(PJSIP/\${EXTEN}@1und1-endpoint,60,gU(kfx_sendfax^\${KFX_JOBID}^\${KFX_FILE}))
+ same => n,Hangup()
 
-    y = h - (TOP_OFFSET_MM * mm)
-    left_x = LEFT_MARGIN_MM * mm
-    right_x = w - (RIGHT_MARGIN_MM * mm)
 
-    c.drawString(left_x, y, date_str)
-    c.drawCentredString(w / 2.0, y, PRACTICE_NAME)
-    c.drawRightString(right_x, y, f"Seite {i}/{total}")
+; =============================================================================
+; CALLEE GOSUB: SendFAX läuft auf dem PJSIP-Kanal
+; =============================================================================
+[kfx_sendfax]
+exten => s,1,NoOp(kfx_sendfax | jobid=\${ARG1} file=\${ARG2} chan=\${CHANNEL(name)})
 
-    c.showPage()
-    c.save()
+ ; Job-Tagging auch auf PJSIP-Kanal
+ same => n,Set(CHANNEL(accountcode)=\${ARG1})
+ same => n,Set(CDR(userfield)=kfx:\${ARG1})
 
-    packet.seek(0)
-    overlay_reader = PdfReader(packet)
-    overlay_page = overlay_reader.pages[0]
+ ; Fallback: Hangup-Handler auf PJSIP-Kanal (FAX* Variablen hier noch vorhanden)
+ same => n,Set(CHANNEL(hangup_handler_push)=kfx_sendfax_hangup,s,1(\${ARG1}))
 
-    try:
-        page.merge_page(overlay_page)
-    except Exception:
-        page.mergePage(overlay_page)  # legacy
+ ; send_start: status=sending + channel/uniqueid ins job.json
+ same => n,AGI(kfx_update_status.agi,\${ARG1},send_start)
 
-    writer.add_page(page)
+ ; Der eigentliche Faxversand
+ same => n,TryExec(SendFAX(\${ARG2}))
 
-with open(OUT, "wb") as f:
-    writer.write(f)
-PY
+ ; Wichtig: nach SendFAX sind FAX* Variablen hier gültig (PJSIP-Kanal)
+ same => n,NoOp(FAX done | FAXSTATUS=\${FAXSTATUS} FAXERROR=\${FAXERROR} FAXPAGES=\${FAXPAGES} FAXBITRATE=\${FAXBITRATE} FAXECM=\${FAXECM} DIALSTATUS=\${DIALSTATUS} HANGUPCAUSE=\${HANGUPCAUSE})
+
+ ; send_end: Quelle der Wahrheit (entscheidet OK/RETRY/FAILED nach Policy)
+ same => n,AGI(kfx_update_status.agi,\${ARG1},send_end,\${FAXSTATUS},\${FAXERROR},\${FAXPAGES},\${FAXBITRATE},\${FAXECM},\${DIALSTATUS},\${HANGUPCAUSE})
+
+ same => n,Return()
+
+
+; =============================================================================
+; Hangup Handler auf PJSIP-Kanal (Fallback, falls send_end nicht lief)
+; =============================================================================
+[kfx_sendfax_hangup]
+exten => s,1,NoOp(kfx_sendfax_hangup | jobid=\${ARG1} chan=\${CHANNEL(name)} FAXSTATUS=\${FAXSTATUS} FAXERROR=\${FAXERROR} FAXPAGES=\${FAXPAGES} FAXBITRATE=\${FAXBITRATE} FAXECM=\${FAXECM} DIALSTATUS=\${DIALSTATUS} HANGUPCAUSE=\${HANGUPCAUSE})
+ ; Nur sinnvoll, wenn nicht schon SUCCESS/OK in job.json steht – diese Logik macht das AGI konservativ.
+ same => n,AGI(kfx_update_status.agi,\${ARG1},send_end,\${FAXSTATUS},\${FAXERROR},\${FAXPAGES},\${FAXBITRATE},\${FAXECM},\${DIALSTATUS},\${HANGUPCAUSE})
+ same => n,Return()
+
+
+; =============================================================================
+; FAX-IN (UID nur Zähler-Teil nach Punkt)
+; =============================================================================
+[fax-in]
+exten => ${FAX_DID},1,NoOp(Inbound Fax)
+ same => n,Answer()
+ same => n,Set(FAXOPT(ecm)=yes)
+ same => n,Set(FAXOPT(maxrate)=9600)
+ same => n,Set(JITTERBUFFER(adaptive)=default)
+
+ same => n,Set(FAXSTAMP=\${STRFTIME(\${EPOCH},,%Y%m%d-%H%M%S)})
+ same => n,Set(FROMRAW=\${CALLERID(num)})
+ same => n,Set(FROM=\${FILTER(0-9,\${FROMRAW})})
+ same => n,ExecIf(\$["\${FROM}"=""]?Set(FROM=unknown))
+
+ ; UNIQUEID nur Zähler-Teil nach Punkt
+ same => n,Set(UID=\${CUT(UNIQUEID,.,2)})
+ same => n,ExecIf(\$["\${UID}"=""]?Set(UID=\${UNIQUEID}))
+
+ same => n,Set(FAXBASE=\${FAXSTAMP}_\${FROM}_\${UID})
+ same => n,Set(TIFF=${SPOOL_TIFF_DIR}/\${FAXBASE}.tif)
+ same => n,Set(PDF=${SPOOL_PDF_DIR}/\${FAXBASE}.pdf)
+
+ same => n,ReceiveFAX(\${TIFF})
+ same => n,NoOp(FAXSTATUS=\${FAXSTATUS} FAXERROR=\${FAXERROR} PAGES=\${FAXPAGES})
+
+ same => n,Set(HASFILE=\${STAT(e,\${TIFF})})
+ same => n,Set(SIZE=\${STAT(s,\${TIFF})})
+ same => n,GotoIf(\$[\${HASFILE} & \${SIZE} > 0]?to_pdf:no_file)
+
+ same => n(to_pdf),System(tiff2pdf -o \${PDF} \${TIFF})
+ same => n,GotoIf(\$["\${SYSTEMSTATUS}"="SUCCESS"]?cleanup:keep_tiff)
+
+ same => n(cleanup),System(rm -f \${TIFF})
+ same => n,Hangup()
+
+ same => n(keep_tiff),NoOp(PDF failed or partial - keeping TIFF: \${TIFF})
+ same => n,Hangup()
+
+ same => n(no_file),NoOp(No TIFF created. Nothing to convert.)
+ same => n,Hangup()
 EOF
 
-chmod +x /usr/local/bin/pdf_with_header.sh
+# ---- 8.7) AGI installieren (v1.3.6) ----
+AGI=/var/lib/asterisk/agi-bin/kfx_update_status.agi
+mkdir -p "$(dirname "$AGI")"
+backup_file_ts "$AGI" || true
 
-# ------------------------------------------------------------------------------
-# 10) kfx_update_status.agi
-# ------------------------------------------------------------------------------
-sep "kfx_update_status.agi installieren"
-
-install -d -m 0755 /var/lib/asterisk/agi-bin
-
-cat >/var/lib/asterisk/agi-bin/kfx_update_status.agi <<'EOF'
+cat >"$AGI" <<'PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 kfx_update_status.agi — kienzlefax
-Version: 1.3.3
-Stand:  2026-02-16
+Version: 1.3.6
+Stand:  2026-02-17
 Autor:  Dr. Thomas Kienzle
 
-Fixes in 1.3.3:
-- Retry-Policy wie gewünscht:
-  - BUSY:      15 Versuche, 90s Abstand
-  - NOANSWER:   3 Versuche, 120s Abstand (wenn du 90s willst: unten ändern)
-  - alles andere retryable: 30 Versuche
-    - CONGESTION/CHANUNAVAIL: 20s Abstand
-    - FAXFAIL (ANSWER aber FAXSTATUS != SUCCESS): 60s Abstand
-- OK nur wenn FAXSTATUS == SUCCESS, sonst FAILED oder RETRY nach Policy.
+Changelog (komplett):
+- 1.3.3:
+  - Retry-Policy:
+    - BUSY:       15 Versuche, 90s Abstand
+    - NOANSWER:    3 Versuche, 120s Abstand (kann angepasst werden)
+    - alles andere retryable: 30 Versuche
+      - CONGESTION/CHANUNAVAIL: 20s Abstand
+      - FAXFAIL (ANSWER aber FAXSTATUS != SUCCESS): 60s Abstand
+  - OK nur wenn FAXSTATUS == SUCCESS.
+- 1.3.6:
+  - Unterstützt Event-Style Aufrufe aus dem Dialplan:
+      * ... jobid,send_start
+      * ... jobid,dial_end,<DIALSTATUS>,<HANGUPCAUSE>
+      * ... jobid,send_end,<FAXSTATUS>,<FAXERROR>,<FAXPAGES>,<FAXBITRATE>,<FAXECM>,<DIALSTATUS>,<HANGUPCAUSE>
+    (Legacy-Signatur weiterhin kompatibel.)
+  - FIX2: DIALSTATUS=CANCEL + HANGUPCAUSE=19 wird als NOANSWER behandelt (Policy: 3 Versuche),
+    weil das in Praxis häufig „keiner geht ran“ bedeutet.
+  - Konservative Entscheidung:
+    - dial_end mit ANSWER finalisiert NICHT (wartet auf send_end oder Hangup-Handler).
+    - send_end ist „Quelle der Wahrheit“ für Fax-Ergebnis.
+  - Neue Reason-Klasse NOFAX:
+    - Wenn ANSWER aber Fax scheitert/keine Seiten -> nur 3 Versuche (statt 30).
+  - Atomare JSON-Schreibweise (tmp + replace), um kaputte job.json zu vermeiden.
 """
+
 import json
 import os
-import sys
 import re
+import sys
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, Tuple
@@ -1085,12 +1030,18 @@ BASE = Path("/srv/kienzlefax")
 PROC = BASE / "processing"
 QUEUE = BASE / "queue"
 
+# Policy nach deinem Stand:
+# - BUSY: 15 @ 90s
+# - NOANSWER: 3 @ 90s
+# - alles andere (nicht BUSY/NOANSWER): 30 @ 20s
+# - NOFAX: 3 @ 20s
 RETRY_RULES = {
-    "BUSY":       {"delay": 90,  "max": 15},
-    "NOANSWER":   {"delay": 120, "max": 3},
-    "CONGESTION": {"delay": 20,  "max": 30},
-    "CHANUNAVAIL":{"delay": 20,  "max": 30},
-    "FAXFAIL":    {"delay": 60,  "max": 30},
+    "BUSY":        {"delay": 90, "max": 15},
+    "NOANSWER":    {"delay": 90, "max": 3},
+    "CONGESTION":  {"delay": 20, "max": 30},
+    "CHANUNAVAIL": {"delay": 20, "max": 30},
+    "FAXFAIL":     {"delay": 20, "max": 30},
+    "NOFAX":       {"delay": 20, "max": 3},
 }
 
 def now_iso() -> str:
@@ -1147,7 +1098,6 @@ def find_job_json(jobid: str) -> Optional[Path]:
     for p in direct:
         if p.exists():
             return p
-
     for root in (PROC, QUEUE):
         if not root.exists():
             continue
@@ -1168,12 +1118,23 @@ def read_json(p: Path) -> Dict[str, Any]:
     with p.open("r", encoding="utf-8") as f:
         return json.load(f)
 
-def write_json(p: Path, obj: Dict[str, Any]) -> None:
+def write_json_atomic(p: Path, obj: Dict[str, Any]) -> None:
     tmp = p.with_suffix(p.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, p)
+
+def set_attempt_meta(job: Dict[str, Any], *, ended: bool, reason: Optional[str]=None, mx: Optional[int]=None) -> None:
+    a = job.setdefault("attempt", {})
+    if ended:
+        a["ended_at"] = now_iso()
+    if reason:
+        a["last_reason"] = reason
+    if mx is not None:
+        a["max"] = int(mx)
 
 def apply_retry(job: Dict[str, Any], key: str) -> None:
     rule = RETRY_RULES[key]
@@ -1181,33 +1142,69 @@ def apply_retry(job: Dict[str, Any], key: str) -> None:
     mx = int(rule["max"])
 
     r = job.setdefault("retry", {})
-    try:
-        r["attempt"] = int(r.get("attempt") or 0) + 1
-    except Exception:
-        r["attempt"] = 1
     r["max"] = mx
     r["last_reason"] = key
     r["suggested_delay_sec"] = delay
     r["next_try_at"] = (datetime.now(timezone.utc) + timedelta(seconds=delay)).replace(microsecond=0).isoformat()
 
+    set_attempt_meta(job, ended=True, reason=key, mx=mx)
+
+def set_result_fields(job: Dict[str, Any], **kv: str) -> None:
+    res = job.setdefault("result", {})
+    for k, v in kv.items():
+        if v is None:
+            continue
+        res[k] = v if isinstance(v, str) else to_str(v)
+
+def normalize_cancel19(dialstatus: str, hangupcause: str) -> str:
+    if dialstatus == "CANCEL" and hangupcause == "19":
+        return "NOANSWER"
+    return dialstatus
+
+def decide_from_send_end(dialstatus: str, hangupcause: str, faxstatus: str, faxerror: str, pages_sent: Optional[int]):
+    if faxstatus == "SUCCESS":
+        return "OK", "OK"
+
+    nofax = False
+    if dialstatus == "ANSWER":
+        if pages_sent is not None and pages_sent <= 0:
+            nofax = True
+        if "dropped prematurely" in (faxerror or "").lower():
+            nofax = True
+        if faxerror.strip().upper() in ("HANGUP", "NO CARRIER", "NOCARRIER"):
+            nofax = True
+
+    if nofax:
+        return "RETRY", "NOFAX"
+
+    if dialstatus == "ANSWER":
+        return "RETRY", "FAXFAIL"
+
+    if dialstatus in ("BUSY", "NOANSWER", "CONGESTION", "CHANUNAVAIL"):
+        return "RETRY", dialstatus
+
+    return "FAILED", faxstatus or dialstatus or "unknown"
+
+def decide_from_dial_end(dialstatus: str):
+    if dialstatus == "ANSWER":
+        return None, None
+    if dialstatus in ("BUSY", "NOANSWER", "CONGESTION", "CHANUNAVAIL"):
+        return "RETRY", dialstatus
+    if dialstatus == "CANCEL":
+        return "FAILED", "CANCEL"
+    return "FAILED", dialstatus or "unknown"
+
 def main() -> int:
-    _agi_env = agi_read_env()
+    agi_env = agi_read_env()
 
     args = sys.argv[1:]
-    while len(args) < 8:
-        args.append("")
+    if len(args) < 2:
+        eprint("kfx_update_status.agi: missing args")
+        return 0
 
     jobid = sanitize_jobid(args[0])
-    dialstatus = upper(args[1])
-    hangupcause = to_str(args[2]).strip()
-    faxstatus = upper(args[3])
-    faxerror = to_str(args[4]).strip()
-    faxpages_raw = to_str(args[5]).strip()
-    faxbitrate = to_str(args[6]).strip()
-    faxecm = to_str(args[7]).strip()
-
     if not jobid:
-        eprint("kfx_update_status.agi: missing jobid (ARG1)")
+        eprint("kfx_update_status.agi: missing jobid")
         return 0
 
     jp = find_job_json(jobid)
@@ -1222,86 +1219,236 @@ def main() -> int:
         return 0
 
     was_cancelled = bool((job.get("cancel") or {}).get("requested"))
+    action = upper(args[1])
 
-    res = job.setdefault("result", {})
-    res["dialstatus"] = dialstatus
-    res["hangupcause"] = hangupcause
-    res["faxstatus"] = faxstatus
-    res["faxerror"] = faxerror
-    res["faxpages_raw"] = faxpages_raw
-    res["faxbitrate"] = faxbitrate
-    res["faxecm"] = faxecm
+    if action == "SEND_START":
+        job["status"] = "SENDING"
+        job["updated_at"] = now_iso()
+        a = job.setdefault("attempt", {})
+        a.setdefault("started_at", job["updated_at"])
+        job.setdefault("asterisk", {})
+        chan = agi_env.get("agi_channel", "")
+        if chan:
+            job["asterisk"]["channel_sendfax"] = chan
+        uid = agi_env.get("agi_uniqueid", "")
+        if uid:
+            job["asterisk"]["uniqueid"] = uid
+        try:
+            write_json_atomic(jp, job)
+        except Exception as e:
+            eprint(f"kfx_update_status.agi: write failed {jp}: {e}")
+        return 0
 
+    if action == "DIAL_END":
+        dialstatus = upper(args[2]) if len(args) >= 3 else ""
+        hangupcause = to_str(args[3]).strip() if len(args) >= 4 else ""
+        dialstatus = normalize_cancel19(dialstatus, hangupcause)
+        set_result_fields(job, dialstatus=dialstatus, hangupcause=hangupcause)
+
+        if was_cancelled:
+            job["status"] = "FAILED"
+            job.setdefault("result", {})["reason"] = "cancelled"
+            set_attempt_meta(job, ended=True, reason="cancelled", mx=(job.get("retry") or {}).get("max"))
+            job["end_time"] = now_iso()
+            job["updated_at"] = job["end_time"]
+            job["finalized_at"] = job.get("finalized_at") or job["end_time"]
+            try:
+                write_json_atomic(jp, job)
+            except Exception as e:
+                eprint(f"kfx_update_status.agi: write failed {jp}: {e}")
+            return 0
+
+        final_status, reason_key = decide_from_dial_end(dialstatus)
+        if final_status is None:
+            job["updated_at"] = now_iso()
+            try:
+                write_json_atomic(jp, job)
+            except Exception as e:
+                eprint(f"kfx_update_status.agi: write failed {jp}: {e}")
+            return 0
+
+        if final_status == "RETRY" and reason_key in RETRY_RULES:
+            job["status"] = "RETRY"
+            job.setdefault("result", {})["reason"] = reason_key
+            apply_retry(job, reason_key)
+        else:
+            job["status"] = "FAILED"
+            job.setdefault("result", {})["reason"] = reason_key or "FAILED"
+            set_attempt_meta(job, ended=True, reason=reason_key or "FAILED", mx=(job.get("retry") or {}).get("max"))
+            job["finalized_at"] = job.get("finalized_at") or now_iso()
+
+        job["end_time"] = now_iso()
+        job["updated_at"] = job["end_time"]
+
+        try:
+            write_json_atomic(jp, job)
+        except Exception as e:
+            eprint(f"kfx_update_status.agi: write failed {jp}: {e}")
+
+        try:
+            agi_send(f'SET VARIABLE KFX_JOB_STATUS "{job.get("status","")}"')
+        except Exception:
+            pass
+        return 0
+
+    if action == "SEND_END":
+        faxstatus = upper(args[2]) if len(args) >= 3 else ""
+        faxerror = to_str(args[3]).strip() if len(args) >= 4 else ""
+        faxpages_raw = to_str(args[4]).strip() if len(args) >= 5 else ""
+        faxbitrate = to_str(args[5]).strip() if len(args) >= 6 else ""
+        faxecm = to_str(args[6]).strip() if len(args) >= 7 else ""
+        dialstatus = upper(args[7]) if len(args) >= 8 else ""
+        hangupcause = to_str(args[8]).strip() if len(args) >= 9 else ""
+
+        dialstatus = normalize_cancel19(dialstatus, hangupcause)
+
+        sent, total = parse_pages(faxpages_raw)
+        set_result_fields(
+            job,
+            faxstatus=faxstatus,
+            faxerror=faxerror,
+            faxpages_raw=faxpages_raw,
+            faxbitrate=faxbitrate,
+            faxecm=faxecm,
+            dialstatus=dialstatus,
+            hangupcause=hangupcause,
+        )
+        res = job.setdefault("result", {})
+        if sent is not None:
+            res["faxpages_sent"] = sent
+        if total is not None:
+            res["faxpages_total"] = total
+
+        if was_cancelled or dialstatus == "CANCEL":
+            job["status"] = "FAILED"
+            res["reason"] = "cancelled" if was_cancelled else "CANCEL"
+            set_attempt_meta(job, ended=True, reason=res["reason"], mx=(job.get("retry") or {}).get("max"))
+            job["finalized_at"] = job.get("finalized_at") or now_iso()
+        else:
+            final_status, reason_key = decide_from_send_end(dialstatus, hangupcause, faxstatus, faxerror, sent)
+            if final_status == "OK":
+                job["status"] = "OK"
+                res["reason"] = "OK"
+                set_attempt_meta(job, ended=True, reason="OK", mx=(job.get("retry") or {}).get("max"))
+                job["finalized_at"] = job.get("finalized_at") or now_iso()
+            elif final_status == "RETRY" and reason_key in RETRY_RULES:
+                job["status"] = "RETRY"
+                res["reason"] = reason_key
+                apply_retry(job, reason_key)
+            else:
+                job["status"] = "FAILED"
+                res["reason"] = reason_key or "FAILED"
+                set_attempt_meta(job, ended=True, reason=res["reason"], mx=(job.get("retry") or {}).get("max"))
+                job["finalized_at"] = job.get("finalized_at") or now_iso()
+
+        job["end_time"] = now_iso()
+        job["updated_at"] = job["end_time"]
+
+        try:
+            write_json_atomic(jp, job)
+        except Exception as e:
+            eprint(f"kfx_update_status.agi: write failed {jp}: {e}")
+
+        try:
+            agi_send(f'SET VARIABLE KFX_JOB_STATUS "{job.get("status","")}"')
+        except Exception:
+            pass
+        return 0
+
+    # Legacy fallback:
+    legacy = args[1:]
+    while len(legacy) < 8:
+        legacy.append("")
+    dialstatus = upper(legacy[0])
+    hangupcause = to_str(legacy[1]).strip()
+    faxstatus = upper(legacy[2])
+    faxerror = to_str(legacy[3]).strip()
+    faxpages_raw = to_str(legacy[4]).strip()
+    faxbitrate = to_str(legacy[5]).strip()
+    faxecm = to_str(legacy[6]).strip()
+
+    dialstatus = normalize_cancel19(dialstatus, hangupcause)
     sent, total = parse_pages(faxpages_raw)
+
+    set_result_fields(
+        job,
+        dialstatus=dialstatus,
+        hangupcause=hangupcause,
+        faxstatus=faxstatus,
+        faxerror=faxerror,
+        faxpages_raw=faxpages_raw,
+        faxbitrate=faxbitrate,
+        faxecm=faxecm,
+    )
+    res = job.setdefault("result", {})
     if sent is not None:
         res["faxpages_sent"] = sent
     if total is not None:
         res["faxpages_total"] = total
 
-    status = "FAILED"
-    reason = ""
-
-    if was_cancelled or dialstatus == "CANCEL":
-        status = "FAILED"
-        reason = "cancelled"
-    elif faxstatus == "SUCCESS":
-        status = "OK"
-        reason = "OK"
+    if was_cancelled:
+        job["status"] = "FAILED"
+        res["reason"] = "cancelled"
+        set_attempt_meta(job, ended=True, reason="cancelled", mx=(job.get("retry") or {}).get("max"))
+        job["finalized_at"] = job.get("finalized_at") or now_iso()
     else:
-        retry_key: Optional[str] = None
-
-        if dialstatus in ("BUSY", "NOANSWER", "CONGESTION", "CHANUNAVAIL"):
-            retry_key = dialstatus
-        elif dialstatus == "ANSWER":
-            retry_key = "FAXFAIL"
-
-        if retry_key and retry_key in RETRY_RULES:
-            status = "RETRY"
-            reason = retry_key
-            apply_retry(job, retry_key)
+        if faxstatus == "SUCCESS":
+            job["status"] = "OK"
+            res["reason"] = "OK"
+            set_attempt_meta(job, ended=True, reason="OK", mx=(job.get("retry") or {}).get("max"))
+            job["finalized_at"] = job.get("finalized_at") or now_iso()
         else:
-            status = "FAILED"
-            reason = faxstatus or dialstatus or "unknown"
-
-    job["status"] = status
-    res["reason"] = reason
+            final_status, reason_key = decide_from_send_end(dialstatus, hangupcause, faxstatus, faxerror, sent)
+            if final_status == "RETRY" and reason_key in RETRY_RULES:
+                job["status"] = "RETRY"
+                res["reason"] = reason_key
+                apply_retry(job, reason_key)
+            else:
+                job["status"] = "FAILED"
+                res["reason"] = reason_key or "FAILED"
+                set_attempt_meta(job, ended=True, reason=res["reason"], mx=(job.get("retry") or {}).get("max"))
+                job["finalized_at"] = job.get("finalized_at") or now_iso()
 
     job["end_time"] = now_iso()
     job["updated_at"] = job["end_time"]
-    if status in ("OK", "FAILED"):
-        job["finalized_at"] = job.get("finalized_at") or job["end_time"]
-
     try:
-        write_json(jp, job)
+        write_json_atomic(jp, job)
     except Exception as e:
-        eprint(f"kfx_update_status.agi: cannot write {jp}: {e}")
+        eprint(f"kfx_update_status.agi: write failed {jp}: {e}")
 
     try:
-        agi_send(f'SET VARIABLE KFX_JOB_STATUS "{status}"')
+        agi_send(f'SET VARIABLE KFX_JOB_STATUS "{job.get("status","")}"')
     except Exception:
         pass
-
     return 0
 
 if __name__ == "__main__":
-    sys.exit(main())
-EOF
+    try:
+        sys.exit(main())
+    except Exception as e:
+        eprint(f"kfx_update_status.agi: fatal: {e}")
+        sys.exit(0)
+PY
 
-chmod 0755 /var/lib/asterisk/agi-bin/kfx_update_status.agi
-chown root:root /var/lib/asterisk/agi-bin/kfx_update_status.agi
+chmod 0755 "$AGI"
+if id asterisk >/dev/null 2>&1; then
+  chown asterisk:asterisk "$AGI"
+else
+  chown root:root "$AGI" || true
+fi
+python3 -m py_compile "$AGI"
 
-# ------------------------------------------------------------------------------
-# 11) Worker installieren + Service
-# ------------------------------------------------------------------------------
-sep "kienzlefax-worker installieren + systemd service"
+# ---- 8.8) Worker installieren (v1.3.5) + systemd ----
+W="/usr/local/bin/kienzlefax-worker.py"
+backup_file_ts "$W" || true
 
-cat >/usr/local/bin/kienzlefax-worker.py <<'EOF'
+cat >"$W" <<'PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 kienzlefax-worker.py — Asterisk-Only Worker (SendFAX)
-Version: 1.3.3
-Stand:  2026-02-16
+Version: 1.3.5
+Stand:  2026-02-17
 Autor:  Dr. Thomas Kienzle
 
 Changelog (komplett):
@@ -1313,8 +1460,7 @@ Changelog (komplett):
 - 1.3.1:
   - AMI-basierter Versand stabilisiert; Rechte/Manager-User Themen sichtbar gemacht.
 - 1.3.2:
-  - HylaFAX-Legacy entfernt: Finalisierung basiert ausschließlich auf AGI-Ergebnis in job.json
-    (kfx_update_status.agi schreibt status=OK/FAILED/RETRY + result.*).
+  - HylaFAX-Legacy entfernt: Finalisierung basiert ausschließlich auf AGI-Ergebnis in job.json.
   - Retry-Handling: status=RETRY => zurück in Queue (Backoff via retry.next_try_at, attempt, etc.).
   - Cooldown nach jedem Call-Ende (terminal oder RETRY) für Gerätepause.
   - Asterisk-Originate so implementiert, dass fax-out NICHT doppelt ausgeführt wird:
@@ -1322,11 +1468,18 @@ Changelog (komplett):
   - PDF->TIFF/F Konvertierung (tiffg4) für SendFAX.
   - Report+Dokument werden weiterhin als PDF zusammengeführt (qpdf), für Archiv/Fehler.
 - 1.3.3:
-  - Retry-Limits werden erzwungen:
-    Wenn job.status=RETRY und retry.max gesetzt ist und attempt >= max -> endgültig FAILED + Fehlerarchiv.
-    (Policy/Max/Delay kommt aus kfx_update_status.agi v1.3.3)
-  - Report enthält Retry-Infos (attempt/max/next_try_at), wenn vorhanden.
+  - Retry-Limits werden erzwungen (basierend auf retry.* Feldern).
+  - Report enthält Retry-Infos.
+- 1.3.4:
+  - Versuchszähler umgebaut (attempt.current als kanonisch).
+- 1.3.5:
+  - FIX: attempt.current wird jetzt beim START eines Attempts hochgezählt (submit_job),
+    nicht beim Requeue. Dadurch zählt jeder tatsächliche Originate/Call genau 1 Versuch,
+    unabhängig davon, ob/wo der Job requeued wird.
+  - Limit-Prüfung: wenn attempt.current > attempt.max (oder retry.max) -> final FAILED.
+  - POST_CALL_COOLDOWN default 20s (per ENV übersteuerbar).
 """
+
 import fcntl
 import json
 import os
@@ -1359,7 +1512,7 @@ PDF_HEADER_SCRIPT = Path(os.environ.get("KFX_PDF_HEADER_SCRIPT", "/usr/local/bin
 
 MAX_INFLIGHT_PROCESSING = int(os.environ.get("KFX_MAX_INFLIGHT", "1"))
 POLL_INTERVAL_SEC = float(os.environ.get("KFX_POLL_INTERVAL_SEC", "1.0"))
-POST_CALL_COOLDOWN_SEC = float(os.environ.get("KFX_POST_CALL_COOLDOWN_SEC", "5.0"))
+POST_CALL_COOLDOWN_SEC = float(os.environ.get("KFX_POST_CALL_COOLDOWN_SEC", "20.0"))
 
 TIFF_DPI = os.environ.get("KFX_TIFF_DPI", "204x196")
 TIFF_DEVICE = os.environ.get("KFX_TIFF_DEVICE", "tiffg4")
@@ -1491,6 +1644,9 @@ def retry_due(job: Dict[str, Any]) -> bool:
     except Exception:
         return True
 
+def _st_norm(job: Dict[str, Any]) -> str:
+    return str(job.get("status") or "").strip().upper()
+
 def count_inflight() -> int:
     n = 0
     for jdir in list_jobdirs(PROC):
@@ -1501,8 +1657,8 @@ def count_inflight() -> int:
             job = read_json(jp)
         except Exception:
             continue
-        st = str(job.get("status") or "").lower()
-        if st in ("claimed", "submitted", "running"):
+        st = _st_norm(job)
+        if st in ("CLAIMED", "SUBMITTED", "PROCESSING", "CALLING", "SENDING"):
             n += 1
     return n
 
@@ -1516,8 +1672,8 @@ def get_busy_numbers() -> set[str]:
             job = read_json(jp)
         except Exception:
             continue
-        st = str(job.get("status") or "").lower()
-        if st in ("claimed", "submitted", "running", "retry_wait"):
+        st = _st_norm(job)
+        if st in ("CLAIMED", "SUBMITTED", "PROCESSING", "CALLING", "SENDING", "RETRY_WAIT"):
             num = normalize_number(((job.get("recipient") or {}).get("number") or ""))
             if num:
                 busy.add(num)
@@ -1586,10 +1742,14 @@ def build_report_pdf(job: Dict[str, Any], out_pdf: Path) -> None:
     pages_raw = str(res.get("faxpages_raw") or "")
 
     retry = job.get("retry") or {}
-    r_attempt = retry.get("attempt")
     r_max = retry.get("max")
     r_next = retry.get("next_try_at")
     r_last = retry.get("last_reason")
+
+    a = job.get("attempt") or {}
+    a_cur = a.get("current")
+    a_max = a.get("max")
+    a_last = a.get("last_reason")
 
     job_id = job.get("job_id") or ""
     rec = job.get("recipient") or {}
@@ -1623,27 +1783,19 @@ def build_report_pdf(job: Dict[str, Any], out_pdf: Path) -> None:
         c.drawString(50, y, f"Grund: {reason}")
         y -= 16
 
-    if r_attempt is not None or r_max is not None or r_next or r_last:
-        c.drawString(50, y, f"Retry: attempt={r_attempt} max={r_max} last_reason={r_last or ''}")
+    if a_cur is not None or a_max is not None or a_last:
+        c.drawString(50, y, f"Attempt: current={a_cur} max={a_max} last_reason={a_last or ''}")
+        y -= 16
+
+    if r_max is not None or r_next or r_last:
+        c.drawString(50, y, f"Retry: max={r_max} last_reason={r_last or ''}")
         y -= 16
         if r_next:
             c.drawString(50, y, f"Next try at (UTC): {r_next}")
             y -= 16
 
-    started = job.get("started_at") or job.get("submitted_at") or job.get("claimed_at")
-    ended = job.get("end_time") or job.get("finalized_at")
-    if started and ended:
-        try:
-            s = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
-            e = datetime.fromisoformat(str(ended).replace("Z", "+00:00"))
-            dur = int((e - s).total_seconds())
-            c.drawString(50, y, f"Dauer: {dur} s")
-            y -= 16
-        except Exception:
-            pass
-
     c.setFont("Helvetica", 9)
-    c.drawString(50, 40, f"Erzeugt: {now_iso()}  |  kienzlefax-worker v1.3.3")
+    c.drawString(50, 40, f"Erzeugt: {now_iso()}  |  kienzlefax-worker v1.3.5")
     c.showPage()
     c.save()
 
@@ -1701,7 +1853,7 @@ def ami_originate_local(jobid: str, exten: str, tiff_path: str) -> None:
         ami_send(sockf, "Async: true")
 
         ami_send(sockf, "Application: Wait")
-        ami_send(sockf, "Data: 1")
+        ami_send(sockf, "Data: 3600")
 
         ami_send(sockf, f"Variable: KFX_JOBID={jobid}")
         ami_send(sockf, f"Variable: KFX_FILE={tiff_path}")
@@ -1723,14 +1875,25 @@ def prepare_send_files(jobdir: Path, job: Dict[str, Any]) -> Tuple[Path, Path]:
     pdf_in = find_original_pdf_in_jobdir(jobdir)
     if not pdf_in:
         raise RuntimeError("missing doc.pdf/source.pdf")
-
     pdf_for_archive = add_header_pdf(pdf_in)
-
     tiff = jobdir / "doc.tif"
     if (not tiff.exists()) or (tiff.stat().st_size == 0):
         pdf_to_tiff_g4(pdf_for_archive, tiff)
-
     return pdf_for_archive, tiff
+
+def _attempt_limit_reached(job: Dict[str, Any]) -> bool:
+    a = job.get("attempt") or {}
+    r = job.get("retry") or {}
+    try:
+        cur = int(a.get("current") or 0)
+    except Exception:
+        cur = 0
+    mx = a.get("max", r.get("max"))
+    try:
+        mx_int = int(mx) if mx is not None else 0
+    except Exception:
+        mx_int = 0
+    return (mx_int > 0 and cur > mx_int)
 
 def submit_job(jobdir: Path) -> None:
     global _next_submit_ts
@@ -1749,6 +1912,14 @@ def submit_job(jobdir: Path) -> None:
         write_json(jp, job)
         return
 
+    if _attempt_limit_reached(job):
+        job["status"] = "FAILED"
+        job.setdefault("result", {})["reason"] = "max attempts reached"
+        job["finalized_at"] = job.get("finalized_at") or now_iso()
+        job["end_time"] = job.get("end_time") or job["finalized_at"]
+        write_json(jp, job)
+        return
+
     rec = job.get("recipient") or {}
     number = normalize_number(rec.get("number") or "")
     if not number:
@@ -1759,13 +1930,34 @@ def submit_job(jobdir: Path) -> None:
     job["claimed_at"] = job.get("claimed_at") or now_iso()
     job["submitted_at"] = now_iso()
     job["started_at"] = job.get("started_at") or job["submitted_at"]
-    job["status"] = "submitted"
+
+    a = job.setdefault("attempt", {})
+    try:
+        prev = int(a.get("current") or 0)
+    except Exception:
+        prev = 0
+    a["current"] = prev + 1
+    a["started_at"] = job["submitted_at"]
+
+    r = job.get("retry") or {}
+    if r.get("max") is not None:
+        try:
+            a["max"] = int(r.get("max"))
+        except Exception:
+            pass
+    if r.get("last_reason"):
+        a["last_reason"] = str(r.get("last_reason"))
+
+    job["status"] = "CALLING"
+    job["updated_at"] = job["submitted_at"]
 
     job.setdefault("asterisk", {})
     job["asterisk"]["dial_context"] = DIAL_CONTEXT
     job["asterisk"]["exten"] = number
     job["asterisk"]["tiff"] = str(tiff)
     job["asterisk"]["pdf_for_archive"] = str(pdf_for_archive)
+    job["asterisk"]["accountcode"] = str(job.get("job_id") or jobdir.name)
+    job["asterisk"]["cdr_userfield"] = f"kfx:{job.get('job_id') or jobdir.name}"
 
     write_json(jp, job)
 
@@ -1773,7 +1965,7 @@ def submit_job(jobdir: Path) -> None:
         ami_originate_local(jobid=str(job.get("job_id") or jobdir.name),
                             exten=number,
                             tiff_path=str(tiff))
-        log(f"submitted via AMI -> {jobdir.name} exten={number}")
+        log(f"submitted via AMI -> {jobdir.name} exten={number} attempt={a.get('current')}")
     except Exception as e:
         job = read_json(jp)
         job["status"] = "FAILED"
@@ -1834,7 +2026,7 @@ def finalize_failed(jobdir: Path, job: Dict[str, Any]) -> None:
     log(f"finalize FAILED -> {out_pdf.name}")
 
 def requeue_retry(jobdir: Path, job: Dict[str, Any]) -> None:
-    job["status"] = "retry_wait"
+    job["status"] = "RETRY_WAIT"
     job["updated_at"] = now_iso()
     write_json(jobdir / "job.json", job)
 
@@ -1842,8 +2034,11 @@ def requeue_retry(jobdir: Path, job: Dict[str, Any]) -> None:
     try:
         jobdir.rename(target)
         r = job.get("retry") or {}
-        log(f"retry scheduled attempt={r.get('attempt','?')}/{r.get('max','?')} "
-            f"reason={r.get('last_reason','')} next_try_at={r.get('next_try_at','')} -> {target.name}")
+        a = job.get("attempt") or {}
+        log(
+            f"retry scheduled attempt={a.get('current','?')}/{a.get('max', r.get('max','?'))} "
+            f"reason={r.get('last_reason','')} next_try_at={r.get('next_try_at','')} -> {target.name}"
+        )
     except Exception as e:
         log(f"retry move back to queue failed for {jobdir.name}: {e}")
 
@@ -1858,7 +2053,7 @@ def step_finalize_processing() -> None:
         except Exception:
             continue
 
-        st = str(job.get("status") or "").upper()
+        st = _st_norm(job)
 
         if st == "OK":
             try:
@@ -1888,15 +2083,12 @@ def step_finalize_processing() -> None:
 
         if st in ("RETRY", "RETRY_WAIT"):
             try:
-                r = job.get("retry") or {}
-                attempt = int(r.get("attempt") or 0)
-                mx = int(r.get("max") or 0)
-
-                if mx > 0 and attempt >= mx:
+                if _attempt_limit_reached(job):
                     job["status"] = "FAILED"
                     job.setdefault("result", {})
                     base_reason = str((job.get("result") or {}).get("reason") or "RETRY")
-                    job["result"]["reason"] = f"{base_reason} (max retries reached: {attempt}/{mx})"
+                    mx = (job.get("attempt") or {}).get("max", (job.get("retry") or {}).get("max"))
+                    job["result"]["reason"] = f"{base_reason} (max attempts reached: {mx})"
                     job["finalized_at"] = job.get("finalized_at") or now_iso()
                     job["end_time"] = job.get("end_time") or job["finalized_at"]
                     write_json(jp, job)
@@ -1914,7 +2106,6 @@ def step_finalize_processing() -> None:
 
 def step_submit() -> None:
     global _next_submit_ts
-
     if time.time() < _next_submit_ts:
         return
 
@@ -1932,8 +2123,11 @@ def step_submit() -> None:
         try:
             job = read_json(jp)
             job["claimed_at"] = job.get("claimed_at") or now_iso()
-            job["status"] = job.get("status") or "claimed"
+            if not job.get("status"):
+                job["status"] = "PROCESSING"
+            job["updated_at"] = now_iso()
             write_json(jp, job)
+
             num = normalize_number(((job.get("recipient") or {}).get("number") or ""))
             if num:
                 busy.add(num)
@@ -1959,7 +2153,7 @@ def step_submit() -> None:
 def main() -> None:
     ensure_dirs()
     acquire_lock()
-    log("started (v1.3.3)")
+    log("started (v1.3.5)")
     try:
         while True:
             step_finalize_processing()
@@ -1974,25 +2168,26 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log("stopped by user")
         sys.exit(0)
-EOF
+PY
 
-chown root:root /usr/local/bin/kienzlefax-worker.py
-chmod 0755 /usr/local/bin/kienzlefax-worker.py
+chown root:root "$W"
+chmod 0755 "$W"
+python3 -m py_compile "$W"
 
-cat >/etc/default/kienzlefax-worker <<'EOF'
+cat >/etc/default/kienzlefax-worker <<EOF
 # kienzlefax-worker env
 KFX_BASE=/srv/kienzlefax
 
 KFX_AMI_HOST=127.0.0.1
 KFX_AMI_PORT=5038
 KFX_AMI_USER=kfx
-KFX_AMI_PASS=mysecret
+KFX_AMI_PASS=${AMI_SECRET}
 
 KFX_DIAL_CONTEXT=fax-out
 
 # optional tuning
 KFX_MAX_INFLIGHT=1
-KFX_POST_CALL_COOLDOWN_SEC=5
+KFX_POST_CALL_COOLDOWN_SEC=20
 EOF
 chmod 0644 /etc/default/kienzlefax-worker
 
@@ -2014,11 +2209,132 @@ WorkingDirectory=/root
 WantedBy=multi-user.target
 EOF
 
+# ---- 8.9) Reload/Restart Asterisk + sanity checks ----
 systemctl daemon-reload
+
+# asterisk (falls unit existiert)
+svc_enable_now asterisk.service
+
+# reload dialplan + manager
+asterisk -rx "dialplan reload" || true
+asterisk -rx "manager reload" || true
+asterisk -rx "manager show user kfx" || true
+
+# worker starten
 systemctl enable --now kienzlefax-worker.service
+systemctl status kienzlefax-worker.service --no-pager -l || true
 
 # ------------------------------------------------------------------------------
-# 12) Finale Checks (nicht blockierend)
+# 9) GANZ AM ENDE: /usr/local/bin/pdf_with_header.sh
+# ------------------------------------------------------------------------------
+sep "GANZ AM ENDE: /usr/local/bin/pdf_with_header.sh erstellen"
+
+tee /usr/local/bin/pdf_with_header.sh >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage:
+#   pdf_with_header.sh INPUT.pdf OUTPUT.pdf
+#
+# Header on EACH page:
+#   Left:  "<DATE>"
+#   Center:"<PRACTICE_NAME>"
+#   Right: "Seite X/Y"
+#
+# Customize via env:
+#   PRACTICE_NAME="Praxis Dr. Thomas Mustermann"
+#   DATE_FMT="%d.%m.%Y %H:%M"
+#   TOP_OFFSET_MM="6"     # distance from top edge to text baseline (smaller => higher)
+#   FONT_NAME="Helvetica"
+#   FONT_SIZE="9"
+#   LEFT_MARGIN_MM="12"
+#   RIGHT_MARGIN_MM="12"
+
+IN="${1:-}"
+OUT="${2:-}"
+[[ -n "$IN" && -n "$OUT" ]] || { echo "Usage: pdf_with_header.sh INPUT.pdf OUTPUT.pdf" >&2; exit 2; }
+[[ -f "$IN" ]] || { echo "Input not found: $IN" >&2; exit 2; }
+
+PRACTICE_NAME="${PRACTICE_NAME:-Praxis}"
+DATE_FMT="${DATE_FMT:-%d.%m.%Y %H:%M}"
+TOP_OFFSET_MM="${TOP_OFFSET_MM:-6}"
+FONT_NAME="${FONT_NAME:-Helvetica}"
+FONT_SIZE="${FONT_SIZE:-9}"
+LEFT_MARGIN_MM="${LEFT_MARGIN_MM:-12}"
+RIGHT_MARGIN_MM="${RIGHT_MARGIN_MM:-12}"
+
+export PRACTICE_NAME DATE_FMT TOP_OFFSET_MM FONT_NAME FONT_SIZE LEFT_MARGIN_MM RIGHT_MARGIN_MM
+export INFILE="$IN" OUTFILE="$OUT"
+
+python3 - <<'PY'
+import os, io, datetime
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import mm
+
+try:
+    from pypdf import PdfReader, PdfWriter
+except Exception:
+    from PyPDF2 import PdfReader, PdfWriter  # type: ignore
+
+IN = os.environ.get("INFILE")
+OUT = os.environ.get("OUTFILE")
+if not IN or not OUT:
+    raise SystemExit("INFILE/OUTFILE not set")
+
+PRACTICE_NAME = os.environ.get("PRACTICE_NAME", "Praxis")
+DATE_FMT = os.environ.get("DATE_FMT", "%d.%m.%Y %H:%M")
+TOP_OFFSET_MM = float(os.environ.get("TOP_OFFSET_MM", "6"))
+FONT_NAME = os.environ.get("FONT_NAME", "Helvetica")
+FONT_SIZE = float(os.environ.get("FONT_SIZE", "9"))
+LEFT_MARGIN_MM = float(os.environ.get("LEFT_MARGIN_MM", "12"))
+RIGHT_MARGIN_MM = float(os.environ.get("RIGHT_MARGIN_MM", "12"))
+
+reader = PdfReader(IN)
+writer = PdfWriter()
+
+total = len(reader.pages)
+date_str = datetime.datetime.now().strftime(DATE_FMT)
+
+for i, page in enumerate(reader.pages, start=1):
+    media = page.mediabox
+    w = float(media.width)
+    h = float(media.height)
+
+    packet = io.BytesIO()
+    c = canvas.Canvas(packet, pagesize=(w, h))
+    c.setFont(FONT_NAME, FONT_SIZE)
+
+    y = h - (TOP_OFFSET_MM * mm)
+    left_x = LEFT_MARGIN_MM * mm
+    right_x = w - (RIGHT_MARGIN_MM * mm)
+
+    c.drawString(left_x, y, date_str)
+    c.drawCentredString(w / 2.0, y, PRACTICE_NAME)
+    c.drawRightString(right_x, y, f"Seite {i}/{total}")
+
+    c.showPage()
+    c.save()
+
+    packet.seek(0)
+    overlay_reader = PdfReader(packet)
+    overlay_page = overlay_reader.pages[0]
+
+    try:
+        page.merge_page(overlay_page)
+    except Exception:
+        page.mergePage(overlay_page)  # legacy
+
+    writer.add_page(page)
+
+with open(OUT, "wb") as f:
+    writer.write(f)
+PY
+EOF
+
+chmod +x /usr/local/bin/pdf_with_header.sh
+
+# ------------------------------------------------------------------------------
+# 10) Finale Checks (nicht blockierend)
 # ------------------------------------------------------------------------------
 sep "Finale Checks"
 
@@ -2030,6 +2346,7 @@ systemctl status kienzlefax-worker --no-pager || true
 
 echo
 echo "======================================================================"
-echo "INSTALLER DONE."
+echo "INSTALLER DONE (kienzlefax-installer.sh v2.1)."
 echo "Web:  http://<host>/kienzlefax.php"
+echo "AMI:  127.0.0.1:5038 user=kfx (lokal only)"
 echo "======================================================================"
