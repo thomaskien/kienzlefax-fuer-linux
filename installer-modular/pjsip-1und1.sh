@@ -1,50 +1,16 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-# -----------------------------------------------------------------------------
-# PJSIP Provider (1und1) interaktiv abfragen + pjsip.conf schreiben
-# -----------------------------------------------------------------------------
-sep "PJSIP (1und1): Provider-Daten interaktiv abfragen"
+# entweder ENVFILE sourcen…
+ENVFILE="/etc/kienzlefax-installer.env"
+[ -f "$ENVFILE" ] && source "$ENVFILE"
 
-# Minimal erforderliche Werte
-prompt_default PJSIP_USER   "1und1 SIP Username (z.B. 49... oder sip-id)" ""
-read -r -s -p "1und1 SIP Passwort (wird NICHT angezeigt): " PJSIP_PASS; echo
-prompt_default PJSIP_SERVER "1und1 Registrar/Server (z.B. sip.1und1.de)" "sip.1und1.de"
+# …oder voraussetzen, dass Variablen bereits exported sind.
 
-# Optional, aber oft nötig/sauber
-prompt_default PJSIP_FROMDOMAIN "From-Domain (leer=wie Server)" ""
-prompt_default PJSIP_OUTBOUND_PROXY "Outbound Proxy (leer=keiner, sonst host:port oder host)" ""
-prompt_default PJSIP_CLIENT_URI "Client-URI (leer=aus User+Server)" ""
+PJSIP="/etc/asterisk/pjsip.conf"
+cp -a "$PJSIP" "${PJSIP}.old.kienzlefax.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
 
-# Ableitungen
-PJSIP_FROMDOMAIN="${PJSIP_FROMDOMAIN:-$PJSIP_SERVER}"
-PJSIP_CLIENT_URI="${PJSIP_CLIENT_URI:-sip:${PJSIP_USER}@${PJSIP_SERVER}}"
-
-if [ -z "$PJSIP_USER" ] || [ -z "$PJSIP_PASS" ]; then
-  die "PJSIP_USER/PJSIP_PASS dürfen nicht leer sein."
-fi
-
-backup_file "$PJSIP_CONF"
-touch "$PJSIP_CONF"
-
-# Transport sicherstellen (bind an 0.0.0.0, wie du willst)
-if ! grep -qE '^\s*\[transport-udp\]\s*$' "$PJSIP_CONF"; then
-  cat >>"$PJSIP_CONF" <<EOF
-
-[transport-udp]
-type=transport
-protocol=udp
-bind=0.0.0.0:${SIP_PORT}
-EOF
-else
-  ini_set_kv "$PJSIP_CONF" "transport-udp" "type" "transport"
-  ini_set_kv "$PJSIP_CONF" "transport-udp" "protocol" "udp"
-  ini_set_kv "$PJSIP_CONF" "transport-udp" "bind" "0.0.0.0:${SIP_PORT}"
-fi
-
-# Provider-Block: ich schreibe ihn als zusammenhängenden Block ans Ende,
-# damit wir bestehende 1und1-Konfig nicht "kaputtsedden".
-# Wenn du willst, kann ich später auch "replace if exists" machen – aber robust ist append+klarer Marker.
-cat >>"$PJSIP_CONF" <<EOF
+cat >"$PJSIP" <<EOF
 
 ; ===== KienzleFax / 1und1 Provider (auto-generated) =====
 ; Hinweis: Für andere Provider hier anpassen.
