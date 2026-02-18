@@ -5,6 +5,23 @@ set -euo pipefail
 ENVFILE="/etc/kienzlefax-installer.env"
 [ -f "$ENVFILE" ] && source "$ENVFILE"
 
+
+# Compatibility layer (alte Variablennamen, die pjsip-1und1.sh evtl. erwartet)
+export PJSIP_USER="${KFX_SIP_NUMBER}"
+export PJSIP_PASS="${KFX_SIP_PASSWORD}"
+export PJSIP_NUMBER="${KFX_SIP_NUMBER}"
+export PJSIP_PASSWORD="${KFX_SIP_PASSWORD}"
+export SIP_USER="${KFX_SIP_NUMBER}"
+export SIP_PASSWORD="${KFX_SIP_PASSWORD}"
+export PUBLIC_FQDN="${KFX_PUBLIC_FQDN}"
+export FAX_DID="${KFX_FAX_DID}"
+export SIP_BIND_PORT="${KFX_SIP_BIND_PORT}"
+export SIP_PORT="${KFX_SIP_BIND_PORT}"
+export PJSIP_BIND_PORT="${KFX_SIP_BIND_PORT}"
+export PJSIP_PORT="${KFX_SIP_BIND_PORT}"y
+
+
+
 # …oder voraussetzen, dass Variablen bereits exported sind.
 
 PJSIP="/etc/asterisk/pjsip.conf"
