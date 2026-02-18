@@ -24,7 +24,7 @@ password=${PJSIP_PASS}
 
 [1und1-aor]
 type=aor
-contact=sip:${PJSIP_SERVER}
+contact=sip:sip.1und1.de
 
 [1und1-endpoint]
 type=endpoint
@@ -34,7 +34,7 @@ disallow=all
 allow=alaw,ulaw
 aors=1und1-aor
 auth=1und1-auth
-from_domain=${PJSIP_FROMDOMAIN}
+from_domain=$sip.1und1.de
 direct_media=no
 force_rport=yes
 rewrite_contact=yes
@@ -55,12 +55,12 @@ cat >>"$PJSIP_CONF" <<EOF
 [1und1-identify]
 type=identify
 endpoint=1und1-endpoint
-match=${PJSIP_SERVER}
+match=sip.1und1.de
 
 [1und1-reg]
 type=registration
 outbound_auth=1und1-auth
-server_uri=sip:${PJSIP_SERVER}
+server_uri=sip:sip.1und1.de
 client_uri=${PJSIP_CLIENT_URI}
 retry_interval=60
 forbidden_retry_interval=300
