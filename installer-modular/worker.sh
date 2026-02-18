@@ -900,6 +900,5 @@ if __name__ == "__main__":
         sys.exit(0)
 PY
 
-sudo chmod +x /usr/local/bin/kienzlefax-worker.py
-sudo systemctl restart kienzlefax-worker
-sudo systemctl status kienzlefax-worker --no-pager -l
+chmod +x /usr/local/bin/kienzlefax-worker.py
+
