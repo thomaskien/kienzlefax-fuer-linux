@@ -1,6 +1,12 @@
-p "Dialplan: extensions.conf (Vorlage wie geliefert)"
-backup_file "$EXT_CONF"
-cat >"$EXT_CONF" <<'CONFEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+ENVFILE="/etc/kienzlefax-installer.env"
+[ -f "$ENVFILE" ] && source "$ENVFILE"
+
+EXT="/etc/asterisk/extensions.conf"
+cp -a "$EXT" "${EXT}.old.kienzlefax.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+
+cat >"$EXT" <<EOF
 [general]
 static=yes
 writeprotect=no
@@ -157,6 +163,6 @@ exten => 4923319265248,1,NoOp(Inbound Fax)
 
  same => n(no_file),NoOp(No TIFF created. Nothing to convert.)
  same => n,Hangup()
-CONFEOF
+EOF
 
 asterisk -rx "dialplan reload" || true
