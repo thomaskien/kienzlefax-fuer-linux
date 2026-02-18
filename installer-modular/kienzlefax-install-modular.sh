@@ -2,7 +2,7 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.2.0
+# Version: 3.2.1
 # Stand:   2026-02-18
 # Autor:   Dr. Thomas Kienzle
 #
@@ -13,11 +13,17 @@
 #   * admin existiert? neu generieren? (Default: N)
 #   * Asterisk erkannt? nochmal kompilieren? (Default: N)
 #   * Remote-Module JEWEILS EINZELN: holen/aktualisieren? (Default: y wenn fehlt, sonst n)
+#   * Webroot: kienzlefax.php neu laden? (Default: n wenn vorhanden, y wenn fehlt)
 # - Asterisk immer aus Source (menuselect interaktiv) wenn gewählt/benötigt
 # - Fix: INI-Patching via Python (kein awk/mawk Problem)
 # - Webroot: kienzlefax.php + index redirect + self-signed SSL 50y
 # - Remote Module:
 #     extensions.sh, pjsip-1und1.sh, worker.sh, agi.sh, pdf_with_header.sh
+#
+# NEU in 3.2.1 (konservativ):
+# - /etc/default/kienzlefax-worker wird angelegt (KFX_AMI_PASS NICHT interaktiv; kommt aus ENV/Default).
+# - systemd Unit exakt wie gewünscht: /etc/systemd/system/kienzlefax-worker.service (EnvironmentFile=...).
+# - kienzlefax.php wird optional neu geladen (Abfrage).
 # ==============================================================================
 
 set -euo pipefail
@@ -48,6 +54,9 @@ DEFAULT_SIP_BIND_PORT="5070"
 DEFAULT_RTP_START="12000"
 DEFAULT_RTP_END="12049"
 ASTERISK_GIT_REF_DEFAULT="20"
+
+# AMI local defaults (NICHT interaktiv; konfigurierbar über ENVFILE/Installer)
+DEFAULT_AMI_SECRET="mysecret"
 
 # Asterisk build
 ASTERISK_SRC_DIR="/usr/src/asterisk"
@@ -198,21 +207,6 @@ ask_default(){
 
 sanitize_digits(){ echo "$1" | tr -cd '0-9'; }
 
-read_secret_twice(){
-  local prompt="$1"
-  local __var="$2"
-  local a b
-  while true; do
-    read -r -s -p "${prompt} (Eingabe 1/2): " a; echo
-    read -r -s -p "${prompt} (Eingabe 2/2): " b; echo
-    [[ -n "${a}" ]] || { echo "Darf nicht leer sein."; continue; }
-    [[ "${a}" == "${b}" ]] || { echo "Stimmt nicht überein. Bitte erneut."; continue; }
-    printf -v "${__var}" "%s" "${a}"
-    unset a b
-    break
-  done
-}
-
 backup_file_ts(){
   local f="$1"
   local stamp=".old.kienzlefax.$(date +%Y%m%d-%H%M%S)"
@@ -228,6 +222,7 @@ DEFAULT_SIP_BIND_PORT="${DEFAULT_SIP_BIND_PORT:-5070}"
 DEFAULT_RTP_START="${DEFAULT_RTP_START:-12000}"
 DEFAULT_RTP_END="${DEFAULT_RTP_END:-12049}"
 ASTERISK_GIT_REF_DEFAULT="${ASTERISK_GIT_REF_DEFAULT:-20}"
+DEFAULT_AMI_SECRET="${DEFAULT_AMI_SECRET:-mysecret}"
 
 sep "Optionen / Hostname / Provider-Daten"
 
@@ -261,16 +256,20 @@ SIP_NUMBER="$(sanitize_digits "${SIP_NUMBER_RAW}")"
 [[ -n "${SIP_NUMBER}" ]] || die "SIP Nummer ist leer/ungültig."
 unset SIP_NUMBER_RAW
 
-read_secret_twice "SIP Passwort" SIP_PASSWORD
+# SIP Passwort bleibt interaktiv (Provider)
+echo
+echo "==== SIP Passwort eingeben (sichtbar aus = nein) ===="
+read -r -s -p "SIP Passwort: " SIP_PASSWORD
+echo
+[[ -n "${SIP_PASSWORD}" ]] || die "SIP Passwort darf nicht leer sein."
 
 read -r -p "FAX DID (Enter = ${SIP_NUMBER}): " FAX_DID_IN
 FAX_DID="$(sanitize_digits "${FAX_DID_IN:-$SIP_NUMBER}")"
 [[ -n "${FAX_DID}" ]] || die "FAX_DID darf nicht leer sein."
 unset FAX_DID_IN
 
-echo
-echo "AMI (Asterisk Manager) läuft NUR lokal auf 127.0.0.1:5038. Bitte Secret setzen:"
-read_secret_twice "AMI Secret (User kfx)" AMI_SECRET
+# AMI Secret NICHT interaktiv (lokal). Konfigurierbar via DEFAULT_AMI_SECRET oder später in ENVFILE.
+AMI_SECRET="${DEFAULT_AMI_SECRET}"
 
 ask_default SIP_BIND_PORT "SIP Bind Port (PJSIP extern; Provider-Config)" "${DEFAULT_SIP_BIND_PORT}"
 [[ "$SIP_BIND_PORT" =~ ^[0-9]+$ ]] || die "SIP_BIND_PORT ungültig"
@@ -433,13 +432,29 @@ log "[OK] admin: sudo+Samba gesetzt."
 EOF
   chmod +x "${MOD_DIR}/30-admin-user.sh"
 
-  # 40-web-ssl
+  # 40-web-ssl (kienzlefax.php optional reload)
   cat >"${MOD_DIR}/40-web-ssl.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "[$(date -Is)] $*"; }
 sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
+
+ask_yes_no(){
+  local __var="$1"; shift
+  local __prompt="$1"; shift
+  local __def="$1"; shift
+  local __val=""
+  while true; do
+    read -r -p "${__prompt} [${__def}]: " __val
+    __val="${__val:-$__def}"
+    case "$__val" in
+      y|Y|yes|YES) printf -v "$__var" "y"; return 0;;
+      n|N|no|NO)   printf -v "$__var" "n"; return 0;;
+      *) echo "Bitte y/n eingeben.";;
+    esac
+  done
+}
 
 ENVFILE="/etc/kienzlefax-installer.env"
 [[ -f "$ENVFILE" ]] || die "ENV fehlt: $ENVFILE"
@@ -452,7 +467,20 @@ FAXTON_URL="https://github.com/thomaskien/kienzlefax-fuer-linux/raw/refs/heads/m
 
 sep "Webroot bootstrappen (kienzlefax.php + faxton.mp3) + index redirect"
 mkdir -p "${WEBROOT}"
-curl -fsSL -o "${WEBROOT}/kienzlefax.php" "${WEB_URL_RAW}"
+
+KFXPHP="${WEBROOT}/kienzlefax.php"
+DEF="n"
+[[ -s "$KFXPHP" ]] || DEF="y"
+ask_yes_no DO_PHP "kienzlefax.php neu herunterladen/aktualisieren?" "$DEF"
+if [[ "$DO_PHP" == "y" ]]; then
+  curl -fsSL -o "${KFXPHP}" "${WEB_URL_RAW}"
+  log "[OK] kienzlefax.php geladen."
+else
+  [[ -s "$KFXPHP" ]] || die "kienzlefax.php fehlt, kann nicht übersprungen werden."
+  log "[OK] kienzlefax.php unverändert."
+fi
+
+# faxton.mp3 konservativ: immer sicherstellen
 curl -fsSL -o "${WEBROOT}/faxton.mp3" "${FAXTON_URL}"
 
 cat > "${WEBROOT}/index.html" <<'HTML'
@@ -555,7 +583,7 @@ log "[OK] Web+SSL: https://${KFX_HOSTNAME}/"
 EOF
   chmod +x "${MOD_DIR}/40-web-ssl.sh"
 
-  # 50-cups-samba (gleich wie vorher; bewusst "alles gehört dazu")
+  # 50-cups-samba (unverändert)
   cat >"${MOD_DIR}/50-cups-samba.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -756,7 +784,7 @@ log "[OK] CUPS+Samba bereit."
 EOF
   chmod +x "${MOD_DIR}/50-cups-samba.sh"
 
-  # 60-asterisk-build
+  # 60-asterisk-build (unverändert)
   cat >"${MOD_DIR}/60-asterisk-build.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -809,7 +837,7 @@ log "[OK] Asterisk installiert/gestartet."
 EOF
   chmod +x "${MOD_DIR}/60-asterisk-build.sh"
 
-  # 70-rtp-ami (Python patcher)
+  # 70-rtp-ami (unverändert)
   cat >"${MOD_DIR}/70-rtp-ami.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -904,6 +932,68 @@ asterisk -rx "manager show user kfx" || true
 log "[OK] RTP+AMI konfiguriert."
 EOF
   chmod +x "${MOD_DIR}/70-rtp-ami.sh"
+
+  # 90-worker-unit (NEU)
+  cat >"${MOD_DIR}/90-worker-unit.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+die(){ echo "ERROR: $*" >&2; exit 1; }
+log(){ echo "[$(date -Is)] $*"; }
+sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
+
+ENVFILE="/etc/kienzlefax-installer.env"
+[[ -f "$ENVFILE" ]] || die "ENV fehlt: $ENVFILE"
+# shellcheck disable=SC1090
+source "$ENVFILE"
+
+sep "Worker: /etc/default + systemd Unit (EnvironmentFile)"
+install -d /etc/default
+
+cat >/etc/default/kienzlefax-worker <<EOFENV
+# kienzlefax-worker env
+KFX_BASE=/srv/kienzlefax
+
+KFX_AMI_HOST=127.0.0.1
+KFX_AMI_PORT=5038
+KFX_AMI_USER=kfx
+KFX_AMI_PASS=${KFX_AMI_SECRET}
+
+KFX_DIAL_CONTEXT=fax-out
+
+# optional tuning
+KFX_MAX_INFLIGHT=2
+KFX_POST_CALL_COOLDOWN_SEC=20
+EOFENV
+chmod 0600 /etc/default/kienzlefax-worker
+chown root:root /etc/default/kienzlefax-worker
+
+cat >/etc/systemd/system/kienzlefax-worker.service <<'EOFSVC'
+[Unit]
+Description=kienzlefax worker (Asterisk SendFAX via AMI)
+After=network.target asterisk.service
+Requires=asterisk.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/kienzlefax-worker
+ExecStart=/usr/bin/python3 -u /usr/local/bin/kienzlefax-worker.py
+Restart=always
+RestartSec=2
+WorkingDirectory=/root
+
+[Install]
+WantedBy=multi-user.target
+EOFSVC
+
+chmod 0644 /etc/systemd/system/kienzlefax-worker.service
+chown root:root /etc/systemd/system/kienzlefax-worker.service
+
+systemctl daemon-reload
+systemctl enable --now kienzlefax-worker
+
+log "[OK] Worker Unit aktiv."
+EOF
+  chmod +x "${MOD_DIR}/90-worker-unit.sh"
 }
 
 # ------------------------------------------------------------------------------
@@ -966,7 +1056,7 @@ export SIP_PORT="${SIP_PORT:-$KFX_SIP_BIND_PORT}"
 export FAX_DID="${FAX_DID:-$KFX_FAX_DID}"
 export PUBLIC_FQDN="${PUBLIC_FQDN:-$KFX_PUBLIC_FQDN}"
 
-# AMI env for worker scripts
+# AMI env for worker scripts (remote scripts might still look for these)
 export KFX_AMI_HOST="127.0.0.1"
 export KFX_AMI_PORT="5038"
 export KFX_AMI_USER="kfx"
@@ -991,10 +1081,11 @@ asterisk -rx "dialplan reload" || true
 sep "Remote AGI installieren"
 run_remote_script "${MOD_CACHE}/agi.sh"
 
-sep "Remote Worker installieren"
+sep "Remote Worker installieren (nur Datei/Code)"
 run_remote_script "${MOD_CACHE}/worker.sh"
-systemctl daemon-reload || true
-systemctl enable --now kienzlefax-worker || true
+
+sep "Worker: /etc/default + systemd Unit (EnvironmentFile)"
+run_module "${MOD_DIR}/90-worker-unit.sh"
 
 sep "Remote pdf_with_header.sh installieren"
 run_remote_script "${MOD_CACHE}/pdf_with_header.sh"
@@ -1016,5 +1107,5 @@ echo "Web: http://$(hostname)/ -> /kienzlefax.php"
 echo "Web SSL (self-signed 50y): https://$(hostname)/"
 echo "SIP Bind Port (Provider): ${KFX_SIP_BIND_PORT}"
 echo "RTP: ${KFX_RTP_START}-${KFX_RTP_END}"
-echo "AMI: 127.0.0.1:5038 user=kfx (secret gesetzt)"
+echo "AMI: 127.0.0.1:5038 user=kfx (secret in /etc/default/kienzlefax-worker)"
 echo "Remote module cache: ${MOD_CACHE}"
