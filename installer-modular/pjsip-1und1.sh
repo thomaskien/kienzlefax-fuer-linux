@@ -147,7 +147,7 @@ chown root:asterisk "$PJSIP" 2>/dev/null || true
 echo "[INFO] Wrote: $PJSIP"
 echo "[INFO] PJSIP_USER=${PJSIP_USER}"
 echo "[INFO] SIP_BIND_PORT=${SIP_BIND_PORT}"
-echo "[INFO] PJSIP_MATCH_CIDR=${PJSIP_MATCH_CIDR}"
+
 [ -n "${PJSIP_OUTBOUND_PROXY}" ] && echo "[INFO] OUTBOUND_PROXY=${PJSIP_OUTBOUND_PROXY}" || true
 [ -n "${PUBLIC_FQDN}" ] && echo "[INFO] PUBLIC_FQDN=${PUBLIC_FQDN}" || true
 
