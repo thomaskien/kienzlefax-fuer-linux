@@ -2,43 +2,33 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Modularer Installer (alles wird installiert; keine optionalen Module)
-#
-# Version: 3.0.0
+# Version: 3.2.0
 # Stand:   2026-02-18
 # Autor:   Dr. Thomas Kienzle
 #
-# Enthält:
-# - Parameterabfrage wie im "alten" Installer (plus SIP_BIND_PORT default 5070 + Hostname)
-# - apt-get update + apt-get -y upgrade
-# - Pakete (übernommen/angelehnt an alten Installer; ergänzt um benötigte Tools)
-# - Web: kienzlefax.php + faxton.mp3 + index.html refresh
-# - Apache SSL: self-signed 50 Jahre, Hostname als CN+SAN, Hostname setzen
-# - Admin-User (passwd) + Samba (smbpasswd)
-# - CUPS Backend + fax1..fax5 + Bonjour/DNS-SD + Samba Shares (inkl. fax-eingang)
-# - Asterisk Build aus Git (interaktiv: make menuselect) + systemd enable
-# - Asterisk Config via Remote-Module:
-#     * pjsip-1und1.sh  (PJSIP komplett/Provider, inkl. bind-port)
-#     * extensions.sh   (Dialplan)
-#     * worker.sh       (Worker + AGI + service)
-# - pdf_with_header.sh via Remote-Module
-#
+# Modularer Installer (alles gehört dazu; Provider-spezifisch später).
+# - Fragt interaktiv:
+#   * Optionen neu setzen? (ENV wiederverwenden möglich)
+#   * Hostname setzen (Maschine + Zertifikat CN+SAN)
+#   * admin existiert? neu generieren? (Default: N)
+#   * Asterisk erkannt? nochmal kompilieren? (Default: N)
+#   * Remote-Module JEWEILS EINZELN: holen/aktualisieren? (Default: y wenn fehlt, sonst n)
+# - Asterisk immer aus Source (menuselect interaktiv) wenn gewählt/benötigt
+# - Fix: INI-Patching via Python (kein awk/mawk Problem)
+# - Webroot: kienzlefax.php + index redirect + self-signed SSL 50y
+# - Remote Module:
+#     extensions.sh, pjsip-1und1.sh, worker.sh, agi.sh, pdf_with_header.sh
 # ==============================================================================
+
 set -euo pipefail
 
 # ------------------------------------------------------------------------------
-# Konstanten / URLs (Remote Module)
+# Remote Module URLs
 # ------------------------------------------------------------------------------
-MOD_BASE="/usr/local/lib/kienzlefax-installer"
-MOD_LIB="${MOD_BASE}/lib"
-MOD_DIR="${MOD_BASE}/modules"
-MOD_CACHE="${MOD_BASE}/cache"
-STATE_DIR="/var/lib/kienzlefax-installer"
-
-# Remote module URLs (wie im neuen Script gesetzt)
 URL_EXTENSIONS="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/extensions.sh"
-URL_WORKER="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/worker.sh"
 URL_PJSIP_1UND1="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/pjsip-1und1.sh"
+URL_WORKER="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/worker.sh"
+URL_AGI="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/agi.sh"
 URL_PDF_WITH_HEADER="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/pdf_with_header.sh"
 
 # Web bootstrap
@@ -46,25 +36,27 @@ WEBROOT="/var/www/html"
 WEB_URL_RAW="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/main/kienzlefax.php"
 FAXTON_URL="https://github.com/thomaskien/kienzlefax-fuer-linux/raw/refs/heads/main/faxton.mp3"
 
-# Project paths
-KZ_BASE="/srv/kienzlefax"
-SPOOL_TIFF_DIR="/var/spool/asterisk/fax1"
-SPOOL_PDF_DIR="/var/spool/asterisk/fax"
-
-# Asterisk build (Git)
-ASTERISK_SRC_DIR="/usr/src/asterisk"
-ASTERISK_GIT_URL="https://github.com/asterisk/asterisk.git"
-ASTERISK_GIT_REF_DEFAULT="20"   # LTS branch default
-
-# AMI fixed
-KFX_AMI_USER="kfx"
-KFX_AMI_BINDADDR="127.0.0.1"
-KFX_AMI_PORT="5038"
+# Installer dirs
+MOD_BASE="/usr/local/lib/kienzlefax-installer"
+MOD_DIR="${MOD_BASE}/modules"
+MOD_CACHE="${MOD_BASE}/cache"
+STATE_DIR="/var/lib/kienzlefax-installer"
+ENVFILE="/etc/kienzlefax-installer.env"
 
 # Defaults
 DEFAULT_SIP_BIND_PORT="5070"
 DEFAULT_RTP_START="12000"
 DEFAULT_RTP_END="12049"
+ASTERISK_GIT_REF_DEFAULT="20"
+
+# Asterisk build
+ASTERISK_SRC_DIR="/usr/src/asterisk"
+ASTERISK_GIT_URL="https://github.com/asterisk/asterisk.git"
+
+# AMI fixed
+KFX_AMI_USER="kfx"
+KFX_AMI_BINDADDR="127.0.0.1"
+KFX_AMI_PORT="5038"
 
 # ------------------------------------------------------------------------------
 # Helpers
@@ -74,44 +66,6 @@ log(){ echo "[$(date -Is)] $*"; }
 sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
 
 require_root(){ [[ ${EUID:-0} -eq 0 ]] || die "Bitte als root ausführen."; }
-
-read_secret_twice(){
-  # usage: read_secret_twice "Prompt" VAR_NAME
-  local prompt="$1"
-  local __var="$2"
-  local a b
-  while true; do
-    read -r -s -p "${prompt} (Eingabe 1/2): " a; echo
-    read -r -s -p "${prompt} (Eingabe 2/2): " b; echo
-    [[ -n "${a}" ]] || { echo "Darf nicht leer sein."; continue; }
-    [[ "${a}" == "${b}" ]] || { echo "Stimmt nicht überein. Bitte erneut."; continue; }
-    printf -v "${__var}" "%s" "${a}"
-    unset a b
-    break
-  done
-}
-
-sanitize_digits(){ echo "$1" | tr -cd '0-9'; }
-
-backup_file_ts(){
-  local f="$1"
-  local stamp=".old.kienzlefax.$(date +%Y%m%d-%H%M%S)"
-  if [[ -e "$f" ]]; then
-    cp -a "$f" "${f}${stamp}"
-    log "backup: $f -> ${f}${stamp}"
-  fi
-}
-
-ask_default(){
-  # usage: ask_default VAR "Prompt" "default"
-  local __var="$1"; shift
-  local __prompt="$1"; shift
-  local __def="$1"; shift
-  local __val=""
-  read -r -p "${__prompt} [${__def}]: " __val
-  __val="${__val:-$__def}"
-  printf -v "$__var" "%s" "$__val"
-}
 
 ask_yes_no(){
   # usage: ask_yes_no VAR "Prompt" "y|n(default)"
@@ -130,31 +84,35 @@ ask_yes_no(){
   done
 }
 
-svc_exists(){
-  systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' | grep -qx "$1"
-}
-
-svc_enable_now(){
-  local u="$1"
-  if svc_exists "$u"; then
-    systemctl enable --now "$u"
-    log "[OK] enabled+started: $u"
-  else
-    log "[INFO] unit not found (skip): $u"
-  fi
-}
-
-download_to(){
-  # usage: download_to URL OUTFILE
+download_atomic(){
   local url="$1"
   local out="$2"
   mkdir -p "$(dirname "$out")"
-  curl -fsSL "$url" -o "$out"
-  [[ -s "$out" ]] || die "Download leer/fehlgeschlagen: $url"
+  local tmp="${out}.tmp.$$"
+  curl -fsSL "$url" -o "$tmp"
+  [[ -s "$tmp" ]] || { rm -f "$tmp"; die "Download leer/fehlgeschlagen: $url"; }
+  mv -f "$tmp" "$out"
+}
+
+maybe_fetch_one(){
+  # usage: maybe_fetch_one "name" "url" "/path/to/cache.sh"
+  local name="$1" url="$2" path="$3"
+  local def="n"
+  if [[ ! -s "$path" ]]; then def="y"; fi
+  local ans
+  ask_yes_no ans "Remote holen/aktualisieren: ${name} ?" "$def"
+  if [[ "$ans" == "y" ]]; then
+    log "[DL ] ${name} <- ${url}"
+    download_atomic "$url" "$path"
+    chmod +x "$path"
+    log "[OK ] ${name} aktualisiert."
+  else
+    [[ -s "$path" ]] || die "${name} fehlt im Cache, kann nicht übersprungen werden: $path"
+    log "[OK ] ${name} unverändert (Cache)."
+  fi
 }
 
 run_module(){
-  # usage: run_module /path/to/module.sh
   local m="$1"
   [[ -x "$m" ]] || die "Modul nicht ausführbar: $m"
   log "[RUN] $m"
@@ -162,13 +120,48 @@ run_module(){
   log "[OK ] $m"
 }
 
+run_remote_script(){
+  # Runs a cached remote script with a helper-function wrapper
+  local script="$1"
+  [[ -x "$script" ]] || die "Remote script nicht ausführbar: $script"
+
+  (
+    set -euo pipefail
+
+    # minimal helpers (exported) for remote scripts that still rely on them
+    sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
+    backup_file_ts(){
+      local f="$1"
+      local stamp=".old.kienzlefax.$(date +%Y%m%d-%H%M%S)"
+      if [[ -e "$f" ]]; then
+        cp -a "$f" "${f}${stamp}" 2>/dev/null || true
+        echo "[INFO] backup: $f -> ${f}${stamp}"
+      fi
+    }
+    ensure_line_in_file(){
+      local file="$1" line="$2"
+      touch "$file"
+      grep -Fxq "$line" "$file" || echo "$line" >>"$file"
+    }
+
+    export -f sep backup_file_ts ensure_line_in_file
+
+    if [[ -f "$ENVFILE" ]]; then
+      # shellcheck disable=SC1090
+      source "$ENVFILE"
+    fi
+
+    bash -euo pipefail "$script"
+  )
+}
+
 # ------------------------------------------------------------------------------
-# Bootstrap local module files (small ones) into MOD_DIR
+# Local modules
 # ------------------------------------------------------------------------------
 bootstrap_local_modules(){
-  mkdir -p "$MOD_BASE" "$MOD_LIB" "$MOD_DIR" "$MOD_CACHE" "$STATE_DIR"
+  mkdir -p "$MOD_DIR" "$MOD_CACHE" "$STATE_DIR"
 
-  # 00-base: parameter prompts + hostname set + env export file
+  # 00-base: options / hostname / envfile
   cat >"${MOD_DIR}/00-base.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -176,6 +169,34 @@ set -euo pipefail
 die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "[$(date -Is)] $*"; }
 sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
+
+ask_yes_no(){
+  local __var="$1"; shift
+  local __prompt="$1"; shift
+  local __def="$1"; shift
+  local __val=""
+  while true; do
+    read -r -p "${__prompt} [${__def}]: " __val
+    __val="${__val:-$__def}"
+    case "$__val" in
+      y|Y|yes|YES) printf -v "$__var" "y"; return 0;;
+      n|N|no|NO)   printf -v "$__var" "n"; return 0;;
+      *) echo "Bitte y/n eingeben.";;
+    esac
+  done
+}
+
+ask_default(){
+  local __var="$1"; shift
+  local __prompt="$1"; shift
+  local __def="$1"; shift
+  local __val=""
+  read -r -p "${__prompt} [${__def}]: " __val
+  __val="${__val:-$__def}"
+  printf -v "$__var" "%s" "$__val"
+}
+
+sanitize_digits(){ echo "$1" | tr -cd '0-9'; }
 
 read_secret_twice(){
   local prompt="$1"
@@ -192,37 +213,39 @@ read_secret_twice(){
   done
 }
 
-sanitize_digits(){ echo "$1" | tr -cd '0-9'; }
-
-ask_default(){
-  local __var="$1"; shift
-  local __prompt="$1"; shift
-  local __def="$1"; shift
-  local __val=""
-  read -r -p "${__prompt} [${__def}]: " __val
-  __val="${__val:-$__def}"
-  printf -v "$__var" "%s" "$__val"
-}
-
 backup_file_ts(){
   local f="$1"
   local stamp=".old.kienzlefax.$(date +%Y%m%d-%H%M%S)"
   if [[ -e "$f" ]]; then
-    cp -a "$f" "${f}${stamp}"
+    cp -a "$f" "${f}${stamp}" 2>/dev/null || true
     log "backup: $f -> ${f}${stamp}"
   fi
 }
 
-sep "Hostname + Provider-Parameter abfragen (GANZ AM ANFANG)"
+ENVFILE="/etc/kienzlefax-installer.env"
 
-# Hostname (für Maschine + Zertifikat)
+DEFAULT_SIP_BIND_PORT="${DEFAULT_SIP_BIND_PORT:-5070}"
+DEFAULT_RTP_START="${DEFAULT_RTP_START:-12000}"
+DEFAULT_RTP_END="${DEFAULT_RTP_END:-12049}"
+ASTERISK_GIT_REF_DEFAULT="${ASTERISK_GIT_REF_DEFAULT:-20}"
+
+sep "Optionen / Hostname / Provider-Daten"
+
+if [[ -f "$ENVFILE" ]]; then
+  ask_yes_no RESET_OPTS "Vorhandene Optionen gefunden (${ENVFILE}). Neu setzen?" "n"
+else
+  RESET_OPTS="y"
+fi
+
+if [[ "$RESET_OPTS" == "n" ]]; then
+  log "[OK] Verwende vorhandene Optionen aus ${ENVFILE}"
+  exit 0
+fi
+
 read -r -p "Hostname für diese Maschine (z.B. fax): " KFX_HOSTNAME
 [[ -n "${KFX_HOSTNAME}" ]] || die "Hostname darf nicht leer sein."
-
-# Set hostname
 hostnamectl set-hostname "${KFX_HOSTNAME}"
 
-# /etc/hosts konsistent halten (127.0.1.1 Zeile)
 backup_file_ts /etc/hosts
 if grep -qE '^\s*127\.0\.1\.1\s+' /etc/hosts; then
   sed -i -E "s/^\s*127\.0\.1\.1\s+.*/127.0.1.1\t${KFX_HOSTNAME}/" /etc/hosts
@@ -230,11 +253,10 @@ else
   echo -e "127.0.1.1\t${KFX_HOSTNAME}" >> /etc/hosts
 fi
 
-# Provider Parameter (wie alter Installer)
 read -r -p "DynDNS / Public FQDN (z.B. myhost.dyndns.org): " PUBLIC_FQDN
 [[ -n "${PUBLIC_FQDN}" ]] || die "PUBLIC_FQDN darf nicht leer sein."
 
-read -r -p "SIP Nummer (gleich Username, nur Ziffern, z.B. 4923...): " SIP_NUMBER_RAW
+read -r -p "SIP Nummer (gleich Username, nur Ziffern): " SIP_NUMBER_RAW
 SIP_NUMBER="$(sanitize_digits "${SIP_NUMBER_RAW}")"
 [[ -n "${SIP_NUMBER}" ]] || die "SIP Nummer ist leer/ungültig."
 unset SIP_NUMBER_RAW
@@ -250,22 +272,17 @@ echo
 echo "AMI (Asterisk Manager) läuft NUR lokal auf 127.0.0.1:5038. Bitte Secret setzen:"
 read_secret_twice "AMI Secret (User kfx)" AMI_SECRET
 
-# SIP bind port EINMAL abfragen (default 5070)
-ask_default SIP_BIND_PORT "SIP Bind Port (PJSIP, extern; für Provider-Config)" "${DEFAULT_SIP_BIND_PORT:-5070}"
+ask_default SIP_BIND_PORT "SIP Bind Port (PJSIP extern; Provider-Config)" "${DEFAULT_SIP_BIND_PORT}"
 [[ "$SIP_BIND_PORT" =~ ^[0-9]+$ ]] || die "SIP_BIND_PORT ungültig"
 
-# RTP range (wie neuer Installer; default 12000-12049)
-ask_default RTP_START "RTP Start-Port" "${DEFAULT_RTP_START:-12000}"
-ask_default RTP_END   "RTP End-Port"   "${DEFAULT_RTP_END:-12049}"
+ask_default RTP_START "RTP Start-Port" "${DEFAULT_RTP_START}"
+ask_default RTP_END   "RTP End-Port"   "${DEFAULT_RTP_END}"
 [[ "$RTP_START" =~ ^[0-9]+$ ]] || die "RTP_START ungültig"
 [[ "$RTP_END" =~ ^[0-9]+$ ]] || die "RTP_END ungültig"
 [ "$RTP_START" -lt "$RTP_END" ] || die "RTP_START muss < RTP_END sein"
 
-# Asterisk Git ref (default 20)
-ask_default AST_REF "Asterisk Git-Ref (Branch/Tag/Commit) für Build" "${ASTERISK_GIT_REF_DEFAULT:-20}"
+ask_default AST_REF "Asterisk Git-Ref (Branch/Tag/Commit) für Build" "${ASTERISK_GIT_REF_DEFAULT}"
 
-# Persist env for later modules
-ENVFILE="/etc/kienzlefax-installer.env"
 cat >"$ENVFILE" <<EENV
 # generated by kienzlefax installer
 KFX_HOSTNAME=${KFX_HOSTNAME}
@@ -278,18 +295,13 @@ KFX_SIP_BIND_PORT=${SIP_BIND_PORT}
 KFX_RTP_START=${RTP_START}
 KFX_RTP_END=${RTP_END}
 KFX_AST_REF=${AST_REF}
+
+# defaults used by dialplan module
+KFX_CALLERID_NAME=Fax
 EENV
 chmod 0600 "$ENVFILE"
 
-log "[OK] Parameter gesetzt:"
-log " - Hostname=${KFX_HOSTNAME}"
-log " - PUBLIC_FQDN=${PUBLIC_FQDN}"
-log " - SIP_NUMBER=${SIP_NUMBER}"
-log " - FAX_DID=${FAX_DID}"
-log " - SIP_BIND_PORT=${SIP_BIND_PORT}"
-log " - RTP=${RTP_START}-${RTP_END}"
-log " - AST_REF=${AST_REF}"
-log " - AMI: 127.0.0.1:5038 user=kfx (secret gesetzt)"
+log "[OK] Optionen neu gesetzt in ${ENVFILE}"
 EOF
   chmod +x "${MOD_DIR}/00-base.sh"
 
@@ -297,21 +309,19 @@ EOF
   cat >"${MOD_DIR}/10-packages.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-
 die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "[$(date -Is)] $*"; }
 sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
 
 export DEBIAN_FRONTEND=noninteractive
 
-sep "System aktualisieren + Pakete installieren (gebündelt)"
-
+sep "APT: Update/Upgrade + Pakete"
 apt-get update
 apt-get -y upgrade
 
 apt-get install -y --no-install-recommends \
   ca-certificates curl wget jq \
-  acl lsof coreutils iproute2 \
+  acl lsof coreutils iproute2 psmisc \
   apache2 libapache2-mod-php \
   php php-cli php-sqlite3 php-mbstring sqlite3 \
   qpdf ghostscript poppler-utils libtiff-tools \
@@ -328,7 +338,6 @@ apt-get install -y --no-install-recommends \
   libjansson-dev \
   libspandsp-dev
 
-# PyPDF/PyPDF2: je nach Debian/RPi OS unterschiedlich benannt
 set +e
 apt-get install -y --no-install-recommends python3-pypdf >/dev/null 2>&1
 rc1=$?
@@ -347,7 +356,6 @@ EOF
   cat >"${MOD_DIR}/20-dirs-acl.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-
 log(){ echo "[$(date -Is)] $*"; }
 sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
 
@@ -355,63 +363,21 @@ KZ_BASE="/srv/kienzlefax"
 SPOOL_TIFF_DIR="/var/spool/asterisk/fax1"
 SPOOL_PDF_DIR="/var/spool/asterisk/fax"
 
-sep "Basis-Verzeichnisse + Gruppe/ACL"
-
+sep "Verzeichnisse + Rechte (kienzlefax)"
 mkdir -p "${KZ_BASE}"
-
-# Eingänge (Drucker)
-for i in 1 2 3 4 5; do
-  mkdir -p "${KZ_BASE}/incoming/fax${i}"
-done
-
-# Drop-ins
+for i in 1 2 3 4 5; do mkdir -p "${KZ_BASE}/incoming/fax${i}"; done
 mkdir -p "${KZ_BASE}/pdf-zu-fax"
-mkdir -p "${KZ_BASE}/sendefehler/eingang"
-mkdir -p "${KZ_BASE}/sendefehler/berichte"
-
-# Queue-Layer
+mkdir -p "${KZ_BASE}/sendefehler/eingang" "${KZ_BASE}/sendefehler/berichte"
 mkdir -p "${KZ_BASE}/staging" "${KZ_BASE}/queue" "${KZ_BASE}/processing"
-
-# Archiv
 mkdir -p "${KZ_BASE}/sendeberichte"
-
-# Telefonbuch-DB Platzhalter
 touch "${KZ_BASE}/phonebook.sqlite"
 
-# Asterisk fax-in spools
 mkdir -p "${SPOOL_TIFF_DIR}" "${SPOOL_PDF_DIR}"
 chmod 0777 "${SPOOL_TIFF_DIR}" "${SPOOL_PDF_DIR}" || true
+chmod 0777 "${KZ_BASE}" "${KZ_BASE}"/* || true
+chmod 0777 "${KZ_BASE}/sendefehler" "${KZ_BASE}/sendefehler"/* || true
 
-# Gruppe
-getent group kienzlefax >/dev/null || groupadd --system kienzlefax
-
-# Users (falls existieren) in Gruppe
-for u in lp www-data admin; do
-  id "$u" >/dev/null 2>&1 && usermod -aG kienzlefax "$u" || true
-done
-
-# Grundrechte (bewusstes Design)
-chown -R root:kienzlefax "${KZ_BASE}"
-
-chmod 2775 "${KZ_BASE}"
-chmod 2777 "${KZ_BASE}/incoming"
-chmod 2777 "${KZ_BASE}/incoming"/fax{1..5}
-
-chmod 2777 "${KZ_BASE}/pdf-zu-fax"
-chmod 2777 "${KZ_BASE}/sendefehler" "${KZ_BASE}/sendefehler/eingang" "${KZ_BASE}/sendefehler/berichte"
-
-chmod 2775 "${KZ_BASE}/staging" "${KZ_BASE}/queue" "${KZ_BASE}/processing"
-chmod 2770 "${KZ_BASE}/sendeberichte"
-
-# ACL: lp + gruppe dürfen in incoming schreiben
-setfacl -m u:lp:rwx,g:kienzlefax:rwx "${KZ_BASE}/incoming" "${KZ_BASE}/incoming"/fax{1..5} || true
-setfacl -d -m u:lp:rwx,g:kienzlefax:rwx "${KZ_BASE}/incoming" "${KZ_BASE}/incoming"/fax{1..5} || true
-
-# Default ACL im Base (praktisch)
-setfacl -R -m g:kienzlefax:rwx "${KZ_BASE}" || true
-setfacl -R -d -m g:kienzlefax:rwx "${KZ_BASE}" || true
-
-log "[OK] Verzeichnisse/Rechte/ACL erledigt."
+log "[OK] Verzeichnisse/Rechte erstellt."
 EOF
   chmod +x "${MOD_DIR}/20-dirs-acl.sh"
 
@@ -419,21 +385,40 @@ EOF
   cat >"${MOD_DIR}/30-admin-user.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-
+die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "[$(date -Is)] $*"; }
 sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
 
-sep "Admin-Account anlegen (Login + sudo + Samba)"
+ask_yes_no(){
+  local __var="$1"; shift
+  local __prompt="$1"; shift
+  local __def="$1"; shift
+  local __val=""
+  while true; do
+    read -r -p "${__prompt} [${__def}]: " __val
+    __val="${__val:-$__def}"
+    case "$__val" in
+      y|Y|yes|YES) printf -v "$__var" "y"; return 0;;
+      n|N|no|NO)   printf -v "$__var" "n"; return 0;;
+      *) echo "Bitte y/n eingeben.";;
+    esac
+  done
+}
 
-if ! id admin >/dev/null 2>&1; then
+sep "Admin-Account anlegen + sudo + Samba"
+if id admin >/dev/null 2>&1; then
+  ask_yes_no REGEN "User 'admin' existiert bereits. Neu generieren (inkl. Passwort neu setzen)?" "n"
+  if [[ "$REGEN" == "n" ]]; then
+    log "[OK] admin unverändert gelassen."
+    exit 0
+  fi
+  log "[INFO] admin bleibt bestehen; Passwörter werden neu gesetzt."
+else
   useradd -m -s /bin/bash admin
   log "[OK] User 'admin' angelegt."
-else
-  log "[OK] User 'admin' existiert bereits."
 fi
 
-usermod -aG sudo admin
-log "[OK] 'admin' ist in Gruppe 'sudo'."
+usermod -aG sudo admin || true
 
 echo
 echo "==== Linux-Login-Passwort für 'admin' setzen (2× Eingabe) ===="
@@ -441,10 +426,10 @@ passwd admin
 
 echo
 echo "==== Samba-Passwort für 'admin' setzen (2× Eingabe) ===="
-echo "HINWEIS: Wenn du EIN Passwort für alles willst, gib hier dasselbe Passwort ein wie oben."
-smbpasswd -a admin
+smbpasswd -a admin || true
 smbpasswd -e admin || true
-log "[OK] Samba-User 'admin' aktiviert."
+
+log "[OK] admin: sudo+Samba gesetzt."
 EOF
   chmod +x "${MOD_DIR}/30-admin-user.sh"
 
@@ -452,7 +437,6 @@ EOF
   cat >"${MOD_DIR}/40-web-ssl.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-
 die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "[$(date -Is)] $*"; }
 sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
@@ -466,8 +450,7 @@ WEBROOT="/var/www/html"
 WEB_URL_RAW="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/main/kienzlefax.php"
 FAXTON_URL="https://github.com/thomaskien/kienzlefax-fuer-linux/raw/refs/heads/main/faxton.mp3"
 
-sep "Web installieren (kienzlefax.php + faxton.mp3) + index.html redirect"
-
+sep "Webroot bootstrappen (kienzlefax.php + faxton.mp3) + index redirect"
 mkdir -p "${WEBROOT}"
 curl -fsSL -o "${WEBROOT}/kienzlefax.php" "${WEB_URL_RAW}"
 curl -fsSL -o "${WEBROOT}/faxton.mp3" "${FAXTON_URL}"
@@ -490,15 +473,13 @@ HTML
 chown www-data:www-data "${WEBROOT}/kienzlefax.php" "${WEBROOT}/faxton.mp3" "${WEBROOT}/index.html" || true
 chmod 0644 "${WEBROOT}/kienzlefax.php" "${WEBROOT}/faxton.mp3" "${WEBROOT}/index.html"
 
-sep "Apache SSL: 50 Jahre self-signed (CN+SAN=Hostname) + Site aktivieren"
-
+sep "Apache SSL: self-signed 50 Jahre (CN+SAN=Hostname) + aktivieren"
 CERT_DIR="/etc/ssl/kienzlefax"
 CERT_KEY="${CERT_DIR}/kienzlefax.key"
 CERT_CRT="${CERT_DIR}/kienzlefax.crt"
 mkdir -p "$CERT_DIR"
 chmod 0700 "$CERT_DIR"
 
-# openssl config for SAN
 OPENSSL_CNF="$(mktemp)"
 cat >"$OPENSSL_CNF" <<EOCNF
 [ req ]
@@ -520,7 +501,6 @@ extendedKeyUsage = serverAuth
 DNS.1 = ${KFX_HOSTNAME}
 EOCNF
 
-# Create cert if missing
 if [[ ! -s "$CERT_KEY" || ! -s "$CERT_CRT" ]]; then
   openssl req -x509 -nodes -newkey rsa:4096 \
     -days 18250 \
@@ -533,33 +513,24 @@ if [[ ! -s "$CERT_KEY" || ! -s "$CERT_CRT" ]]; then
 else
   log "[OK] Zertifikat existiert bereits, skip."
 fi
-
 rm -f "$OPENSSL_CNF" || true
 
-# Enable SSL module and site
 a2enmod ssl >/dev/null 2>&1 || true
 
-# Use default-ssl but point to our cert
 SSL_SITE="/etc/apache2/sites-available/default-ssl.conf"
-if [[ -f "$SSL_SITE" ]]; then
-  cp -a "$SSL_SITE" "${SSL_SITE}.old.kienzlefax.$(date +%Y%m%d-%H%M%S)" || true
-fi
+[[ -f "$SSL_SITE" ]] && cp -a "$SSL_SITE" "${SSL_SITE}.old.kienzlefax.$(date +%Y%m%d-%H%M%S)" || true
 
-# Ensure default-ssl exists; if not, create minimal site
 if [[ ! -f "$SSL_SITE" ]]; then
   cat >"$SSL_SITE" <<EOFSSL
 <IfModule mod_ssl.c>
 <VirtualHost _default_:443>
     ServerName ${KFX_HOSTNAME}
     DocumentRoot ${WEBROOT}
-
     ErrorLog \${APACHE_LOG_DIR}/error.log
     CustomLog \${APACHE_LOG_DIR}/access.log combined
-
     SSLEngine on
     SSLCertificateFile      ${CERT_CRT}
     SSLCertificateKeyFile   ${CERT_KEY}
-
     <Directory ${WEBROOT}>
         Options FollowSymLinks
         AllowOverride None
@@ -569,63 +540,46 @@ if [[ ! -f "$SSL_SITE" ]]; then
 </IfModule>
 EOFSSL
 else
-  # Patch cert paths (conservative)
   sed -i -E "s|^\s*SSLCertificateFile\s+.*|SSLCertificateFile      ${CERT_CRT}|" "$SSL_SITE" || true
   sed -i -E "s|^\s*SSLCertificateKeyFile\s+.*|SSLCertificateKeyFile   ${CERT_KEY}|" "$SSL_SITE" || true
-  # Ensure ServerName present (avoid warnings)
   if ! grep -qE '^\s*ServerName\s+' "$SSL_SITE"; then
     sed -i -E "s|<VirtualHost[^>]*>|&\n    ServerName ${KFX_HOSTNAME}|" "$SSL_SITE" || true
   fi
 fi
 
 a2ensite default-ssl >/dev/null 2>&1 || true
-
-systemctl enable --now apache2.service
+systemctl enable --now apache2
 systemctl restart apache2
 
-log "[OK] Web+SSL bereit: https://${KFX_HOSTNAME}/ (self-signed)"
+log "[OK] Web+SSL: https://${KFX_HOSTNAME}/"
 EOF
   chmod +x "${MOD_DIR}/40-web-ssl.sh"
 
-  # 50-cups-samba (backend + printers + shares)
+  # 50-cups-samba (gleich wie vorher; bewusst "alles gehört dazu")
   cat >"${MOD_DIR}/50-cups-samba.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-
-die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "[$(date -Is)] $*"; }
 sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
 
 KZ_BASE="/srv/kienzlefax"
 SPOOL_PDF_DIR="/var/spool/asterisk/fax"
 
-WORKGROUP="WORKGROUP"
+sep "CUPS Backend + fax1..fax5 + Samba Shares"
 
-INCOMING="${KZ_BASE}/incoming"
-PDF_ZU_FAX="${KZ_BASE}/pdf-zu-fax"
-SENDEFEHLER_EINGANG="${KZ_BASE}/sendefehler/eingang"
-SENDEFEHLER_BERICHTE="${KZ_BASE}/sendefehler/berichte"
-SENDEBERICHTE="${KZ_BASE}/sendeberichte"
-
-BACKEND="/usr/lib/cups/backend/kienzlefaxpdf"
-BACKEND_LOG="/var/log/kienzlefaxpdf-backend.log"
-
-sep "CUPS Backend + fax1..fax5 + Bonjour + Samba Shares (inkl. fax-eingang)"
-
-echo "== cups-browsed deaktivieren (falls vorhanden; verhindert implicitclass://) =="
 if systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' | grep -qx "cups-browsed.service"; then
   systemctl stop cups-browsed || true
   systemctl disable cups-browsed || true
 fi
 
-echo "== Backend installieren (deterministisch) =="
+BACKEND="/usr/lib/cups/backend/kienzlefaxpdf"
+BACKEND_LOG="/var/log/kienzlefaxpdf-backend.log"
+
 cat > "$BACKEND" <<'BACKEND_EOF'
 #!/bin/bash
-set -u  # KEIN set -e, wir loggen Fehler selbst
-
+set -u
 DESTBASE="/srv/kienzlefax/incoming"
 LOG="/var/log/kienzlefaxpdf-backend.log"
-
 TIMEOUT="/usr/bin/timeout"
 GS="/usr/bin/gs"
 MKTEMP="/usr/bin/mktemp"
@@ -636,40 +590,31 @@ MKDIR="/bin/mkdir"
 DATE="/usr/bin/date"
 TR="/usr/bin/tr"
 SED="/usr/bin/sed"
-
 CUPSTMP="/var/spool/cups/tmp"
 TMPBASE="/tmp"
-if [[ -d "$CUPSTMP" && -w "$CUPSTMP" ]]; then
-  TMPBASE="$CUPSTMP"
-fi
-
+if [[ -d "$CUPSTMP" && -w "$CUPSTMP" ]]; then TMPBASE="$CUPSTMP"; fi
 log() { echo "[$($DATE -Is)] $*" >> "$LOG"; }
 
 if [[ $# -eq 0 ]]; then
-  echo 'direct kienzlefaxpdf "KienzleFax PDF Drop (fax1..fax5)" "kienzlefaxpdf:/fax1"'
-  echo 'direct kienzlefaxpdf "KienzleFax PDF Drop (fax1..fax5)" "kienzlefaxpdf:/fax2"'
-  echo 'direct kienzlefaxpdf "KienzleFax PDF Drop (fax1..fax5)" "kienzlefaxpdf:/fax3"'
-  echo 'direct kienzlefaxpdf "KienzleFax PDF Drop (fax1..fax5)" "kienzlefaxpdf:/fax4"'
-  echo 'direct kienzlefaxpdf "KienzleFax PDF Drop (fax1..fax5)" "kienzlefaxpdf:/fax5"'
+  for i in 1 2 3 4 5; do
+    echo "direct kienzlefaxpdf \"KienzleFax PDF Drop\" \"kienzlefaxpdf:/fax$i\""
+  done
   exit 0
 fi
 
 JOBID="${1:-}"
 USER="${2:-unknown}"
 TITLE="${3:-job}"
-COPIES="${4:-1}"
 FILE="${6:-}"
 URI="${DEVICE_URI:-}"
 PRN="${URI#kienzlefaxpdf:/}"
 PRN="${PRN%%/*}"
-
-log "START jobid=$JOBID user=$USER title=$TITLE copies=$COPIES file='${FILE:-}' uri='$URI' prn='$PRN' tmpbase='$TMPBASE'"
-
-if [[ -z "$JOBID" ]]; then log "ERROR: missing jobid"; exit 1; fi
-if [[ ! "$PRN" =~ ^fax[1-5]$ ]]; then log "ERROR: invalid prn '$PRN'"; exit 1; fi
+log "START jobid=$JOBID user=$USER title=$TITLE file='${FILE:-}' uri='$URI' prn='$PRN' tmpbase='$TMPBASE'"
+[[ -n "$JOBID" ]] || { log "ERROR: missing jobid"; exit 1; }
+[[ "$PRN" =~ ^fax[1-5]$ ]] || { log "ERROR: invalid prn '$PRN'"; exit 1; }
 
 OUTDIR="$DESTBASE/$PRN"
-if ! $MKDIR -p "$OUTDIR"; then log "ERROR: mkdir '$OUTDIR' failed"; exit 1; fi
+$MKDIR -p "$OUTDIR" || { log "ERROR: mkdir '$OUTDIR' failed"; exit 1; }
 
 ts="$($DATE +%Y%m%d-%H%M%S)"
 base="$(echo "$TITLE" | $TR -c 'A-Za-z0-9._-' '_' | $SED 's/^_//;s/_$//')"
@@ -681,50 +626,26 @@ if [[ -n "${FILE:-}" && -f "$FILE" ]]; then
   infile="$FILE"
 else
   tmp_in="$($MKTEMP --tmpdir="$TMPBASE" "kienzlefaxpdf.${JOBID}.XXXXXX" 2>/dev/null)"
-  if [[ -z "$tmp_in" ]]; then
-    log "ERROR: mktemp stdin file failed (tmpbase=$TMPBASE)"
-    exit 1
-  fi
+  [[ -n "$tmp_in" ]] || { log "ERROR: mktemp stdin failed"; exit 1; }
   cat > "$tmp_in"
   infile="$tmp_in"
 fi
 
-size="$($STAT -c%s "$infile" 2>/dev/null || echo '?')"
-log "INFO: infile='$infile' size=$size"
-
 tmp_pdf="$($MKTEMP --tmpdir="$TMPBASE" "kienzlefaxpdf.${JOBID}.XXXXXX.pdf" 2>/dev/null)"
-if [[ -z "$tmp_pdf" ]]; then
-  log "ERROR: mktemp pdf failed (tmpbase=$TMPBASE)"
-  [[ -n "$tmp_in" ]] && rm -f "$tmp_in" || true
-  exit 1
-fi
-
-log "INFO: gs begin -> '$tmp_pdf'"
+[[ -n "$tmp_pdf" ]] || { log "ERROR: mktemp pdf failed"; [[ -n "$tmp_in" ]] && rm -f "$tmp_in"; exit 1; }
 
 export TMPDIR="$TMPBASE"
-
-if ! $TIMEOUT 60s $GS -q -dSAFER -dBATCH -dNOPAUSE \
-  -sDEVICE=pdfwrite -sOutputFile="$tmp_pdf" "$infile" >>"$LOG" 2>&1; then
+if ! $TIMEOUT 60s $GS -q -dSAFER -dBATCH -dNOPAUSE -sDEVICE=pdfwrite -sOutputFile="$tmp_pdf" "$infile" >>"$LOG" 2>&1; then
   rc=$?
-  log "ERROR: gs failed/timeout rc=$rc"
-  rm -f "$tmp_pdf" || true
-  [[ -n "$tmp_in" ]] && rm -f "$tmp_in" || true
+  log "ERROR: gs failed rc=$rc"
+  rm -f "$tmp_pdf"
+  [[ -n "$tmp_in" ]] && rm -f "$tmp_in"
   exit 1
 fi
 
-outsize="$($STAT -c%s "$tmp_pdf" 2>/dev/null || echo '?')"
-log "INFO: gs ok size=$outsize"
-
-if ! $MV -f "$tmp_pdf" "$out"; then
-  log "ERROR: mv failed to '$out'"
-  rm -f "$tmp_pdf" || true
-  [[ -n "$tmp_in" ]] && rm -f "$tmp_in" || true
-  exit 1
-fi
-
+$MV -f "$tmp_pdf" "$out" || { log "ERROR: mv failed"; rm -f "$tmp_pdf"; [[ -n "$tmp_in" ]] && rm -f "$tmp_in"; exit 1; }
 $CHMOD 0664 "$out" || true
 [[ -n "$tmp_in" ]] && rm -f "$tmp_in" || true
-
 log "OK wrote '$out'"
 exit 0
 BACKEND_EOF
@@ -732,29 +653,14 @@ BACKEND_EOF
 chmod 0755 "$BACKEND"
 chown root:root "$BACKEND"
 
-echo "== Backend-Logfile vorbereiten (schreibbar für CUPS/lp) =="
 touch "$BACKEND_LOG"
 chown lp:lp "$BACKEND_LOG" || true
 chmod 0664 "$BACKEND_LOG"
 
-echo "== CUPS: Bonjour/DNS-SD aktivieren (minimal) =="
-CUPSD="/etc/cups/cupsd.conf"
-if grep -qE '^[#[:space:]]*Browsing[[:space:]]+' "$CUPSD"; then
-  sed -i -E 's/^[#[:space:]]*Browsing[[:space:]]+.*/Browsing On/' "$CUPSD"
-else
-  echo 'Browsing On' >> "$CUPSD"
-fi
-if grep -qE '^[#[:space:]]*BrowseLocalProtocols[[:space:]]+' "$CUPSD"; then
-  sed -i -E 's/^[#[:space:]]*BrowseLocalProtocols[[:space:]]+.*/BrowseLocalProtocols dnssd/' "$CUPSD"
-else
-  echo 'BrowseLocalProtocols dnssd' >> "$CUPSD"
-fi
-cupsctl --share-printers >/dev/null 2>&1 || true
+systemctl enable --now cups || true
+systemctl restart cups || true
 
-echo "== CUPS: fax1..fax5 deterministisch anlegen =="
-for i in 1 2 3 4 5; do
-  lpadmin -x "fax$i" 2>/dev/null || true
-done
+for i in 1 2 3 4 5; do lpadmin -x "fax$i" 2>/dev/null || true; done
 for i in 1 2 3 4 5; do
   PRN="fax$i"
   lpadmin -p "$PRN" -E -v "kienzlefaxpdf:/$PRN" -m raw
@@ -764,25 +670,18 @@ for i in 1 2 3 4 5; do
   cupsaccept "$PRN"
 done
 
-echo "== Samba: smb.conf schreiben (inkl. Shares; inkl. fax-eingang) =="
-mkdir -p /var/spool/samba
-chmod 1777 /var/spool/samba
-
-# fax-eingang path sicherstellen (Guest share)
-mkdir -p "${SPOOL_PDF_DIR}"
-chmod 0777 "${SPOOL_PDF_DIR}" || true
+mkdir -p "$SPOOL_PDF_DIR"
+chmod 0777 "$SPOOL_PDF_DIR" || true
 
 cat > /etc/samba/smb.conf <<EOFSMB
 [global]
-   workgroup = ${WORKGROUP}
+   workgroup = WORKGROUP
    server string = kienzlefax samba
    security = user
    map to guest = Bad User
    guest account = nobody
    server min protocol = SMB2
    smb ports = 445
-
-   # Printing via CUPS
    printing = cups
    printcap name = cups
    load printers = yes
@@ -797,10 +696,8 @@ cat > /etc/samba/smb.conf <<EOFSMB
    read only = yes
    create mask = 0700
 
-### KIENZLEFAX SHARES BEGIN ###
-
 [pdf-zu-fax]
-   path = ${PDF_ZU_FAX}
+   path = /srv/kienzlefax/pdf-zu-fax
    browseable = yes
    read only = no
    guest ok = yes
@@ -810,7 +707,7 @@ cat > /etc/samba/smb.conf <<EOFSMB
    directory mask = 2777
 
 [sendefehler-eingang]
-   path = ${SENDEFEHLER_EINGANG}
+   path = /srv/kienzlefax/sendefehler/eingang
    browseable = yes
    read only = no
    guest ok = yes
@@ -820,7 +717,7 @@ cat > /etc/samba/smb.conf <<EOFSMB
    directory mask = 2777
 
 [sendefehler-berichte]
-   path = ${SENDEFEHLER_BERICHTE}
+   path = /srv/kienzlefax/sendefehler/berichte
    browseable = yes
    read only = yes
    guest ok = yes
@@ -830,7 +727,7 @@ cat > /etc/samba/smb.conf <<EOFSMB
    directory mask = 2777
 
 [sendeberichte]
-   path = ${SENDEBERICHTE}
+   path = /srv/kienzlefax/sendeberichte
    browseable = yes
    read only = yes
    guest ok = no
@@ -840,7 +737,7 @@ cat > /etc/samba/smb.conf <<EOFSMB
    directory mask = 2750
 
 [fax-eingang]
-   path = ${SPOOL_PDF_DIR}
+   path = /var/spool/asterisk/fax
    browseable = yes
    writable = yes
    read only = no
@@ -850,20 +747,12 @@ cat > /etc/samba/smb.conf <<EOFSMB
    directory mask = 0777
    force user = nobody
    force group = nogroup
-
-### KIENZLEFAX SHARES END ###
 EOFSMB
-
-systemctl enable --now cups || true
-systemctl restart cups || true
 
 systemctl enable --now smbd nmbd || true
 systemctl restart smbd nmbd || true
 
-systemctl enable --now avahi-daemon || true
-systemctl restart avahi-daemon || true
-
-log "[OK] CUPS+Samba fertig."
+log "[OK] CUPS+Samba bereit."
 EOF
   chmod +x "${MOD_DIR}/50-cups-samba.sh"
 
@@ -871,7 +760,6 @@ EOF
   cat >"${MOD_DIR}/60-asterisk-build.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-
 die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "[$(date -Is)] $*"; }
 sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
@@ -885,7 +773,6 @@ ASTERISK_SRC_DIR="/usr/src/asterisk"
 ASTERISK_GIT_URL="https://github.com/asterisk/asterisk.git"
 
 sep "Asterisk: Source holen + Build (INTERAKTIV menuselect)"
-
 mkdir -p "$(dirname "$ASTERISK_SRC_DIR")"
 if [[ ! -d "$ASTERISK_SRC_DIR/.git" ]]; then
   rm -rf "$ASTERISK_SRC_DIR"
@@ -906,10 +793,8 @@ echo "  - res_fax"
 echo "  - app_fax (SendFAX/ReceiveFAX)"
 echo "  - res_fax_spandsp (falls verfügbar/gewünscht)"
 echo "  - format_tiff"
-echo "  - (optional) codec_ulaw/alaw etc. nach Bedarf"
 echo
 read -r -p "ENTER drücken um menuselect zu starten..." _
-
 make menuselect
 
 CPU="$(nproc 2>/dev/null || echo 2)"
@@ -924,11 +809,10 @@ log "[OK] Asterisk installiert/gestartet."
 EOF
   chmod +x "${MOD_DIR}/60-asterisk-build.sh"
 
-  # 70-rtp-ami (Manager minimal robust)
+  # 70-rtp-ami (Python patcher)
   cat >"${MOD_DIR}/70-rtp-ami.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-
 die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "[$(date -Is)] $*"; }
 sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
@@ -941,72 +825,72 @@ source "$ENVFILE"
 RTP_CONF="/etc/asterisk/rtp.conf"
 MANAGER_CONF="/etc/asterisk/manager.conf"
 
-ini_set_kv(){
-  local file="$1"; local section="$2"; local key="$3"; local value="$4"
-  touch "$file"
-  if ! grep -qE "^\s*\[$section\]\s*$" "$file"; then
-    { echo; echo "[$section]"; echo "$key = $value"; } >>"$file"
-    return
-  fi
-  local tmp="${file}.tmp.$$"
-  awk -v sec="$section" -v key="$key" -v val="$value" '
-    function ltrim(s){ sub(/^[ \t\r\n]+/,"",s); return s }
-    function rtrim(s){ sub(/[ \t\r\n]+$/,"",s); return s }
-    function trim(s){ return rtrim(ltrim(s)) }
-    BEGIN{ insec=0; done=0 }
-    {
-      line=$0
-      if (match(line, /^\s*\[([^\]]+)\]\s*$/, m)) {
-        if (insec==1 && done==0) { print key " = " val; done=1 }
-        insec = (trim(m[1])==sec) ? 1 : 0
-        print line
-        next
-      }
-      if (insec==1) {
-        if (match(line, "^[ \t]*" key "[ \t]*=", mm)) {
-          if (done==0) { print key " = " val; done=1 }
-          next
-        }
-      }
-      print line
-    }
-    END{ if (insec==1 && done==0) print key " = " val }
-  ' "$file" >"$tmp"
-  mv "$tmp" "$file"
+ini_set_kv_py(){
+  local file="$1" section="$2" key="$3" value="$4"
+  python3 - "$file" "$section" "$key" "$value" <<'PY'
+import sys, re, pathlib
+file, section, key, value = sys.argv[1:5]
+path = pathlib.Path(file)
+text = path.read_text(encoding="utf-8") if path.exists() else ""
+lines = text.splitlines()
+sec_re = re.compile(r'^\s*\[' + re.escape(section) + r'\]\s*$')
+any_sec_re = re.compile(r'^\s*\[[^\]]+\]\s*$')
+key_re = re.compile(r'^\s*' + re.escape(key) + r'\s*=')
+out=[]
+i=0
+found=False
+while i < len(lines):
+    line = lines[i]
+    if sec_re.match(line):
+        found=True
+        out.append(line); i += 1
+        wrote=False
+        while i < len(lines) and not any_sec_re.match(lines[i]):
+            if key_re.match(lines[i]) and not wrote:
+                out.append(f"{key} = {value}"); wrote=True; i += 1; continue
+            out.append(lines[i]); i += 1
+        if not wrote:
+            out.append(f"{key} = {value}")
+        continue
+    out.append(line); i += 1
+if not found:
+    if out and out[-1].strip() != "":
+        out.append("")
+    out.append(f"[{section}]")
+    out.append(f"{key} = {value}")
+path.write_text("\n".join(out) + "\n", encoding="utf-8")
+PY
 }
 
 ensure_line_in_file(){
-  local file="$1"; local line="$2"
+  local file="$1" line="$2"
   touch "$file"
   grep -Fxq "$line" "$file" || echo "$line" >>"$file"
 }
 
 sep "Asterisk: RTP Range setzen"
-cp -a "$RTP_CONF" "${RTP_CONF}.old.kienzlefax.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+[[ -f "$RTP_CONF" ]] && cp -a "$RTP_CONF" "${RTP_CONF}.old.kienzlefax.$(date +%Y%m%d-%H%M%S)" || true
 touch "$RTP_CONF"
-ini_set_kv "$RTP_CONF" "general" "rtpstart" "$KFX_RTP_START"
-ini_set_kv "$RTP_CONF" "general" "rtpend"   "$KFX_RTP_END"
+ini_set_kv_py "$RTP_CONF" "general" "rtpstart" "$KFX_RTP_START"
+ini_set_kv_py "$RTP_CONF" "general" "rtpend"   "$KFX_RTP_END"
 
 sep "Asterisk AMI/Manager aktivieren + nur localhost"
-cp -a "$MANAGER_CONF" "${MANAGER_CONF}.old.kienzlefax.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+[[ -f "$MANAGER_CONF" ]] && cp -a "$MANAGER_CONF" "${MANAGER_CONF}.old.kienzlefax.$(date +%Y%m%d-%H%M%S)" || true
 touch "$MANAGER_CONF"
 
 ensure_line_in_file "$MANAGER_CONF" '#include "/etc/asterisk/manager.d/*.conf"'
 mkdir -p /etc/asterisk/manager.d
 
-ini_set_kv "$MANAGER_CONF" "general" "enabled"    "yes"
-ini_set_kv "$MANAGER_CONF" "general" "webenabled" "no"
-ini_set_kv "$MANAGER_CONF" "general" "bindaddr"   "127.0.0.1"
-ini_set_kv "$MANAGER_CONF" "general" "port"       "5038"
+ini_set_kv_py "$MANAGER_CONF" "general" "enabled"    "yes"
+ini_set_kv_py "$MANAGER_CONF" "general" "webenabled" "no"
+ini_set_kv_py "$MANAGER_CONF" "general" "bindaddr"   "127.0.0.1"
+ini_set_kv_py "$MANAGER_CONF" "general" "port"       "5038"
 
 cat >/etc/asterisk/manager.d/kfx.conf <<EOFCONF
 [kfx]
 secret = ${KFX_AMI_SECRET}
-
-; nur lokal (weil AMI bindaddr=127.0.0.1)
 deny=0.0.0.0/0.0.0.0
 permit=127.0.0.1/255.255.255.255
-
 read = system,call,log,command,reporting
 write = system,call,command,reporting,originate
 EOFCONF
@@ -1023,66 +907,97 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# Main flow
+# Main
 # ------------------------------------------------------------------------------
 require_root
 export DEBIAN_FRONTEND=noninteractive
 
-sep "Bootstrap Module"
+sep "Bootstrap lokale Module"
 bootstrap_local_modules
 
-sep "Remote Module holen?"
-ask_yes_no FETCH_REMOTE "Remote Module (pjsip/extensions/worker/pdf_with_header) neu holen/aktualisieren?" "y"
+sep "Remote Module einzeln holen/aktualisieren"
+maybe_fetch_one "extensions.sh"      "$URL_EXTENSIONS"      "${MOD_CACHE}/extensions.sh"
+maybe_fetch_one "pjsip-1und1.sh"     "$URL_PJSIP_1UND1"     "${MOD_CACHE}/pjsip-1und1.sh"
+maybe_fetch_one "worker.sh"          "$URL_WORKER"          "${MOD_CACHE}/worker.sh"
+maybe_fetch_one "agi.sh"             "$URL_AGI"             "${MOD_CACHE}/agi.sh"
+maybe_fetch_one "pdf_with_header.sh" "$URL_PDF_WITH_HEADER" "${MOD_CACHE}/pdf_with_header.sh"
 
-if [[ "$FETCH_REMOTE" == "y" ]]; then
-  sep "Remote Module downloaden"
-  download_to "$URL_EXTENSIONS"       "${MOD_CACHE}/extensions.sh"
-  download_to "$URL_WORKER"           "${MOD_CACHE}/worker.sh"
-  download_to "$URL_PJSIP_1UND1"      "${MOD_CACHE}/pjsip-1und1.sh"
-  download_to "$URL_PDF_WITH_HEADER"  "${MOD_CACHE}/pdf_with_header.sh"
-  chmod +x "${MOD_CACHE}/extensions.sh" "${MOD_CACHE}/worker.sh" "${MOD_CACHE}/pjsip-1und1.sh" "${MOD_CACHE}/pdf_with_header.sh"
-else
-  sep "Remote Module: verwende Cache (falls vorhanden)"
-  [[ -x "${MOD_CACHE}/extensions.sh" ]]      || die "extensions.sh fehlt im Cache – bitte Remote-Download erlauben."
-  [[ -x "${MOD_CACHE}/worker.sh" ]]          || die "worker.sh fehlt im Cache – bitte Remote-Download erlauben."
-  [[ -x "${MOD_CACHE}/pjsip-1und1.sh" ]]     || die "pjsip-1und1.sh fehlt im Cache – bitte Remote-Download erlauben."
-  [[ -x "${MOD_CACHE}/pdf_with_header.sh" ]] || die "pdf_with_header.sh fehlt im Cache – bitte Remote-Download erlauben."
-fi
-
-sep "Module ausführen (feste Reihenfolge, alles gehört dazu)"
-
+sep "Module ausführen (feste Reihenfolge)"
 run_module "${MOD_DIR}/00-base.sh"
 run_module "${MOD_DIR}/10-packages.sh"
 run_module "${MOD_DIR}/20-dirs-acl.sh"
 run_module "${MOD_DIR}/30-admin-user.sh"
 run_module "${MOD_DIR}/40-web-ssl.sh"
 run_module "${MOD_DIR}/50-cups-samba.sh"
-run_module "${MOD_DIR}/60-asterisk-build.sh"
+
+# Asterisk build decision
+ASTERISK_DETECTED="n"
+command -v asterisk >/dev/null 2>&1 && ASTERISK_DETECTED="y"
+if [[ "$ASTERISK_DETECTED" == "y" ]]; then
+  ask_yes_no DO_ASTERISK_BUILD "Asterisk ist bereits installiert. Nochmal aus Source kompilieren?" "n"
+else
+  DO_ASTERISK_BUILD="y"
+fi
+
+if [[ "$DO_ASTERISK_BUILD" == "y" ]]; then
+  run_module "${MOD_DIR}/60-asterisk-build.sh"
+else
+  sep "Asterisk Build übersprungen (bestehende Installation wird genutzt)"
+  systemctl enable --now asterisk || true
+fi
+
 run_module "${MOD_DIR}/70-rtp-ami.sh"
 
-sep "Remote Provider-PJSIP (1und1) – EINZIGE Stelle für pjsip.conf"
-# Export env expected by remote module
+# Load ENV
 # shellcheck disable=SC1090
-source /etc/kienzlefax-installer.env
-export KFX_PUBLIC_FQDN KFX_SIP_NUMBER KFX_SIP_PASSWORD KFX_FAX_DID KFX_SIP_BIND_PORT
-bash -euxo pipefail "${MOD_CACHE}/pjsip-1und1.sh"
+source "$ENVFILE"
 
-sep "Remote Dialplan (extensions.conf)"
-bash -euxo pipefail "${MOD_CACHE}/extensions.sh"
-asterisk -rx "dialplan reload" || true
+# ------------------------------------------------------------------------------
+# Export variables for remote scripts (compatibility layer)
+# ------------------------------------------------------------------------------
+export KFX_HOSTNAME KFX_PUBLIC_FQDN KFX_SIP_NUMBER KFX_SIP_PASSWORD KFX_FAX_DID KFX_SIP_BIND_PORT
+export KFX_RTP_START KFX_RTP_END KFX_AST_REF KFX_AMI_SECRET
 
-sep "Remote Worker + AGI + systemd"
-# Pass AMI env + anything else via environment
+# Common legacy names (remote scripts may still use these)
+export PJSIP_USER="${PJSIP_USER:-$KFX_SIP_NUMBER}"
+export PJSIP_PASS="${PJSIP_PASS:-$KFX_SIP_PASSWORD}"
+export SIP_BIND_PORT="${SIP_BIND_PORT:-$KFX_SIP_BIND_PORT}"
+export SIP_PORT="${SIP_PORT:-$KFX_SIP_BIND_PORT}"
+export FAX_DID="${FAX_DID:-$KFX_FAX_DID}"
+export PUBLIC_FQDN="${PUBLIC_FQDN:-$KFX_PUBLIC_FQDN}"
+
+# AMI env for worker scripts
 export KFX_AMI_HOST="127.0.0.1"
 export KFX_AMI_PORT="5038"
 export KFX_AMI_USER="kfx"
 export KFX_AMI_PASS="${KFX_AMI_SECRET}"
-bash -euxo pipefail "${MOD_CACHE}/worker.sh"
+
+export AMI_HOST="${AMI_HOST:-$KFX_AMI_HOST}"
+export AMI_PORT="${AMI_PORT:-$KFX_AMI_PORT}"
+export AMI_USER="${AMI_USER:-$KFX_AMI_USER}"
+export AMI_SECRET="${AMI_SECRET:-$KFX_AMI_PASS}"
+
+# ------------------------------------------------------------------------------
+# Remote scripts execution
+# ------------------------------------------------------------------------------
+sep "Remote Provider-PJSIP (befüllt pjsip.conf)"
+run_remote_script "${MOD_CACHE}/pjsip-1und1.sh"
+asterisk -rx "pjsip reload" || true
+
+sep "Remote Dialplan (befüllt extensions.conf)"
+run_remote_script "${MOD_CACHE}/extensions.sh"
+asterisk -rx "dialplan reload" || true
+
+sep "Remote AGI installieren"
+run_remote_script "${MOD_CACHE}/agi.sh"
+
+sep "Remote Worker installieren"
+run_remote_script "${MOD_CACHE}/worker.sh"
 systemctl daemon-reload || true
 systemctl enable --now kienzlefax-worker || true
 
-sep "Remote pdf_with_header.sh"
-bash -euxo pipefail "${MOD_CACHE}/pdf_with_header.sh"
+sep "Remote pdf_with_header.sh installieren"
+run_remote_script "${MOD_CACHE}/pdf_with_header.sh"
 
 sep "Reloads + Status"
 asterisk -rx "core reload" || true
@@ -1097,11 +1012,9 @@ systemctl status kienzlefax-worker --no-pager -l || true
 
 sep "Fertig: Kurzinfo"
 echo "Hostname: $(hostname)"
-echo "Web: http://$(hostname)/ -> redirect /kienzlefax.php"
+echo "Web: http://$(hostname)/ -> /kienzlefax.php"
 echo "Web SSL (self-signed 50y): https://$(hostname)/"
-echo "Provider: 1und1 via remote pjsip-1und1.sh (SIP bind port: ${KFX_SIP_BIND_PORT})"
+echo "SIP Bind Port (Provider): ${KFX_SIP_BIND_PORT}"
 echo "RTP: ${KFX_RTP_START}-${KFX_RTP_END}"
 echo "AMI: 127.0.0.1:5038 user=kfx (secret gesetzt)"
-echo "CUPS: fax1..fax5 backend=kienzlefaxpdf"
-echo "Samba Shares: pdf-zu-fax, sendefehler-*, sendeberichte (admin), fax-eingang (guest)"
 echo "Remote module cache: ${MOD_CACHE}"
