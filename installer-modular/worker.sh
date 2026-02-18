@@ -902,3 +902,75 @@ PY
 
 chmod +x /usr/local/bin/kienzlefax-worker.py
 
+
+sudo bash -euxo pipefail <<'EOF'
+# ===== kienzlefax-worker systemd service installieren + aktivieren =====
+
+# 1) Plausibilitätschecks
+test -x /usr/local/bin/kienzlefax-worker.py
+id asterisk >/dev/null 2>&1 || true
+
+# 2) Optional: eigener User (falls du NICHT als root laufen willst)
+#    (empfohlen ist: als "asterisk" laufen, damit AMI/Dateirechte sauber sind)
+#    Wenn der User bei dir anders ist, hier anpassen:
+RUN_AS_USER="root"
+RUN_AS_GROUP="root"
+
+# 3) Service-Datei schreiben
+sudo tee /etc/systemd/system/kienzlefax-worker.service >/dev/null <<SERVICE
+[Unit]
+Description=kienzlefax worker (Asterisk SendFAX via AMI)
+After=network.target asterisk.service
+Wants=asterisk.service
+
+[Service]
+Type=simple
+User=${RUN_AS_USER}
+Group=${RUN_AS_GROUP}
+WorkingDirectory=/srv/kienzlefax
+ExecStart=/usr/bin/python3 -u /usr/local/bin/kienzlefax-worker.py
+Restart=always
+RestartSec=2
+
+# --- Environment: bei Bedarf hier setzen/ändern ---
+Environment=KFX_BASE=/srv/kienzlefax
+Environment=KFX_AMI_HOST=127.0.0.1
+Environment=KFX_AMI_PORT=5038
+Environment=KFX_AMI_USER=kfx
+Environment=KFX_AMI_PASS=test
+Environment=KFX_DIAL_CONTEXT=fax-out
+Environment=KFX_MAX_INFLIGHT=1
+Environment=KFX_POLL_INTERVAL_SEC=1.0
+Environment=KFX_POST_CALL_COOLDOWN_SEC=20.0
+Environment=KFX_AMI_ORIGINATE_WAIT_SEC=3600
+Environment=KFX_PDF_HEADER_SCRIPT=/usr/local/bin/pdf_with_header.sh
+Environment=KFX_QPDF_BIN=qpdf
+Environment=KFX_GS_BIN=gs
+Environment=KFX_TIFF_DPI=204x196
+Environment=KFX_TIFF_DEVICE=tiffg4
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+# 4) Rechte sicherstellen (wichtig, falls als asterisk läuft)
+sudo mkdir -p /srv/kienzlefax/{queue,processing,sendeberichte,sendefehler/eingang,sendefehler/berichte}
+#sudo chown -R ${RUN_AS_USER}:${RUN_AS_GROUP} /srv/kienzlefax
+sudo chmod -R u+rwX,g+rwX /srv/kienzlefax
+
+# 5) systemd reload + enable + start
+sudo systemctl daemon-reload
+sudo systemctl enable --now kienzlefax-worker.service
+
+# 6) Status anzeigen
+sudo systemctl status kienzlefax-worker --no-pager -l
+
+# 7) Live-Logs (kurz)
+sudo journalctl -u kienzlefax-worker -n 80 --no-pager
+EOF
+
+
