@@ -24,7 +24,6 @@ SERVER_URI="sip:${PROVIDER_DOMAIN}"
 # client_uri: if caller provided something use it, else build it.
 PJSIP_CLIENT_URI="${PJSIP_CLIENT_URI:-}"
 if [ -z "${PJSIP_CLIENT_URI}" ]; then
-  # typical: sip:<user>@sip.1und1.de
   PJSIP_CLIENT_URI="sip:${PJSIP_USER}@${PROVIDER_DOMAIN}"
 fi
 
@@ -44,7 +43,6 @@ cp -a "$PJSIP" "${PJSIP}.old.kienzlefax.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || t
 # outbound proxy line (optional)
 OUTBOUND_PROXY_LINE=""
 if [ -n "${PJSIP_OUTBOUND_PROXY}" ]; then
-  # ensure it has sip:
   if [[ "${PJSIP_OUTBOUND_PROXY}" =~ ^sip: ]]; then
     OUTBOUND_PROXY_LINE="outbound_proxy=${PJSIP_OUTBOUND_PROXY}\;lr"
   else
@@ -52,64 +50,95 @@ if [ -n "${PJSIP_OUTBOUND_PROXY}" ]; then
   fi
 fi
 
-cat >"$PJSIP" <<EOF
-; ===== KienzleFax / 1und1 Provider (auto-generated) =====
-; Hinweis: Für andere Provider hier anpassen.
-; Generated: $(date -Is)
+# external address lines (optional)
+EXTERNAL_ADDR_LINES=""
+if [ -n "${PUBLIC_FQDN}" ]; then
+  EXTERNAL_ADDR_LINES=$(
+    cat <<EOF
+external_signaling_address = ${PUBLIC_FQDN}
+external_media_address     = ${PUBLIC_FQDN}
+EOF
+  )
+else
+  EXTERNAL_ADDR_LINES=$(
+    cat <<'EOF'
+;external_signaling_address = <PUBLIC_FQDN>
+;external_media_address     = <PUBLIC_FQDN>
+EOF
+  )
+fi
 
-; --- Transport: bind to 0.0.0.0:${SIP_BIND_PORT} ---
+cat >"$PJSIP" <<EOF
 [transport-udp]
 type=transport
 protocol=udp
 bind=0.0.0.0:${SIP_BIND_PORT}
 
-; --- Auth ---
+${EXTERNAL_ADDR_LINES}
+
+local_net = 10.0.0.0/8
+local_net = 192.168.0.0/16
+
+
+
+[1und1]
+type=registration
+transport=transport-udp
+outbound_auth=1und1-auth
+server_uri=sip:${PROVIDER_DOMAIN}
+client_uri=${PJSIP_CLIENT_URI}
+contact_user=${PJSIP_USER}
+retry_interval=60
+forbidden_retry_interval=600
+expiration=300
+${OUTBOUND_PROXY_LINE}
+
+
 [1und1-auth]
 type=auth
 auth_type=userpass
 username=${PJSIP_USER}
 password=${PJSIP_PASS}
 
-; --- AOR ---
 [1und1-aor]
 type=aor
 contact=sip:${PROVIDER_DOMAIN}
 
-; --- Endpoint ---
 [1und1-endpoint]
 type=endpoint
 transport=transport-udp
 context=fax-in
 disallow=all
 allow=alaw,ulaw
+outbound_auth=1und1-auth
 aors=1und1-aor
-auth=1und1-auth
-from_domain=${PROVIDER_DOMAIN}
 direct_media=no
-force_rport=yes
 rewrite_contact=yes
 rtp_symmetric=yes
-timers=no
+force_rport=yes
+t38_udptl=no
+;t38_udptl_ec=no
+t38_udptl_nat=no
+from_user=${PJSIP_USER}
+from_domain=${PROVIDER_DOMAIN}
+send_pai=yes
+send_rpid=yes
+trust_id_outbound=yes
 ${OUTBOUND_PROXY_LINE}
 
-; --- Identify ---
+; ===== JITTERBUFFER (PJSIP/chan_pjsip korrekt) =====
+;use_jitterbuffer=yes
+;jbimpl=adaptive
+;jbmaxsize=400
+;jbtargetextra=200
+
+
 [1und1-identify]
 type=identify
 endpoint=1und1-endpoint
-match=${PROVIDER_DOMAIN}
 
-; --- Registration ---
-[1und1-reg]
-type=registration
-outbound_auth=1und1-auth
-server_uri=${SERVER_URI}
-client_uri=${PJSIP_CLIENT_URI}
-retry_interval=60
-forbidden_retry_interval=300
-fatal_retry_interval=300
-expiration=3600
-transport=transport-udp
-${OUTBOUND_PROXY_LINE}
+; erstmal die IPs aus deinem Trace
+match=212.227.0.0/16
 EOF
 
 chmod 0640 "$PJSIP" || true
@@ -118,6 +147,7 @@ chown root:asterisk "$PJSIP" 2>/dev/null || true
 echo "[INFO] Wrote: $PJSIP"
 echo "[INFO] PJSIP_USER=${PJSIP_USER}"
 echo "[INFO] SIP_BIND_PORT=${SIP_BIND_PORT}"
+echo "[INFO] PJSIP_MATCH_CIDR=${PJSIP_MATCH_CIDR}"
 [ -n "${PJSIP_OUTBOUND_PROXY}" ] && echo "[INFO] OUTBOUND_PROXY=${PJSIP_OUTBOUND_PROXY}" || true
 [ -n "${PUBLIC_FQDN}" ] && echo "[INFO] PUBLIC_FQDN=${PUBLIC_FQDN}" || true
 
