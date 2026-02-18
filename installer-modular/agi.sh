@@ -1,5 +1,22 @@
-# ---- 8.7) AGI installieren (v1.3.6) ----
-AGI=/var/lib/asterisk/agi-bin/kfx_update_status.agi
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENVFILE="/etc/kienzlefax-installer.env"
+if [ -f "$ENVFILE" ]; then
+  # shellcheck disable=SC1090
+  source "$ENVFILE"
+fi
+
+backup_file_ts() {
+  local f="$1"
+  local stamp=".old.kienzlefax.$(date +%Y%m%d-%H%M%S)"
+  if [ -e "$f" ]; then
+    cp -a "$f" "${f}${stamp}" 2>/dev/null || true
+    echo "[INFO] backup: $f -> ${f}${stamp}"
+  fi
+}
+
+AGI="/var/lib/asterisk/agi-bin/kfx_update_status.agi"
 mkdir -p "$(dirname "$AGI")"
 backup_file_ts "$AGI" || true
 
@@ -448,3 +465,18 @@ if __name__ == "__main__":
         eprint(f"kfx_update_status.agi: fatal: {e}")
         sys.exit(0)
 PY
+
+chmod 0755 "$AGI"
+
+if id asterisk >/dev/null 2>&1; then
+  chown asterisk:asterisk "$AGI" 2>/dev/null || true
+else
+  chown root:root "$AGI" 2>/dev/null || true
+fi
+
+python3 -m py_compile "$AGI" >/dev/null 2>&1 || {
+  echo "ERROR: Python compile failed for $AGI" >&2
+  exit 1
+}
+
+echo "[OK] AGI installed: $AGI"
