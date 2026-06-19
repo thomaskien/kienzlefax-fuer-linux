@@ -3,6 +3,7 @@
 
 https://www.kienzlefax.de
 
+- NEU: nun mit installer!
 - läuft einfach in einer VM auf dem server
 - oder auf einem raspberry pi
 - alles open source und unter linux
