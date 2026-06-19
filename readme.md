@@ -4,10 +4,12 @@
 https://www.kienzlefax.de
 
 - läuft einfach in einer VM auf dem server
+- oder auf einem raspberry pi
 - alles open source und unter linux
 - angebunden per SIP direkt an die eigene nummer
 - optimal für den workflow von arztpraxen
 - stabiler empfang und senden
+- OCR auch für den scanner direkt integriert
 - voll anpassbar
 - papierfreies fax: ende der zettelwirtschaft
 - optimale lesbarkeit der wichtigen befunde da nicht z.B "mal wieder bei fast leerem toner ausgedruckt und anschließend gefaxt" wird
