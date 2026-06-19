@@ -12,6 +12,7 @@ fi
 PJSIP_USER="${PJSIP_USER:-${KFX_SIP_NUMBER:-}}"
 PJSIP_PASS="${PJSIP_PASS:-${KFX_SIP_PASSWORD:-}}"
 SIP_BIND_PORT="${SIP_BIND_PORT:-${PJSIP_PORT:-${PJSIP_BIND_PORT:-${KFX_SIP_BIND_PORT:-5070}}}}"
+PJSIP_EXPIRATION="${PJSIP_EXPIRATION:-${KFX_SIP_EXPIRATION:-300}}"
 
 # Optional:
 PJSIP_OUTBOUND_PROXY="${PJSIP_OUTBOUND_PROXY:-}"
@@ -36,6 +37,57 @@ if ! [[ "${SIP_BIND_PORT}" =~ ^[0-9]+$ ]]; then
   echo "ERROR: SIP_BIND_PORT ungültig: '${SIP_BIND_PORT}'" >&2
   exit 1
 fi
+if ! [[ "${PJSIP_EXPIRATION}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: PJSIP_EXPIRATION ungültig: '${PJSIP_EXPIRATION}'" >&2
+  exit 1
+fi
+
+ast_cfg_value() {
+  local s="${1-}"
+  s="${s//\\/\\\\}"
+  s="${s//;/\\;}"
+  printf '%s' "$s"
+}
+
+PJSIP_PASS_CFG="$(ast_cfg_value "$PJSIP_PASS")"
+
+wait_for_asterisk_cli() {
+  local timeout="${1:-60}"
+  local waited=0
+  command -v asterisk >/dev/null 2>&1 || return 1
+  while (( waited < timeout )); do
+    if asterisk -rx "core show version" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+registration_status() {
+  local out
+  out="$(asterisk -rx "pjsip show registrations" 2>/dev/null || true)"
+  awk '$1 == "1und1/sip:sip.1und1.de" {print $3; found=1} END {if (!found) print ""}' <<<"$out"
+}
+
+wait_for_registration() {
+  local timeout="${1:-30}"
+  local waited=0
+  local status=""
+  while (( waited < timeout )); do
+    status="$(registration_status)"
+    if [[ "$status" == "Registered" ]]; then
+      echo "[INFO] PJSIP registration status: Registered"
+      return 0
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  status="$(registration_status)"
+  echo "[WARN] PJSIP registration not registered after ${timeout}s (status=${status:-unknown})"
+  return 1
+}
 
 PJSIP="/etc/asterisk/pjsip.conf"
 cp -a "$PJSIP" "${PJSIP}.old.kienzlefax.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
@@ -90,7 +142,7 @@ client_uri=${PJSIP_CLIENT_URI}
 contact_user=${PJSIP_USER}
 retry_interval=60
 forbidden_retry_interval=600
-expiration=300
+expiration=${PJSIP_EXPIRATION}
 ${OUTBOUND_PROXY_LINE}
 
 
@@ -98,7 +150,7 @@ ${OUTBOUND_PROXY_LINE}
 type=auth
 auth_type=userpass
 username=${PJSIP_USER}
-password=${PJSIP_PASS}
+password=${PJSIP_PASS_CFG}
 
 [1und1-aor]
 type=aor
@@ -147,11 +199,29 @@ chown root:asterisk "$PJSIP" 2>/dev/null || true
 echo "[INFO] Wrote: $PJSIP"
 echo "[INFO] PJSIP_USER=${PJSIP_USER}"
 echo "[INFO] SIP_BIND_PORT=${SIP_BIND_PORT}"
+echo "[INFO] PJSIP_EXPIRATION=${PJSIP_EXPIRATION}"
 
 [ -n "${PJSIP_OUTBOUND_PROXY}" ] && echo "[INFO] OUTBOUND_PROXY=${PJSIP_OUTBOUND_PROXY}" || true
 [ -n "${PUBLIC_FQDN}" ] && echo "[INFO] PUBLIC_FQDN=${PUBLIC_FQDN}" || true
 
 echo "[INFO] Reloading PJSIP..."
 asterisk -rx "pjsip reload" || true
+asterisk -rx "pjsip send register 1und1" || true
+
+if ! wait_for_registration 30; then
+  status="$(registration_status)"
+  if [[ "$status" == "Rejected" || "$status" == "Unregistered" || -z "$status" ]]; then
+    echo "[WARN] Registration steckt in status=${status:-unknown}; starte Asterisk einmal neu und versuche erneut."
+    systemctl restart asterisk || service asterisk restart || true
+    if wait_for_asterisk_cli 90; then
+      asterisk -rx "pjsip send register 1und1" || true
+      wait_for_registration 45 || true
+    else
+      echo "[WARN] Asterisk CLI nach Restart nicht bereit; Registrierung kann nicht erneut geprüft werden."
+    fi
+  fi
+fi
+
 asterisk -rx "pjsip show transports" || true
 asterisk -rx "pjsip show registrations" || true
+asterisk -rx "pjsip show registration 1und1" || true

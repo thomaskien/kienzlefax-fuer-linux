@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.1"
+VERSION="1.2"
 
 log(){ echo "[$(date -Is)] scan-ocr-install: $*"; }
 
@@ -121,13 +121,13 @@ cat >"$WATCH" <<'WATCH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.1"
+VERSION="1.2"
 IN_DIR="${SCAN_OCR_IN_DIR:-/srv/scan/eingang}"
 OUT_DIR="${SCAN_OCR_OUT_DIR:-/srv/scan/ocr}"
 ARCH_DIR="${SCAN_OCR_ARCH_DIR:-/srv/scan/archiv}"
 ERR_DIR="${SCAN_OCR_ERR_DIR:-/srv/scan/fehler}"
 WORK_BASE="${SCAN_OCR_WORK_DIR:-/var/tmp/scan-ocr}"
-OUTPUT_SUFFIX="${SCAN_OCR_OUTPUT_SUFFIX:-_OCR}"
+OUTPUT_SUFFIX="${SCAN_OCR_OUTPUT_SUFFIX-_OCR}"
 LANGS="${SCAN_OCR_LANG:-deu+eng}"
 JOBS="${SCAN_OCR_JOBS:-2}"
 STABLE_WAIT_SEC="${SCAN_OCR_STABLE_WAIT_SEC:-2}"
@@ -137,8 +137,13 @@ EMBED_JSON="${SCAN_OCR_EMBED_JSON:-/usr/local/bin/embed-json-in-pdf.py}"
 log(){ echo "[$(date -Is)] scan-ocr: $*"; }
 
 safe_mkdirs(){
-  mkdir -p "$IN_DIR" "$OUT_DIR" "$ARCH_DIR" "$ERR_DIR" "$WORK_BASE"
-  chmod 0777 "$IN_DIR" "$OUT_DIR" "$ARCH_DIR" "$ERR_DIR" "$WORK_BASE" || true
+  mkdir -p "$IN_DIR" "$ARCH_DIR" "$ERR_DIR" "$WORK_BASE"
+  mkdir -p "$OUT_DIR" 2>/dev/null || true
+  chmod 0777 "$IN_DIR" "$ARCH_DIR" "$ERR_DIR" "$WORK_BASE" || true
+  chmod 0777 "$OUT_DIR" 2>/dev/null || true
+  if [[ ! -w "$OUT_DIR" ]]; then
+    log "WARN: Ausgabeverzeichnis ist nicht schreibbar: $OUT_DIR"
+  fi
 }
 
 lower_ext(){

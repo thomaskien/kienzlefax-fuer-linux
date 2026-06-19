@@ -1017,7 +1017,7 @@ def step_submit() -> None:
 def main() -> None:
     ensure_dirs()
     acquire_lock()
-    log("started (v1.3.10)")
+    log("started (v1.3.11)")
     try:
         while True:
             step_cancel_processing()
