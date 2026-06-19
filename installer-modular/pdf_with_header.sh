@@ -11,7 +11,7 @@ set -euo pipefail
 #   Right: "Seite X/Y"
 #
 # Customize via env:
-#   PRACTICE_NAME="Praxis Dr. Thomas Mustermann"
+#   PRACTICE_NAME="Praxis Dr. Beispiel"
 #   DATE_FMT="%d.%m.%Y %H:%M"
 #   TOP_OFFSET_MM="6"     # distance from top edge to text baseline (smaller => higher)
 #   FONT_NAME="Helvetica"
@@ -32,7 +32,7 @@ if [[ ! -f "$IN" ]]; then
   exit 2
 fi
 
-PRACTICE_NAME="${PRACTICE_NAME:-Praxis Dr. Thomas Mustermann - Tel: 0123/4567 Fax: 0123/4568}"
+PRACTICE_NAME="${PRACTICE_NAME:-KienzleFax}"
 DATE_FMT="${DATE_FMT:-%d.%m.%Y %H:%M}"
 
 TOP_OFFSET_MM="${TOP_OFFSET_MM:-6}"

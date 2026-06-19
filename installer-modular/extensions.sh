@@ -92,6 +92,8 @@ exten => _0X.,1,NoOp(FAX OUT national | jobid=${KFX_JOBID} file=${KFX_FILE})
 exten => s,1,NoOp(kfx_sendfax | jobid=${ARG1} file=${ARG2} chan=${CHANNEL(name)})
  same => n,Set(CHANNEL(accountcode)=${ARG1})
  same => n,Set(CDR(userfield)=kfx:${ARG1})
+ same => n,Set(AGISIGHUP=no)
+ same => n,Set(AGIEXITONHANGUP=no)
  same => n,Set(CHANNEL(hangup_handler_push)=kfx_sendfax_hangup,s,1(${ARG1}))
  same => n,AGI(kfx_update_status.agi,${ARG1},send_start)
  same => n,TryExec(SendFAX(${ARG2}))
@@ -101,6 +103,8 @@ exten => s,1,NoOp(kfx_sendfax | jobid=${ARG1} file=${ARG2} chan=${CHANNEL(name)}
 
 [kfx_sendfax_hangup]
 exten => s,1,NoOp(kfx_sendfax_hangup | jobid=${ARG1} chan=${CHANNEL(name)} FAXSTATUS=${FAXSTATUS} FAXERROR=${FAXERROR} FAXPAGES=${FAXPAGES} FAXBITRATE=${FAXBITRATE} FAXECM=${FAXECM} DIALSTATUS=${DIALSTATUS} HANGUPCAUSE=${HANGUPCAUSE})
+ same => n,Set(AGISIGHUP=no)
+ same => n,Set(AGIEXITONHANGUP=no)
  same => n,AGI(kfx_update_status.agi,${ARG1},send_end,${FAXSTATUS},${FAXERROR},${FAXPAGES},${FAXBITRATE},${FAXECM},${DIALSTATUS},${HANGUPCAUSE})
  same => n,Return()
 
@@ -124,7 +128,9 @@ exten => __KFX_FAX_DID__,1,NoOp(Inbound Fax)
 
  same => n,Set(FAXBASE=${FAXSTAMP}_${FROM}_${UID})
  same => n,Set(TIFF=/var/spool/asterisk/fax1/${FAXBASE}.tif)
- same => n,Set(PDF=/var/spool/asterisk/fax/${FAXBASE}.pdf)
+ same => n,Set(PDF=/srv/scan/fax-eingang/${FAXBASE}.pdf)
+ same => n,System(mkdir -p /srv/scan/fax-eingang)
+ same => n,System(chmod 0777 /srv/scan/fax-eingang)
 
  same => n,ReceiveFAX(${TIFF})
  same => n,NoOp(FAXSTATUS=${FAXSTATUS} FAXERROR=${FAXERROR} PAGES=${FAXPAGES})
@@ -136,7 +142,8 @@ exten => __KFX_FAX_DID__,1,NoOp(Inbound Fax)
  same => n(to_pdf),System(tiff2pdf -o ${PDF} ${TIFF})
  same => n,GotoIf($["${SYSTEMSTATUS}"="SUCCESS"]?cleanup:keep_tiff)
 
- same => n(cleanup),System(rm -f ${TIFF})
+ same => n(cleanup),System(chmod 0666 ${PDF})
+ same => n,System(rm -f ${TIFF})
  same => n,Hangup()
 
  same => n(keep_tiff),NoOp(PDF failed or partial - keeping TIFF: ${TIFF})

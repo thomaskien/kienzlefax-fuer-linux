@@ -2,14 +2,15 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.2.1
-# Stand:   2026-02-18
+# Version: 3.2.8
+# Stand:   2026-06-19
 # Autor:   Dr. Thomas Kienzle
 #
 # Modularer Installer (alles gehört dazu; Provider-spezifisch später).
 # - Fragt interaktiv:
 #   * Optionen neu setzen? (ENV wiederverwenden möglich)
 #   * Hostname setzen (Maschine + Zertifikat CN+SAN)
+#   * Praxis-Kopfzeile fuer gesendete PDFs/Faxe
 #   * admin existiert? neu generieren? (Default: N)
 #   * Asterisk erkannt? nochmal kompilieren? (Default: N)
 #   * Remote-Module JEWEILS EINZELN: holen/aktualisieren? (Default: y wenn fehlt, sonst n)
@@ -18,12 +19,38 @@
 # - Fix: INI-Patching via Python (kein awk/mawk Problem)
 # - Webroot: kienzlefax.php + index redirect + self-signed SSL 50y
 # - Remote Module:
-#     extensions.sh, pjsip-1und1.sh, worker.sh, agi.sh, pdf_with_header.sh
+#     extensions.sh, pjsip-1und1.sh, worker.sh, agi.sh, pdf_with_header.sh, scan_ocr.sh
 #
 # NEU in 3.2.1 (konservativ):
 # - /etc/default/kienzlefax-worker wird angelegt (KFX_AMI_PASS NICHT interaktiv; kommt aus ENV/Default).
 # - systemd Unit exakt wie gewünscht: /etc/systemd/system/kienzlefax-worker.service (EnvironmentFile=...).
 # - kienzlefax.php wird optional neu geladen (Abfrage).
+#
+# NEU in 3.2.2 (konservativ):
+# - Nach Asterisk-Start wird auf die CLI/den Control-Socket gewartet, bevor AMI/PJSIP/Dialplan-Reloads laufen.
+#
+# NEU in 3.2.3 (konservativ):
+# - CUPS-Freigabe fuer Bonjour/DNS-SD wird global aktiviert und Avahi explizit gestartet.
+# - CUPS bleibt fuer Bonjour-Anzeigen aktiv (IdleExitTimeout=0).
+#
+# NEU in 3.2.4 (konservativ):
+# - incoming/fax1..fax5 werden explizit fuer den CUPS-Backend schreibbar gemacht.
+# - CUPS-Queues nutzen wieder generic.ppd, falls vorhanden; raw bleibt nur Fallback.
+# - Vom CUPS-Backend erzeugte PDFs werden fuer die Web-UI lesbar abgelegt.
+#
+# NEU in 3.2.5 (konservativ):
+# - CUPS-Backend erzwingt A4-PDF-Ausgabe; Queues setzen media und PageSize auf A4.
+#
+# NEU in 3.2.6 (konservativ):
+# - Praxis-Kopfzeile fuer pdf_with_header.sh wird im Installer abgefragt und an den Worker durchgereicht.
+#
+# NEU in 3.2.7 (konservativ):
+# - Scan-OCR Pipeline mit Shares scan-to-ocr und scan-eingang.
+# - Empfangene Fax-PDFs werden zusaetzlich in die OCR-Pipeline kopiert.
+#
+# NEU in 3.2.8 (konservativ):
+# - Empfangene Faxe erscheinen erst nach OCR/Fallback im bestehenden Share fax-eingang.
+# - Zweiter Watcher scan-ocr-fax.service verarbeitet /srv/scan/fax-eingang -> /var/spool/asterisk/fax.
 # ==============================================================================
 
 set -euo pipefail
@@ -36,6 +63,7 @@ URL_PJSIP_1UND1="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-li
 URL_WORKER="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/worker.sh"
 URL_AGI="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/agi.sh"
 URL_PDF_WITH_HEADER="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/pdf_with_header.sh"
+URL_SCAN_OCR="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/scan_ocr.sh"
 
 # Web bootstrap
 WEBROOT="/var/www/html"
@@ -164,6 +192,36 @@ run_remote_script(){
   )
 }
 
+wait_for_asterisk_cli(){
+  local timeout="${1:-60}"
+  local waited=0
+  command -v asterisk >/dev/null 2>&1 || return 1
+  while (( waited < timeout )); do
+    if asterisk -rx "core show version" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+require_asterisk_cli(){
+  local timeout="${1:-60}"
+  log "[WAIT] Warte auf Asterisk CLI/Control-Socket (max ${timeout}s)..."
+  wait_for_asterisk_cli "$timeout" || die "Asterisk CLI ist nach ${timeout}s nicht bereit."
+  log "[OK ] Asterisk CLI bereit."
+}
+
+asterisk_rx(){
+  local cmd="$1"
+  if wait_for_asterisk_cli 30; then
+    asterisk -rx "$cmd" || true
+  else
+    log "[WARN] Asterisk CLI nicht bereit; überspringe: ${cmd}"
+  fi
+}
+
 # ------------------------------------------------------------------------------
 # Local modules
 # ------------------------------------------------------------------------------
@@ -206,6 +264,15 @@ ask_default(){
 }
 
 sanitize_digits(){ echo "$1" | tr -cd '0-9'; }
+
+quote_env_value(){
+  local s="${1-}"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//\$/\\$}"
+  s="${s//\`/\\\`}"
+  printf '"%s"' "$s"
+}
 
 backup_file_ts(){
   local f="$1"
@@ -268,6 +335,10 @@ FAX_DID="$(sanitize_digits "${FAX_DID_IN:-$SIP_NUMBER}")"
 [[ -n "${FAX_DID}" ]] || die "FAX_DID darf nicht leer sein."
 unset FAX_DID_IN
 
+ask_default KFX_PRACTICE_NAME "Praxis-Kopfzeile fuer ausgehende Faxe" "KienzleFax"
+KFX_PRACTICE_NAME_ENV="$(quote_env_value "$KFX_PRACTICE_NAME")"
+KFX_CALLERID_NAME_ENV="$(quote_env_value "Fax")"
+
 # AMI Secret NICHT interaktiv (lokal). Konfigurierbar via DEFAULT_AMI_SECRET oder später in ENVFILE.
 AMI_SECRET="${DEFAULT_AMI_SECRET}"
 
@@ -296,7 +367,10 @@ KFX_RTP_END=${RTP_END}
 KFX_AST_REF=${AST_REF}
 
 # defaults used by dialplan module
-KFX_CALLERID_NAME=Fax
+KFX_CALLERID_NAME=${KFX_CALLERID_NAME_ENV}
+
+# PDF header used by /usr/local/bin/pdf_with_header.sh
+KFX_PRACTICE_NAME=${KFX_PRACTICE_NAME_ENV}
 EENV
 chmod 0600 "$ENVFILE"
 
@@ -324,6 +398,8 @@ apt-get install -y --no-install-recommends \
   apache2 libapache2-mod-php \
   php php-cli php-sqlite3 php-mbstring sqlite3 \
   qpdf ghostscript poppler-utils libtiff-tools \
+  ocrmypdf tesseract-ocr tesseract-ocr-deu tesseract-ocr-eng \
+  inotify-tools img2pdf python3-pikepdf unpaper \
   cups cups-client \
   avahi-daemon avahi-utils \
   samba smbclient sudo \
@@ -374,6 +450,7 @@ touch "${KZ_BASE}/phonebook.sqlite"
 mkdir -p "${SPOOL_TIFF_DIR}" "${SPOOL_PDF_DIR}"
 chmod 0777 "${SPOOL_TIFF_DIR}" "${SPOOL_PDF_DIR}" || true
 chmod 0777 "${KZ_BASE}" "${KZ_BASE}"/* || true
+for i in 1 2 3 4 5; do chmod 0777 "${KZ_BASE}/incoming/fax${i}" || true; done
 chmod 0777 "${KZ_BASE}/sendefehler" "${KZ_BASE}/sendefehler"/* || true
 
 log "[OK] Verzeichnisse/Rechte erstellt."
@@ -583,7 +660,7 @@ log "[OK] Web+SSL: https://${KFX_HOSTNAME}/"
 EOF
   chmod +x "${MOD_DIR}/40-web-ssl.sh"
 
-  # 50-cups-samba (unverändert)
+  # 50-cups-samba (Bonjour/DNS-SD Freigabe)
   cat >"${MOD_DIR}/50-cups-samba.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -598,6 +675,10 @@ sep "CUPS Backend + fax1..fax5 + Samba Shares"
 if systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' | grep -qx "cups-browsed.service"; then
   systemctl stop cups-browsed || true
   systemctl disable cups-browsed || true
+fi
+
+if systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' | grep -qx "avahi-daemon.service"; then
+  systemctl enable --now avahi-daemon || true
 fi
 
 BACKEND="/usr/lib/cups/backend/kienzlefaxpdf"
@@ -663,7 +744,9 @@ tmp_pdf="$($MKTEMP --tmpdir="$TMPBASE" "kienzlefaxpdf.${JOBID}.XXXXXX.pdf" 2>/de
 [[ -n "$tmp_pdf" ]] || { log "ERROR: mktemp pdf failed"; [[ -n "$tmp_in" ]] && rm -f "$tmp_in"; exit 1; }
 
 export TMPDIR="$TMPBASE"
-if ! $TIMEOUT 60s $GS -q -dSAFER -dBATCH -dNOPAUSE -sDEVICE=pdfwrite -sOutputFile="$tmp_pdf" "$infile" >>"$LOG" 2>&1; then
+if ! $TIMEOUT 60s $GS -q -dSAFER -dBATCH -dNOPAUSE \
+  -sDEVICE=pdfwrite -sPAPERSIZE=a4 -dFIXEDMEDIA -dPDFFitPage \
+  -sOutputFile="$tmp_pdf" "$infile" >>"$LOG" 2>&1; then
   rc=$?
   log "ERROR: gs failed rc=$rc"
   rm -f "$tmp_pdf"
@@ -672,7 +755,7 @@ if ! $TIMEOUT 60s $GS -q -dSAFER -dBATCH -dNOPAUSE -sDEVICE=pdfwrite -sOutputFil
 fi
 
 $MV -f "$tmp_pdf" "$out" || { log "ERROR: mv failed"; rm -f "$tmp_pdf"; [[ -n "$tmp_in" ]] && rm -f "$tmp_in"; exit 1; }
-$CHMOD 0664 "$out" || true
+$CHMOD 0666 "$out" || true
 [[ -n "$tmp_in" ]] && rm -f "$tmp_in" || true
 log "OK wrote '$out'"
 exit 0
@@ -685,18 +768,47 @@ touch "$BACKEND_LOG"
 chown lp:lp "$BACKEND_LOG" || true
 chmod 0664 "$BACKEND_LOG"
 
+for i in 1 2 3 4 5; do
+  mkdir -p "${KZ_BASE}/incoming/fax${i}"
+  chmod 0777 "${KZ_BASE}/incoming/fax${i}" || true
+done
+
 systemctl enable --now cups || true
 systemctl restart cups || true
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  lpstat -r >/dev/null 2>&1 && break
+  sleep 1
+done
+
+if ! cupsctl --share-printers; then
+  log "[WARN] CUPS-Druckerfreigabe konnte nicht global aktiviert werden."
+fi
+if ! cupsctl Browsing=Yes BrowseLocalProtocols=dnssd BrowseDNSSDSubTypes=_cups,_print DefaultShared=Yes IdleExitTimeout=0; then
+  log "[WARN] CUPS-Bonjour-Optionen konnten nicht vollstaendig gesetzt werden."
+fi
+
+MODEL="drv:///sample.drv/generic.ppd"
+if ! lpinfo -m 2>/dev/null | awk '{print $1}' | grep -qx "$MODEL"; then
+  MODEL="raw"
+  log "[WARN] CUPS generic.ppd nicht gefunden; verwende raw als Fallback."
+fi
 
 for i in 1 2 3 4 5; do lpadmin -x "fax$i" 2>/dev/null || true; done
 for i in 1 2 3 4 5; do
   PRN="fax$i"
-  lpadmin -p "$PRN" -E -v "kienzlefaxpdf:/$PRN" -m raw
+  lpadmin -p "$PRN" -E -v "kienzlefaxpdf:/$PRN" -m "$MODEL"
   lpadmin -p "$PRN" -o printer-is-shared=true
   lpadmin -p "$PRN" -o media=A4
+  lpadmin -p "$PRN" -o PageSize=A4
   cupsenable "$PRN"
   cupsaccept "$PRN"
 done
+
+cupsctl --share-printers || true
+systemctl restart cups || true
+if systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' | grep -qx "avahi-daemon.service"; then
+  systemctl restart avahi-daemon || true
+fi
 
 mkdir -p "$SPOOL_PDF_DIR"
 chmod 0777 "$SPOOL_PDF_DIR" || true
@@ -792,6 +904,20 @@ die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "[$(date -Is)] $*"; }
 sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
 
+wait_for_asterisk_cli(){
+  local timeout="${1:-90}"
+  local waited=0
+  command -v asterisk >/dev/null 2>&1 || return 1
+  while (( waited < timeout )); do
+    if asterisk -rx "core show version" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
 ENVFILE="/etc/kienzlefax-installer.env"
 [[ -f "$ENVFILE" ]] || die "ENV fehlt: $ENVFILE"
 # shellcheck disable=SC1090
@@ -833,6 +959,7 @@ make config  || true
 ldconfig
 
 systemctl enable --now asterisk
+wait_for_asterisk_cli 90 || die "Asterisk wurde gestartet, aber die CLI/der Control-Socket ist nicht bereit."
 log "[OK] Asterisk installiert/gestartet."
 EOF
   chmod +x "${MOD_DIR}/60-asterisk-build.sh"
@@ -844,6 +971,20 @@ set -euo pipefail
 die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "[$(date -Is)] $*"; }
 sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
+
+wait_for_asterisk_cli(){
+  local timeout="${1:-60}"
+  local waited=0
+  command -v asterisk >/dev/null 2>&1 || return 1
+  while (( waited < timeout )); do
+    if asterisk -rx "core show version" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
 
 ENVFILE="/etc/kienzlefax-installer.env"
 [[ -f "$ENVFILE" ]] || die "ENV fehlt: $ENVFILE"
@@ -925,9 +1066,13 @@ EOFCONF
 chmod 0644 /etc/asterisk/manager.d/kfx.conf
 chown root:root /etc/asterisk/manager.d/kfx.conf
 
-asterisk -rx "manager reload" || true
-asterisk -rx "manager show settings" | sed -n '1,200p' || true
-asterisk -rx "manager show user kfx" || true
+if wait_for_asterisk_cli 60; then
+  asterisk -rx "manager reload" || true
+  asterisk -rx "manager show settings" | sed -n '1,200p' || true
+  asterisk -rx "manager show user kfx" || true
+else
+  log "[WARN] Asterisk CLI nicht bereit; Manager-Reload/Checks übersprungen."
+fi
 
 log "[OK] RTP+AMI konfiguriert."
 EOF
@@ -949,6 +1094,17 @@ source "$ENVFILE"
 sep "Worker: /etc/default + systemd Unit (EnvironmentFile)"
 install -d /etc/default
 
+quote_env_value(){
+  local s="${1-}"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//\$/\\$}"
+  s="${s//\`/\\\`}"
+  printf '"%s"' "$s"
+}
+
+PRACTICE_NAME_ENV="$(quote_env_value "${KFX_PRACTICE_NAME:-KienzleFax}")"
+
 cat >/etc/default/kienzlefax-worker <<EOFENV
 # kienzlefax-worker env
 KFX_BASE=/srv/kienzlefax
@@ -959,6 +1115,7 @@ KFX_AMI_USER=kfx
 KFX_AMI_PASS=${KFX_AMI_SECRET}
 
 KFX_DIAL_CONTEXT=fax-out
+PRACTICE_NAME=${PRACTICE_NAME_ENV}
 
 # optional tuning
 KFX_MAX_INFLIGHT=2
@@ -1011,6 +1168,7 @@ maybe_fetch_one "pjsip-1und1.sh"     "$URL_PJSIP_1UND1"     "${MOD_CACHE}/pjsip-
 maybe_fetch_one "worker.sh"          "$URL_WORKER"          "${MOD_CACHE}/worker.sh"
 maybe_fetch_one "agi.sh"             "$URL_AGI"             "${MOD_CACHE}/agi.sh"
 maybe_fetch_one "pdf_with_header.sh" "$URL_PDF_WITH_HEADER" "${MOD_CACHE}/pdf_with_header.sh"
+maybe_fetch_one "scan_ocr.sh"        "$URL_SCAN_OCR"        "${MOD_CACHE}/scan_ocr.sh"
 
 sep "Module ausführen (feste Reihenfolge)"
 run_module "${MOD_DIR}/00-base.sh"
@@ -1019,6 +1177,9 @@ run_module "${MOD_DIR}/20-dirs-acl.sh"
 run_module "${MOD_DIR}/30-admin-user.sh"
 run_module "${MOD_DIR}/40-web-ssl.sh"
 run_module "${MOD_DIR}/50-cups-samba.sh"
+
+sep "Remote Scan-OCR installieren"
+run_remote_script "${MOD_CACHE}/scan_ocr.sh"
 
 # Asterisk build decision
 ASTERISK_DETECTED="n"
@@ -1036,6 +1197,7 @@ else
   systemctl enable --now asterisk || true
 fi
 
+require_asterisk_cli 90
 run_module "${MOD_DIR}/70-rtp-ami.sh"
 
 # Load ENV
@@ -1072,11 +1234,11 @@ export AMI_SECRET="${AMI_SECRET:-$KFX_AMI_PASS}"
 # ------------------------------------------------------------------------------
 sep "Remote Provider-PJSIP (befüllt pjsip.conf)"
 run_remote_script "${MOD_CACHE}/pjsip-1und1.sh"
-asterisk -rx "pjsip reload" || true
+asterisk_rx "pjsip reload"
 
 sep "Remote Dialplan (befüllt extensions.conf)"
 run_remote_script "${MOD_CACHE}/extensions.sh"
-asterisk -rx "dialplan reload" || true
+asterisk_rx "dialplan reload"
 
 sep "Remote AGI installieren"
 run_remote_script "${MOD_CACHE}/agi.sh"
@@ -1091,13 +1253,15 @@ sep "Remote pdf_with_header.sh installieren"
 run_remote_script "${MOD_CACHE}/pdf_with_header.sh"
 
 sep "Reloads + Status"
-asterisk -rx "core reload" || true
-asterisk -rx "pjsip reload" || true
-asterisk -rx "dialplan reload" || true
+asterisk_rx "core reload"
+asterisk_rx "pjsip reload"
+asterisk_rx "dialplan reload"
 
 systemctl status apache2 --no-pager -l || true
 systemctl status cups --no-pager -l || true
 systemctl status smbd --no-pager -l || true
+systemctl status scan-ocr --no-pager -l || true
+systemctl status scan-ocr-fax --no-pager -l || true
 systemctl status asterisk --no-pager -l || true
 systemctl status kienzlefax-worker --no-pager -l || true
 

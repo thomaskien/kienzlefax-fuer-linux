@@ -3,8 +3,8 @@ sudo tee /usr/local/bin/kienzlefax-worker.py >/dev/null <<'PY'
 # -*- coding: utf-8 -*-
 """
 kienzlefax-worker.py — Asterisk-Only Worker (SendFAX)
-Version: 1.3.6
-Stand:  2026-02-18
+Version: 1.3.11
+Stand:  2026-06-19
 Autor:  Dr. Thomas Kienzle
 
 Changelog (komplett):
@@ -39,6 +39,24 @@ Changelog (komplett):
     - AMI Originate Wait-Sekunden parametrisierbar (Default 3600; schützt vor "Wait(1)" Regression).
     - Cancel-Handling: "aktiv" umfasst jetzt auch SUBMITTED/PROCESSING (Status-Timing ist nicht immer deterministisch).
     - Retry-Log zeigt next_attempt zur besseren Nachvollziehbarkeit (keine Verhaltensänderung).
+- 1.3.7:
+  - Fallback für Jobs, die nach send_start in SENDING hängen bleiben:
+    Wenn kein Asterisk-Kanal zum Job mehr aktiv ist und kein send_end geschrieben wurde,
+    wird der Job nach Timeout konservativ als RETRY weitergeführt statt dauerhaft in processing zu bleiben.
+- 1.3.8:
+  - Cancel-Fix für verwaiste aktive Jobs:
+    Wenn cancel.requested gesetzt ist, aber kein Asterisk-Kanal zum Job mehr existiert,
+    wird der Job sofort als CANCELLED finalisiert statt im processing zu bleiben.
+- 1.3.9:
+  - Sicherheitsfix gegen Doppelversand:
+    Verwaiste SENDING-Jobs mit ANSWER werden NICHT automatisch erneut gesendet,
+    sondern terminal als FAILED/UNKNOWN_SENT_NO_SEND_END markiert.
+- 1.3.10:
+  - Finalizer behandelt CANCELLED als terminalen Status und räumt den Job aus processing.
+- 1.3.11:
+  - Verwaiste SENDING-Jobs mit DIALSTATUS=ANSWER und normalem Hangup werden als
+    OK_ASSUMED_NO_SEND_END archiviert statt als Fehler, weil die Praxis zeigt:
+    Fax ist versendet, nur send_end fehlt. Kein Retry, kein Doppelversand.
 """
 
 import fcntl
@@ -50,7 +68,7 @@ import socket
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
 
@@ -74,6 +92,7 @@ PDF_HEADER_SCRIPT = Path(os.environ.get("KFX_PDF_HEADER_SCRIPT", "/usr/local/bin
 MAX_INFLIGHT_PROCESSING = int(os.environ.get("KFX_MAX_INFLIGHT", "1"))
 POLL_INTERVAL_SEC = float(os.environ.get("KFX_POLL_INTERVAL_SEC", "1.0"))
 POST_CALL_COOLDOWN_SEC = float(os.environ.get("KFX_POST_CALL_COOLDOWN_SEC", "20.0"))
+ORPHAN_CALL_TIMEOUT_SEC = float(os.environ.get("KFX_ORPHAN_CALL_TIMEOUT_SEC", "120.0"))
 
 # wichtig: Default 3600 wie im funktionierenden System
 AMI_ORIGINATE_WAIT_SEC = int(os.environ.get("KFX_AMI_ORIGINATE_WAIT_SEC", "3600"))
@@ -88,6 +107,15 @@ _next_submit_ts: float = 0.0
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+def parse_iso_ts(value: Any) -> Optional[datetime]:
+    s = str(value or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
 
 def log(msg: str) -> None:
     ts = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -668,6 +696,100 @@ def requeue_retry(jobdir: Path, job: Dict[str, Any]) -> None:
     except Exception as e:
         log(f"retry move back to queue failed for {jobdir.name}: {e}")
 
+def mark_orphaned_call_for_retry(jdir: Path, job: Dict[str, Any]) -> bool:
+    st = _st_norm(job)
+    if st not in ("CALLING", "SENDING"):
+        return False
+
+    if job.get("end_time") or job.get("finalized_at"):
+        return False
+
+    started = parse_iso_ts(job.get("updated_at") or job.get("submitted_at") or job.get("started_at"))
+    if not started:
+        return False
+
+    age = (datetime.now(timezone.utc) - started).total_seconds()
+    if age < ORPHAN_CALL_TIMEOUT_SEC:
+        return False
+
+    jobid = str(job.get("job_id") or jdir.name)
+    chans = _find_channels_for_job(jobid)
+    if chans:
+        return False
+
+    res = job.setdefault("result", {})
+    dial = str(res.get("dialstatus") or "").strip().upper()
+    hcause = str(res.get("hangupcause") or "").strip()
+    if dial == "ANSWER" and hcause in ("", "0", "16"):
+        reason = "OK_ASSUMED_NO_SEND_END"
+        job["status"] = "OK"
+        res["reason"] = reason
+        res["faxstatus"] = res.get("faxstatus") or "ASSUMED_SUCCESS"
+        res["orphaned_call"] = True
+        res["orphaned_call_age_sec"] = int(age)
+        res["assumed_success"] = True
+        res["note"] = "send_start und DIALSTATUS=ANSWER wurden erreicht, aber send_end fehlt; als erfolgreich archiviert, kein Retry"
+
+        a = job.setdefault("attempt", {})
+        a["ended_at"] = now_iso()
+        a["last_reason"] = reason
+
+        job["end_time"] = now_iso()
+        job["finalized_at"] = job.get("finalized_at") or job["end_time"]
+        job["updated_at"] = job["end_time"]
+        write_json(jdir / "job.json", job)
+        log(f"orphaned sending job assumed OK jobid={jobid} dial={dial or 'n/a'} hcause={hcause or 'n/a'} age={int(age)}s")
+        return True
+
+    if st == "SENDING" or dial == "ANSWER":
+        reason = "UNKNOWN_SENT_NO_SEND_END"
+        job["status"] = "FAILED"
+        res["reason"] = reason
+        res["orphaned_call"] = True
+        res["orphaned_call_age_sec"] = int(age)
+        res["note"] = "send_start wurde erreicht, aber send_end fehlt; kein Retry, um Doppelversand zu vermeiden"
+
+        a = job.setdefault("attempt", {})
+        a["ended_at"] = now_iso()
+        a["last_reason"] = reason
+
+        job["end_time"] = now_iso()
+        job["finalized_at"] = job.get("finalized_at") or job["end_time"]
+        job["updated_at"] = job["end_time"]
+        write_json(jdir / "job.json", job)
+        log(f"orphaned sending job finalized without retry jobid={jobid} dial={dial or 'n/a'} hcause={hcause or 'n/a'} age={int(age)}s")
+        return True
+
+    if dial in ("BUSY", "NOANSWER", "CONGESTION", "CHANUNAVAIL"):
+        reason = dial
+        delay = 20 if dial in ("CONGESTION", "CHANUNAVAIL") else 90
+        max_attempts = 30 if dial in ("CONGESTION", "CHANUNAVAIL") else (15 if dial == "BUSY" else 3)
+    else:
+        reason = "CHANUNAVAIL"
+        delay = 20
+        max_attempts = 30
+
+    job["status"] = "RETRY"
+    res["reason"] = res.get("reason") or f"{reason}_NO_SEND_END"
+    res["orphaned_call"] = True
+    res["orphaned_call_age_sec"] = int(age)
+
+    r = job.setdefault("retry", {})
+    r["max"] = max_attempts
+    r["last_reason"] = reason
+    r["suggested_delay_sec"] = delay
+    r["next_try_at"] = (datetime.now(timezone.utc) + timedelta(seconds=delay)).replace(microsecond=0).isoformat()
+
+    a = job.setdefault("attempt", {})
+    a["ended_at"] = now_iso()
+    a["last_reason"] = reason
+    a["max"] = max_attempts
+
+    job["updated_at"] = now_iso()
+    write_json(jdir / "job.json", job)
+    log(f"orphaned call recovered jobid={jobid} status={st} dial={dial or 'n/a'} reason={reason} age={int(age)}s")
+    return True
+
 def _job_is_active_calling(job: Dict[str, Any]) -> bool:
     # konservativ: Status-Timing kann variieren; Cancel soll trotzdem greifen
     st = str(job.get("status") or "").strip().lower()
@@ -753,7 +875,16 @@ def step_cancel_processing() -> None:
                 if not done:
                     log(f"cancel: no hangup success jobid={jobid} chans={chans}")
             else:
-                log(f"cancel: no channels found jobid={jobid} (will rely on timeout/orphan)")
+                log(f"cancel: no channels found jobid={jobid}; finalizing CANCELLED")
+                job["status"] = "CANCELLED"
+                job.setdefault("result", {})["reason"] = "cancelled"
+                job.setdefault("cancel", {})
+                job["cancel"]["handled_at"] = now_iso()
+                job["end_time"] = now_iso()
+                job["finalized_at"] = job.get("finalized_at") or job["end_time"]
+                job["updated_at"] = job["end_time"]
+                write_json(jp, job)
+                continue
 
             job.setdefault("cancel", {})
             job["cancel"]["handled_at"] = now_iso()
@@ -784,6 +915,10 @@ def step_finalize_processing() -> None:
 
         st = _st_norm(job)
 
+        if mark_orphaned_call_for_retry(jdir, job):
+            _next_submit_ts = time.time() + POST_CALL_COOLDOWN_SEC
+            continue
+
         if st == "OK":
             try:
                 if not job.get("finalized_at"):
@@ -797,7 +932,7 @@ def step_finalize_processing() -> None:
             _next_submit_ts = time.time() + POST_CALL_COOLDOWN_SEC
             continue
 
-        if st == "FAILED":
+        if st in ("FAILED", "CANCELLED"):
             try:
                 if not job.get("finalized_at"):
                     job["finalized_at"] = now_iso()
@@ -882,7 +1017,7 @@ def step_submit() -> None:
 def main() -> None:
     ensure_dirs()
     acquire_lock()
-    log("started (v1.3.6)")
+    log("started (v1.3.10)")
     try:
         while True:
             step_cancel_processing()
@@ -901,7 +1036,3 @@ if __name__ == "__main__":
 PY
 
 chmod +x /usr/local/bin/kienzlefax-worker.py
-
-
-
-
