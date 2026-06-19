@@ -330,7 +330,7 @@
 
 <div class="cta">
   <a class="primary" href="https://github.com/thomaskien/kienzlefax-fuer-linux">GitHub</a>
-  <a href="https://github.com/thomaskien/kienzlefax-fuer-linux#readme">Dokumentation</a>
+  <a href="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/main/kienzlefax-installer.sh">Installer</a>
 </div>
 
 <div class="infobox">
@@ -340,21 +340,34 @@
 <section class="install">
   <header>▶ Installation</header>
 
-  <pre>Repository &amp; Dokumentation:
+  <pre>Repository:
 <a href="https://github.com/thomaskien/kienzlefax-fuer-linux">https://github.com/thomaskien/kienzlefax-fuer-linux</a>
 
-kienzlefax basiert auf Asterisk.
-Installation und Konfiguration erfolgen gemäß README (Schritt für Schritt).</pre>
+Installer herunterladen und starten:
+
+curl -fsSL \
+  https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/main/kienzlefax-installer.sh \
+  -o kienzlefax-installer.sh
+
+chmod +x kienzlefax-installer.sh
+sudo ./kienzlefax-installer.sh</pre>
 
   <div class="req">
     <b>Voraussetzungen</b>
     <ul>
       <li><b>Läuft mit Windows-, Mac- und Linux-Clients gleichermaßen</b></li>
-      <li>Linux-Server oder VM (Ubuntu LTS empfohlen)</li>
-      <li>oder einfach separater rasperry pi</li>
+      <li>Raspberry Pi OS oder ein Debian-basiertes Linux-System</li>
       <li>SIP-fähige Faxnummer</li>
       <li>Netzwerkzugriff der Arbeitsplätze</li>
       <li>Grundkenntnisse in Linux-Administration</li>
+    </ul>
+
+    <b>Was der Installer einrichtet</b>
+    <ul>
+      <li>Asterisk mit Faxempfang und Faxversand</li>
+      <li>Web-UI, Worker-Dienst, CUPS-Faxdrucker und Samba-Shares</li>
+      <li>Bonjour/DNS-SD für die Druckerbereitstellung im Netzwerk</li>
+      <li>OCR-Pipeline für eingehende Faxe und Scan-PDFs</li>
     </ul>
 
     <b>Absicherung (nach Inbetriebnahme)</b>
@@ -420,11 +433,11 @@ Installation und Konfiguration erfolgen gemäß README (Schritt für Schritt).</
   <h2>Technische Einordnung</h2>
   <ul>
     <li>Spandsp für den stabilen Faxversand</li>
-    <li>Sintegriertes OCR (auch für den Scanner)</li>
     <li>Asterisk für die SIP-Anbindung</li>
     <li>Ghostscript für die PDF-Aufbereitung</li>
     <li>CUPS für die Faxdrucker-Integration</li>
     <li>Samba für die Windows-Anbindung</li>
+    <li>OCRmyPDF/Tesseract für automatisch durchsuchbare Eingangs-Faxe</li>
     <li>Getrennter Worker-Dienst mit klarer Queue-Struktur</li>
   </ul>
 </section>
