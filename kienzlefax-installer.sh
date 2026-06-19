@@ -2,7 +2,7 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.2.10
+# Version: 3.2.12
 # Stand:   2026-06-20
 # Autor:   Dr. Thomas Kienzle
 #
@@ -59,6 +59,14 @@
 # NEU in 3.2.10 (konservativ):
 # - Provider-PJSIP-Modul stoesst die Registrierung aktiv an, wartet auf Registered
 #   und startet Asterisk einmal neu, falls die Registrierung im laufenden Zustand auf Rejected/Unregistered klebt.
+#
+# NEU in 3.2.11 (konservativ):
+# - Asterisk-Build schreibt eine native systemd-Unit und laesst `make config` nur noch mit Timeout laufen,
+#   damit `systemd-sysv-install enable asterisk` den Installer auf frischen Systemen nicht blockiert.
+#
+# NEU in 3.2.12 (konservativ):
+# - Auch beim Ueberspringen des Asterisk-Builds wird die native Asterisk-systemd-Unit sichergestellt,
+#   bevor Asterisk gestartet/aktiviert wird.
 # ==============================================================================
 
 set -euo pipefail
@@ -228,6 +236,29 @@ asterisk_rx(){
   else
     log "[WARN] Asterisk CLI nicht bereit; überspringe: ${cmd}"
   fi
+}
+
+install_native_asterisk_unit(){
+  cat >/etc/systemd/system/asterisk.service <<'UNIT'
+[Unit]
+Description=Asterisk PBX
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/asterisk -f -C /etc/asterisk/asterisk.conf
+ExecReload=/usr/sbin/asterisk -rx "core reload"
+ExecStop=/usr/sbin/asterisk -rx "core stop now"
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  chmod 0644 /etc/systemd/system/asterisk.service
+  systemctl daemon-reload
 }
 
 # ------------------------------------------------------------------------------
@@ -931,6 +962,29 @@ wait_for_asterisk_cli(){
   return 1
 }
 
+install_asterisk_systemd_unit(){
+  cat >/etc/systemd/system/asterisk.service <<'UNIT'
+[Unit]
+Description=Asterisk PBX
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/asterisk -f -C /etc/asterisk/asterisk.conf
+ExecReload=/usr/sbin/asterisk -rx "core reload"
+ExecStop=/usr/sbin/asterisk -rx "core stop now"
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  chmod 0644 /etc/systemd/system/asterisk.service
+  systemctl daemon-reload
+}
+
 ENVFILE="/etc/kienzlefax-installer.env"
 [[ -f "$ENVFILE" ]] || die "ENV fehlt: $ENVFILE"
 # shellcheck disable=SC1090
@@ -968,9 +1022,15 @@ CPU="$(nproc 2>/dev/null || echo 2)"
 make -j"$CPU"
 make install
 make samples || true
-make config  || true
+if command -v timeout >/dev/null 2>&1; then
+  timeout 30s make config || log "[WARN] make config nicht erfolgreich/Timeout; native systemd-Unit wird verwendet."
+else
+  make config || true
+fi
+install_asterisk_systemd_unit
 ldconfig
 
+systemctl reset-failed asterisk || true
 systemctl enable --now asterisk
 wait_for_asterisk_cli 90 || die "Asterisk wurde gestartet, aber die CLI/der Control-Socket ist nicht bereit."
 log "[OK] Asterisk installiert/gestartet."
@@ -1207,6 +1267,8 @@ if [[ "$DO_ASTERISK_BUILD" == "y" ]]; then
   run_module "${MOD_DIR}/60-asterisk-build.sh"
 else
   sep "Asterisk Build übersprungen (bestehende Installation wird genutzt)"
+  install_native_asterisk_unit
+  systemctl reset-failed asterisk || true
   systemctl enable --now asterisk || true
 fi
 
