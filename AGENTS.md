@@ -79,12 +79,14 @@ Diese Datei fasst die Projektvorgaben zusammen. Sie dient als verbindliche Arbei
 - `pjsip.conf` wird nur im Provider-Modul `pjsip-1und1.sh` befüllt.
 - Keine doppelte Ownership der `pjsip.conf`.
 - Das Provider-Modul arbeitet aus Installer-Variablen und sourct `/etc/kienzlefax-installer.env`.
+- SIP-Passwoerter und andere freie String-Werte muessen shell-sicher gequotet in `/etc/kienzlefax-installer.env` stehen; ungequotete Sonderzeichen koennen zu `pjsip show registrations => Rejected` fuehren.
 - Neue Variablen bevorzugt mit `KFX_*`; Legacy-Variablen wie `PJSIP_USER` und `PJSIP_PASS` nur kompatibel unterstützen.
 - Keine `set -u`/unbound-variable Fehler.
 - Keine undefinierten Helper-Funktionen voraussetzen.
 - `transport-udp` mit `bind=0.0.0.0:${KFX_SIP_BIND_PORT}` setzen.
 - `from_domain=sip.1und1.de`, nicht `from_domain=$sip.1und1.de`.
 - `client_uri` typischerweise aus SIP-User bilden: `sip:${PJSIP_USER}@sip.1und1.de`.
+- Beim Schreiben von `pjsip.conf` freie Config-Werte wie `password=` fuer Asterisk escapen, mindestens `\` und `;`; Semikolon wird sonst als Kommentarbeginn interpretiert.
 
 ## Dialplan / extensions.sh
 
@@ -226,6 +228,7 @@ WantedBy=multi-user.target
 
 - Am Ende reloaden/checken: `core reload`, `pjsip reload`, `dialplan reload`, `systemctl status apache2`, `cups`, `smbd`, `asterisk`, `kienzlefax-worker`.
 - Sinnvolle Zusatzchecks: `asterisk -rx "pjsip show transports"`, `asterisk -rx "pjsip show registrations"`, `asterisk -rx "manager show settings"`, `asterisk -rx "manager show user kfx"`.
+- Bei `pjsip show registrations => Rejected` zuerst `/etc/kienzlefax-installer.env` pruefen: SIP-Nummer korrekt und SIP-Passwort unverfaelscht/shell-sicher gequotet.
 - Kein `awk` mit `match(..., ..., array)`, weil Debian/RPi häufig `mawk` nutzt; INI-Patching stattdessen mit Python.
 - Heredocs fuer Dialplan immer quoted, damit Bash keine Asterisk-Variablen expandiert.
 - PJSIP-Modul muss Variablennamen konsistent setzen und darf `PJSIP_CONF`/`PJSIP` nicht verwechseln.
