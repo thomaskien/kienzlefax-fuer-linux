@@ -13,10 +13,10 @@ set -euo pipefail
 # Customize via env:
 #   PRACTICE_NAME="Praxis Dr. Beispiel"
 #   DATE_FMT="%d.%m.%Y %H:%M"
-#   TOP_OFFSET_MM="6"     # distance from top edge to text baseline (smaller => higher)
-#   HEADER_BAND_MM="12"   # reserved top band; original content is scaled below it
+#   TOP_OFFSET_MM="4"     # distance from top edge to text baseline (smaller => higher)
+#   HEADER_BAND_MM="6"    # slim reserved top band; original content is scaled below it
 #   FONT_NAME="Helvetica"
-#   FONT_SIZE="9"
+#   FONT_SIZE="8"
 #   LEFT_MARGIN_MM="12"
 #   RIGHT_MARGIN_MM="12"
 
@@ -36,13 +36,13 @@ fi
 PRACTICE_NAME="${PRACTICE_NAME:-KienzleFax}"
 DATE_FMT="${DATE_FMT:-%d.%m.%Y %H:%M}"
 
-TOP_OFFSET_MM="${TOP_OFFSET_MM:-6}"
-HEADER_BAND_MM="${HEADER_BAND_MM:-12}"
+TOP_OFFSET_MM="${TOP_OFFSET_MM:-4}"
+HEADER_BAND_MM="${HEADER_BAND_MM:-6}"
 LEFT_MARGIN_MM="${LEFT_MARGIN_MM:-12}"
 RIGHT_MARGIN_MM="${RIGHT_MARGIN_MM:-12}"
 
 FONT_NAME="${FONT_NAME:-Helvetica}"
-FONT_SIZE="${FONT_SIZE:-9}"
+FONT_SIZE="${FONT_SIZE:-8}"
 
 python3 - "$IN" "$OUT" "$PRACTICE_NAME" "$DATE_FMT" \
         "$TOP_OFFSET_MM" "$HEADER_BAND_MM" "$LEFT_MARGIN_MM" "$RIGHT_MARGIN_MM" \
@@ -95,7 +95,7 @@ def make_overlay(page_w, page_h, page_no, total_pages):
 
     c.setFont(font_name, font_size)
 
-    # Baseline position: a bit closer to top than before
+    # Compact fax header near the top edge.
     y = page_h - (top_offset_mm * mm)
 
     left_text = stamp_date
