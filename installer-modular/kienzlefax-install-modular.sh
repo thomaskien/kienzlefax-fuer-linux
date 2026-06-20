@@ -2,7 +2,7 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.3.0
+# Version: 3.3.2
 # Stand:   2026-06-20
 # Autor:   Dr. Thomas Kienzle
 #
@@ -81,6 +81,15 @@
 # - Installationsbericht mit SIP-/Admin-Passwort, aktueller IP, Portweiterleitungen, Config-Dateien und Share-Uebersicht.
 # - Ausgehende Fax-Kopfzeile reserviert ein Headerband und verkleinert den Seiteninhalt minimal.
 # - OCR-Eingangsshare heisst `hierhin-scannen-fuer-ocr` statt `scan-to-ocr`.
+#
+# NEU in 3.3.1:
+# - Asterisk-menuselect behandelt versionsabhaengig fehlende Optionen `app_fax` und `format_tiff`
+#   als optional; Pflicht fuer Fax bleibt `res_fax` und `res_fax_spandsp`.
+#
+# NEU in 3.3.2:
+# - Laufoptionen werden bei jedem Installerstart neu abgefragt, auch wenn die Grundkonfiguration
+#   wiederverwendet wird: Remote-Module, Web-Update, Asterisk-Rebuild, Bericht, Benutzerentfernung.
+# - Installationsbericht warnt klar: Web-Ports 80/443 niemals ins Internet weiterleiten.
 # ==============================================================================
 
 set -euo pipefail
@@ -361,6 +370,54 @@ quote_env_value(){
   printf '"%s"' "$s"
 }
 
+upsert_env_line(){
+  local key="$1" value="$2" file="${3:-$ENVFILE}"
+  if grep -qE "^${key}=" "$file" 2>/dev/null; then
+    sed -i -E "s|^${key}=.*|${key}=${value}|" "$file"
+  else
+    printf '%s=%s\n' "$key" "$value" >>"$file"
+  fi
+}
+
+collect_run_options(){
+  ask_yes_no REMOTE_REFRESH "Remote-Module aus GitHub holen/aktualisieren?" "y"
+  ask_yes_no WEB_REFRESH "Weboberflaeche neu herunterladen/aktualisieren?" "y"
+  ask_yes_no AST_MANUAL_MENUSELECT "Asterisk-Modulauswahl manuell zur Pruefung oeffnen? Beenden mit X" "n"
+
+  if command -v asterisk >/dev/null 2>&1; then
+    ask_yes_no AST_REBUILD "Asterisk ist bereits installiert. Nochmal aus Source kompilieren?" "n"
+  else
+    AST_REBUILD="y"
+    log "[INFO] Asterisk ist noch nicht installiert; Build wird ausgefuehrt."
+  fi
+
+  ask_yes_no INSTALL_REPORT "Installationsbericht mit Klartext-Passwoertern erzeugen?" "y"
+
+  REMOVE_USER_NAME=""
+  REMOVE_USER_HOME="n"
+  CURRENT_USER_CANDIDATE="$(detect_current_user_candidate || true)"
+  if [[ -n "$CURRENT_USER_CANDIDATE" ]]; then
+    ask_yes_no REMOVE_CURRENT_USER "Aktuellen Benutzer '${CURRENT_USER_CANDIDATE}' am Ende entfernen?" "n"
+    if [[ "$REMOVE_CURRENT_USER" == "y" ]]; then
+      REMOVE_USER_NAME="$CURRENT_USER_CANDIDATE"
+      ask_yes_no REMOVE_USER_HOME "Home-Verzeichnis von '${CURRENT_USER_CANDIDATE}' ebenfalls loeschen?" "n"
+    fi
+  fi
+}
+
+write_run_options_to_env(){
+  local remove_user_name_env
+  remove_user_name_env="$(quote_env_value "${REMOVE_USER_NAME:-}")"
+  upsert_env_line KFX_REMOTE_REFRESH "${REMOTE_REFRESH:-y}"
+  upsert_env_line KFX_WEB_REFRESH "${WEB_REFRESH:-y}"
+  upsert_env_line KFX_ASTERISK_MANUAL_MENUSELECT "${AST_MANUAL_MENUSELECT:-n}"
+  upsert_env_line KFX_REBUILD_ASTERISK "${AST_REBUILD:-y}"
+  upsert_env_line KFX_INSTALL_REPORT_WITH_PASSWORDS "${INSTALL_REPORT:-y}"
+  upsert_env_line KFX_REMOVE_USER_NAME "${remove_user_name_env}"
+  upsert_env_line KFX_REMOVE_USER_HOME "${REMOVE_USER_HOME:-n}"
+  chmod 0600 "$ENVFILE"
+}
+
 backup_file_ts(){
   local f="$1"
   local stamp=".old.kienzlefax.$(date +%Y%m%d-%H%M%S)"
@@ -393,7 +450,11 @@ if [[ "$RESET_OPTS" == "n" ]]; then
     log "[INFO] Vorhandene Optionen sind aelter als 3.3.0; Eingaben werden neu gesammelt."
     RESET_OPTS="y"
   else
-    log "[OK] Verwende vorhandene Optionen aus ${ENVFILE}"
+    log "[OK] Verwende vorhandene Grundkonfiguration aus ${ENVFILE}"
+    sep "Laufoptionen fuer diese Installation"
+    collect_run_options
+    write_run_options_to_env
+    log "[OK] Laufoptionen aktualisiert in ${ENVFILE}"
     exit 0
   fi
 fi
@@ -437,29 +498,6 @@ unset FAX_DID_IN
 
 ask_default KFX_PRACTICE_NAME "Praxis-Kopfzeile fuer ausgehende Faxe" "KienzleFax"
 
-ask_yes_no REMOTE_REFRESH "Remote-Module aus GitHub holen/aktualisieren?" "y"
-ask_yes_no WEB_REFRESH "Weboberflaeche neu herunterladen/aktualisieren?" "y"
-ask_yes_no AST_MANUAL_MENUSELECT "Asterisk-Modulauswahl manuell zur Pruefung oeffnen? Beenden mit X" "n"
-
-if command -v asterisk >/dev/null 2>&1; then
-  ask_yes_no AST_REBUILD "Asterisk ist bereits installiert. Nochmal aus Source kompilieren?" "n"
-else
-  AST_REBUILD="y"
-fi
-
-ask_yes_no INSTALL_REPORT "Installationsbericht mit Klartext-Passwoertern erzeugen?" "y"
-
-REMOVE_USER_NAME=""
-REMOVE_USER_HOME="n"
-CURRENT_USER_CANDIDATE="$(detect_current_user_candidate || true)"
-if [[ -n "$CURRENT_USER_CANDIDATE" ]]; then
-  ask_yes_no REMOVE_CURRENT_USER "Aktuellen Benutzer '${CURRENT_USER_CANDIDATE}' nach Admin-Anlage entfernen?" "n"
-  if [[ "$REMOVE_CURRENT_USER" == "y" ]]; then
-    REMOVE_USER_NAME="$CURRENT_USER_CANDIDATE"
-    ask_yes_no REMOVE_USER_HOME "Home-Verzeichnis von '${CURRENT_USER_CANDIDATE}' ebenfalls loeschen?" "n"
-  fi
-fi
-
 ask_default SIP_BIND_PORT "SIP Bind Port (PJSIP extern; Provider-Config)" "${DEFAULT_SIP_BIND_PORT}"
 [[ "$SIP_BIND_PORT" =~ ^[0-9]+$ ]] || die "SIP_BIND_PORT ungültig"
 
@@ -474,6 +512,9 @@ echo "Hinweis Portweiterleitung nur fuer Fax-Kommunikation:"
 echo "  UDP ${SIP_BIND_PORT} -> dieses System (SIP)"
 echo "  UDP ${RTP_START}-${RTP_END} -> dieses System (RTP)"
 echo "Eine feste IP per DHCP-Reservierung im Router wird empfohlen."
+
+sep "Laufoptionen fuer diese Installation"
+collect_run_options
 
 KFX_HOSTNAME_ENV="$(quote_env_value "$KFX_HOSTNAME")"
 PUBLIC_FQDN_ENV="$(quote_env_value "$PUBLIC_FQDN")"
@@ -1112,12 +1153,19 @@ configure_asterisk_modules(){
   make menuselect.makeopts
   [[ -x "$ms" ]] || die "menuselect CLI fehlt: $ms"
 
-  for mod in res_fax app_fax res_fax_spandsp format_tiff; do
+  for mod in res_fax res_fax_spandsp; do
     if ! "$ms" --enable "$mod" menuselect.makeopts; then
-      log "[WARN] Asterisk-Modul konnte nicht automatisch aktiviert werden: $mod"
+      log "[WARN] Asterisk-Pflichtmodul konnte nicht automatisch aktiviert werden: $mod"
       failed=1
     fi
   done
+
+  for mod in app_fax format_tiff; do
+    if ! "$ms" --enable "$mod" menuselect.makeopts; then
+      log "[INFO] Asterisk-Option ist in diesem Source-Tree nicht vorhanden oder nicht separat waehlbar: $mod"
+    fi
+  done
+
   if ! "$ms" --check-deps menuselect.makeopts; then
     log "[WARN] Asterisk-menuselect meldet fehlende Abhaengigkeiten."
     failed=1
@@ -1444,7 +1492,7 @@ lines = [
     "Fax-Portweiterleitungen im Router, nur fuer Fax-Kommunikation:",
     f"- UDP {e('KFX_SIP_BIND_PORT', '5070')} -> KienzleFax-System (SIP/PJSIP)",
     f"- UDP {e('KFX_RTP_START', '12000')}-{e('KFX_RTP_END', '12049')} -> KienzleFax-System (RTP)",
-    "- Keine Web-Portweiterleitung fuer 80/443 erforderlich, sofern kein Fernzugriff gewuenscht ist.",
+    "- Web-Ports 80/443 NIEMALS ins Internet weiterleiten: Das wuerde Patientendaten exponieren.",
     "",
     "Wichtige Dateien:",
     "- /etc/kienzlefax-installer.env",
