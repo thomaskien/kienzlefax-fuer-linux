@@ -41,6 +41,7 @@ Diese Datei fasst die Projektvorgaben zusammen. Sie dient als verbindliche Arbei
 - Am Anfang fragt der Installer, ob Optionen neu gesetzt werden sollen.
 - Wenn `/etc/kienzlefax-installer.env` vorhanden ist, ist der Default: vorhandene Optionen weiterverwenden.
 - Installer-Dialoge sollen am Anfang gesammelt werden. Der lange Installationslauf soll danach ohne weitere Rueckfragen laufen.
+- Grundkonfiguration darf wiederverwendet werden, aber Laufoptionen muessen bei jedem Installerstart neu gefragt werden: Remote-Module aktualisieren, Weboberflaeche aktualisieren, Asterisk-Rebuild, manuelles menuselect, Installationsbericht, optionaler Benutzerentfernungs-Schritt.
 - Wenn Asterisk erkannt wird, fragt der Installer am Anfang, ob Asterisk erneut kompiliert werden soll; Default bei vorhandenem Asterisk: `nein`.
 - Der Installer fragt am Anfang ein Admin-Passwort ab und setzt damit Linux-User `admin` und Samba-User `admin`; `admin` muss normale sudo-Rechte mit Passwortabfrage haben.
 - Optional darf der bisherige Erstbenutzer entfernt werden, aber nur nach Sicherheitschecks und nie `root` oder `admin`.
@@ -80,7 +81,8 @@ Diese Datei fasst die Projektvorgaben zusammen. Sie dient als verbindliche Arbei
 - SIP-Port wird am Anfang abgefragt; Default `5070`.
 - RTP-Range wird am Anfang abgefragt; Default `12000-12049`.
 - Public FQDN / DynDNS ist optional, aber Hinweistext: `Zur optimalen Stabilität unbedingt empfohlen.`
-- Portweiterleitungen nur fuer Fax-Kommunikation empfehlen: UDP SIP-Port und UDP RTP-Range; Webports 80/443 nicht als Fax-Weiterleitung nennen.
+- Portweiterleitungen nur fuer Fax-Kommunikation empfehlen: UDP SIP-Port und UDP RTP-Range.
+- Webports 80/443 niemals ins Internet weiterleiten oder relativieren; Hinweis im Bericht: Das wuerde Patientendaten exponieren.
 
 ## PJSIP / Provider 1und1
 
