@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.2"
+VERSION="1.3"
 
 log(){ echo "[$(date -Is)] scan-ocr-install: $*"; }
 
@@ -121,7 +121,7 @@ cat >"$WATCH" <<'WATCH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.2"
+VERSION="1.3"
 IN_DIR="${SCAN_OCR_IN_DIR:-/srv/scan/eingang}"
 OUT_DIR="${SCAN_OCR_OUT_DIR:-/srv/scan/ocr}"
 ARCH_DIR="${SCAN_OCR_ARCH_DIR:-/srv/scan/archiv}"
@@ -461,7 +461,7 @@ import sys
 
 path = Path(sys.argv[1])
 text = path.read_text(encoding="utf-8", errors="replace")
-drop = {"scan-to-ocr", "scan-eingang", "fax-eingang"}
+drop = {"scan-to-ocr", "hierhin-scannen-fuer-ocr", "scan-eingang", "fax-eingang"}
 out = []
 skip = False
 for line in text.splitlines():
@@ -476,7 +476,7 @@ while out and out[-1].strip() == "":
     out.pop()
 
 out.append("")
-out.append("[scan-to-ocr]")
+out.append("[hierhin-scannen-fuer-ocr]")
 out.append("   path = /srv/scan/eingang")
 out.append("   browseable = yes")
 out.append("   read only = no")
@@ -520,4 +520,4 @@ systemctl enable --now scan-ocr-fax.service
 systemctl restart scan-ocr-fax.service || true
 systemctl restart smbd nmbd || true
 
-log "[OK] Scan-OCR bereit: \\\\$(hostname)\\scan-to-ocr -> \\\\$(hostname)\\scan-eingang; Fax-OCR -> \\\\$(hostname)\\fax-eingang"
+log "[OK] Scan-OCR bereit: \\\\$(hostname)\\hierhin-scannen-fuer-ocr -> \\\\$(hostname)\\scan-eingang; Fax-OCR -> \\\\$(hostname)\\fax-eingang"

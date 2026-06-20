@@ -14,6 +14,7 @@ set -euo pipefail
 #   PRACTICE_NAME="Praxis Dr. Beispiel"
 #   DATE_FMT="%d.%m.%Y %H:%M"
 #   TOP_OFFSET_MM="6"     # distance from top edge to text baseline (smaller => higher)
+#   HEADER_BAND_MM="12"   # reserved top band; original content is scaled below it
 #   FONT_NAME="Helvetica"
 #   FONT_SIZE="9"
 #   LEFT_MARGIN_MM="12"
@@ -36,6 +37,7 @@ PRACTICE_NAME="${PRACTICE_NAME:-KienzleFax}"
 DATE_FMT="${DATE_FMT:-%d.%m.%Y %H:%M}"
 
 TOP_OFFSET_MM="${TOP_OFFSET_MM:-6}"
+HEADER_BAND_MM="${HEADER_BAND_MM:-12}"
 LEFT_MARGIN_MM="${LEFT_MARGIN_MM:-12}"
 RIGHT_MARGIN_MM="${RIGHT_MARGIN_MM:-12}"
 
@@ -43,7 +45,7 @@ FONT_NAME="${FONT_NAME:-Helvetica}"
 FONT_SIZE="${FONT_SIZE:-9}"
 
 python3 - "$IN" "$OUT" "$PRACTICE_NAME" "$DATE_FMT" \
-        "$TOP_OFFSET_MM" "$LEFT_MARGIN_MM" "$RIGHT_MARGIN_MM" \
+        "$TOP_OFFSET_MM" "$HEADER_BAND_MM" "$LEFT_MARGIN_MM" "$RIGHT_MARGIN_MM" \
         "$FONT_NAME" "$FONT_SIZE" <<'PY'
 import sys
 from datetime import datetime
@@ -55,9 +57,11 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase.pdfmetrics import stringWidth
 
 try:
-    from PyPDF2 import PdfReader, PdfWriter
+    from pypdf import PdfReader, PdfWriter, Transformation
+    from pypdf._page import PageObject
 except ModuleNotFoundError:
-    from pypdf import PdfReader, PdfWriter
+    from PyPDF2 import PdfReader, PdfWriter, Transformation
+    from PyPDF2._page import PageObject
 
 in_path = Path(sys.argv[1])
 out_path = Path(sys.argv[2])
@@ -66,11 +70,12 @@ practice = sys.argv[3]
 date_fmt = sys.argv[4]
 
 top_offset_mm = float(sys.argv[5])
-left_margin_mm = float(sys.argv[6])
-right_margin_mm = float(sys.argv[7])
+header_band_mm = float(sys.argv[6])
+left_margin_mm = float(sys.argv[7])
+right_margin_mm = float(sys.argv[8])
 
-font_name = sys.argv[8]
-font_size = float(sys.argv[9])
+font_name = sys.argv[9]
+font_size = float(sys.argv[10])
 
 reader = PdfReader(str(in_path))
 total_pages = len(reader.pages)
@@ -120,9 +125,19 @@ for idx, page in enumerate(reader.pages, start=1):
     w = float(page.mediabox.width)
     h = float(page.mediabox.height)
 
+    header_band = max(0.0, header_band_mm * mm)
+    content_h = max(1.0, h - header_band)
+    scale = min(1.0, content_h / h)
+    tx = (w - (w * scale)) / 2.0
+    ty = 0.0
+
+    composed = PageObject.create_blank_page(width=w, height=h)
+    page.add_transformation(Transformation().scale(scale).translate(tx=tx, ty=ty))
+    composed.merge_page(page)
+
     overlay = make_overlay(w, h, idx, total_pages)
-    page.merge_page(overlay)
-    writer.add_page(page)
+    composed.merge_page(overlay)
+    writer.add_page(composed)
 
 out_path.parent.mkdir(parents=True, exist_ok=True)
 with out_path.open("wb") as f:
