@@ -2,7 +2,7 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.2.12
+# Version: 3.2.13
 # Stand:   2026-06-20
 # Autor:   Dr. Thomas Kienzle
 #
@@ -67,6 +67,10 @@
 # NEU in 3.2.12 (konservativ):
 # - Auch beim Ueberspringen des Asterisk-Builds wird die native Asterisk-systemd-Unit sichergestellt,
 #   bevor Asterisk gestartet/aktiviert wird.
+#
+# NEU in 3.2.13 (konservativ):
+# - Asterisk-Build nutzt auf Raspberry Pi standardmaessig maximal 2 parallele Jobs und faellt bei
+#   pjproject/Compiler-Fehlern automatisch auf `make -j1` zurueck.
 # ==============================================================================
 
 set -euo pipefail
@@ -985,6 +989,34 @@ UNIT
   systemctl daemon-reload
 }
 
+asterisk_build_jobs(){
+  local n jobs
+  n="$(nproc 2>/dev/null || echo 2)"
+  jobs="${KFX_ASTERISK_BUILD_JOBS:-}"
+  if [[ -z "$jobs" ]]; then
+    jobs="$n"
+    if (( jobs > 2 )); then
+      jobs=2
+    fi
+  fi
+  if ! [[ "$jobs" =~ ^[0-9]+$ ]] || (( jobs < 1 )); then
+    jobs=1
+  fi
+  printf '%s\n' "$jobs"
+}
+
+make_asterisk_with_retry(){
+  local jobs="$1"
+  log "[INFO] Asterisk Build startet mit make -j${jobs}."
+  if make -j"$jobs"; then
+    return 0
+  fi
+
+  log "[WARN] Asterisk Build mit -j${jobs} fehlgeschlagen. Retry konservativ mit make -j1."
+  journalctl -k -n 80 --no-pager 2>/dev/null | grep -Ei 'out of memory|oom|killed process|cc1' || true
+  make -j1
+}
+
 ENVFILE="/etc/kienzlefax-installer.env"
 [[ -f "$ENVFILE" ]] || die "ENV fehlt: $ENVFILE"
 # shellcheck disable=SC1090
@@ -1018,8 +1050,8 @@ echo
 read -r -p "ENTER drücken um menuselect zu starten..." _
 make menuselect
 
-CPU="$(nproc 2>/dev/null || echo 2)"
-make -j"$CPU"
+BUILD_JOBS="$(asterisk_build_jobs)"
+make_asterisk_with_retry "$BUILD_JOBS"
 make install
 make samples || true
 if command -v timeout >/dev/null 2>&1; then
