@@ -40,7 +40,10 @@ Diese Datei fasst die Projektvorgaben zusammen. Sie dient als verbindliche Arbei
   - Datei existiert: Default `nein`
 - Am Anfang fragt der Installer, ob Optionen neu gesetzt werden sollen.
 - Wenn `/etc/kienzlefax-installer.env` vorhanden ist, ist der Default: vorhandene Optionen weiterverwenden.
-- Wenn Asterisk erkannt wird, fragt der Installer, ob Asterisk erneut kompiliert werden soll; Default bei vorhandenem Asterisk: `nein`.
+- Installer-Dialoge sollen am Anfang gesammelt werden. Der lange Installationslauf soll danach ohne weitere Rueckfragen laufen.
+- Wenn Asterisk erkannt wird, fragt der Installer am Anfang, ob Asterisk erneut kompiliert werden soll; Default bei vorhandenem Asterisk: `nein`.
+- Der Installer fragt am Anfang ein Admin-Passwort ab und setzt damit Linux-User `admin` und Samba-User `admin`; `admin` muss normale sudo-Rechte mit Passwortabfrage haben.
+- Optional darf der bisherige Erstbenutzer entfernt werden, aber nur nach Sicherheitschecks und nie `root` oder `admin`.
 - Wenn User `admin` bereits existiert, fragt der Installer, ob `admin` neu generiert bzw. Passwörter neu gesetzt werden sollen; Default: `nein`.
 
 ## Aktuelle Remote-Module
@@ -67,12 +70,16 @@ Diese Datei fasst die Projektvorgaben zusammen. Sie dient als verbindliche Arbei
 ## Asterisk
 
 - Asterisk wird aus Source installiert, wenn noch nicht vorhanden oder wenn der Nutzer Rebuild bestätigt.
-- Build-Ablauf: `git clone/fetch/checkout`, `./configure`, interaktives `make menuselect`, `make -j"$(nproc)"`, `make install`, `make samples`, `make config`, `ldconfig`, `systemctl enable --now asterisk`.
-- `make menuselect` bleibt interaktiv.
-- In `menuselect` mindestens prüfen/aktivieren: `res_fax`, `app_fax` / `SendFAX` / `ReceiveFAX`, `res_fax_spandsp` falls verfügbar/gewünscht, `format_tiff`, passende Codecs nach Bedarf.
+- Build-Ablauf: `git clone/fetch/checkout`, `./configure`, nichtinteraktive Aktivierung der Fax-Module per `menuselect/menuselect`, optional manuelle Menuepruefung nur wenn am Anfang gewaehlt, ressourcenschonendes `make` mit max. 2 Jobs und Fallback auf `make -j1`, `make install`, `make samples`, `make config`, `ldconfig`, `systemctl enable --now asterisk`.
+- `make menuselect` wird standardmaessig nicht geoeffnet; falls es manuell geoeffnet wird, im Hinweis klar sagen: Beenden/Speichern mit `X`.
+- Auf frischen Raspberry-Pi-OS/Systemd-Systemen darf `systemd-sysv-install enable asterisk` den Installer nicht blockieren; der Installer stellt deshalb eine native `/etc/systemd/system/asterisk.service` sicher und fuehrt `make config` nur mit Timeout aus.
+- Asterisk/pjproject kann auf Raspberry Pi bei zu viel Parallelisierung mit unspezifischem `Error 2` abbrechen; Installer nicht mit `make -j$(nproc)` bauen lassen, sondern max. 2 Jobs und automatischer Retry `make -j1`.
+- Nichtinteraktiv aktivieren: `res_fax`, `app_fax` / `SendFAX` / `ReceiveFAX`, `res_fax_spandsp`, `format_tiff`.
 - Asterisk-PJSIP bindet an `0.0.0.0`.
 - SIP-Port wird am Anfang abgefragt; Default `5070`.
 - RTP-Range wird am Anfang abgefragt; Default `12000-12049`.
+- Public FQDN / DynDNS ist optional, aber Hinweistext: `Zur optimalen Stabilität unbedingt empfohlen.`
+- Portweiterleitungen nur fuer Fax-Kommunikation empfehlen: UDP SIP-Port und UDP RTP-Range; Webports 80/443 nicht als Fax-Weiterleitung nennen.
 
 ## PJSIP / Provider 1und1
 
@@ -211,12 +218,15 @@ WantedBy=multi-user.target
   - `/srv/scan/fehler` fuer nicht verarbeitbare Dateien.
   - `/var/tmp/scan-ocr` fuer temporaere Arbeitsdaten.
 - Verbindliche Samba-Share-Namen:
-  - `scan-to-ocr` zeigt auf `/srv/scan/eingang`.
+  - `hierhin-scannen-fuer-ocr` zeigt auf `/srv/scan/eingang`.
   - `scan-eingang` zeigt auf `/srv/scan/ocr`.
 - Rechte wie im Projekt ueblich offen/grosszuegig; Samba erzwingt `scanocr:scanocr`.
 - Empfangene Faxe werden roh nach `/srv/scan/fax-eingang` geschrieben.
 - `scan-ocr-fax.service` verarbeitet `/srv/scan/fax-eingang` nach `/var/spool/asterisk/fax`.
 - Der bestehende Share `fax-eingang` zeigt weiter auf `/var/spool/asterisk/fax` und enthaelt dadurch OCR-Ergebnis oder Fallback-PDF, nicht die Roh-PDF vor OCR.
+- Installationsbericht mit Klartext-Passwoertern wird standardmaessig erzeugt, wenn am Anfang nicht abgewählt. Ziel: `/var/spool/asterisk/fax/installationsbericht_kienzlefax_*_bitte_loeschen_mit_passwoertern.pdf`.
+- Bericht enthaelt SIP-Passwort, Admin-Passwort, aktuelle lokale IP, Empfehlung feste IP per DHCP-Reservierung, Fax-Portweiterleitungen, wichtige Config-Dateien und Share-/Verzeichnisuebersicht.
+- Ausgehende Fax-Kopfzeile darf Inhalte nicht ueberdrucken: A4 beibehalten, oben Headerband reservieren, Originalinhalt minimal darunter verkleinern.
 
 ## Remote-Script-Kompatibilität
 

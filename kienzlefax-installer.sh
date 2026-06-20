@@ -2,7 +2,7 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.2.13
+# Version: 3.3.0
 # Stand:   2026-06-20
 # Autor:   Dr. Thomas Kienzle
 #
@@ -11,11 +11,11 @@
 #   * Optionen neu setzen? (ENV wiederverwenden möglich)
 #   * Hostname setzen (Maschine + Zertifikat CN+SAN)
 #   * Praxis-Kopfzeile fuer gesendete PDFs/Faxe
-#   * admin existiert? neu generieren? (Default: N)
-#   * Asterisk erkannt? nochmal kompilieren? (Default: N)
-#   * Remote-Module JEWEILS EINZELN: holen/aktualisieren? (Default: y wenn fehlt, sonst n)
-#   * Webroot: kienzlefax.php neu laden? (Default: n wenn vorhanden, y wenn fehlt)
-# - Asterisk immer aus Source (menuselect interaktiv) wenn gewählt/benötigt
+#   * Admin-Passwort fuer Linux und Samba
+#   * optional: bisherigen Erstbenutzer entfernen
+#   * optional: Asterisk-menuselect manuell pruefen (Default: N)
+#   * optional: Installationsbericht mit Klartext-Passwoertern erzeugen (Default: Y)
+# - Asterisk baut nichtinteraktiv; menuselect ist nur noch optionale manuelle Pruefung
 # - Fix: INI-Patching via Python (kein awk/mawk Problem)
 # - Webroot: kienzlefax.php + index redirect + self-signed SSL 50y
 # - Remote Module:
@@ -45,7 +45,7 @@
 # - Praxis-Kopfzeile fuer pdf_with_header.sh wird im Installer abgefragt und an den Worker durchgereicht.
 #
 # NEU in 3.2.7 (konservativ):
-# - Scan-OCR Pipeline mit Shares scan-to-ocr und scan-eingang.
+# - Scan-OCR Pipeline mit Eingangs- und Ergebnis-Share.
 # - Empfangene Fax-PDFs werden zusaetzlich in die OCR-Pipeline kopiert.
 #
 # NEU in 3.2.8 (konservativ):
@@ -71,6 +71,16 @@
 # NEU in 3.2.13 (konservativ):
 # - Asterisk-Build nutzt auf Raspberry Pi standardmaessig maximal 2 parallele Jobs und faellt bei
 #   pjproject/Compiler-Fehlern automatisch auf `make -j1` zurueck.
+#
+# NEU in 3.3.0:
+# - Installer-Dialoge werden an den Anfang gezogen; der lange Installationslauf bleibt ohne weitere Rueckfragen.
+# - Admin-Passwort wird initial gesetzt und fuer Linux-User `admin` sowie Samba-User `admin` verwendet.
+# - Optional kann der bisherige Erstbenutzer nach Admin-Anlage entfernt werden; `admin` behaelt sudo mit Passwort.
+# - DynDNS/Public FQDN ist optional, aber zur optimalen Stabilitaet unbedingt empfohlen.
+# - Asterisk-menuselect wird standardmaessig nicht geoeffnet; benoetigte Fax-Module werden nichtinteraktiv aktiviert.
+# - Installationsbericht mit SIP-/Admin-Passwort, aktueller IP, Portweiterleitungen, Config-Dateien und Share-Uebersicht.
+# - Ausgehende Fax-Kopfzeile reserviert ein Headerband und verkleinert den Seiteninhalt minimal.
+# - OCR-Eingangsshare heisst `hierhin-scannen-fuer-ocr` statt `scan-to-ocr`.
 # ==============================================================================
 
 set -euo pipefail
@@ -154,10 +164,8 @@ download_atomic(){
 maybe_fetch_one(){
   # usage: maybe_fetch_one "name" "url" "/path/to/cache.sh"
   local name="$1" url="$2" path="$3"
-  local def="n"
-  if [[ ! -s "$path" ]]; then def="y"; fi
-  local ans
-  ask_yes_no ans "Remote holen/aktualisieren: ${name} ?" "$def"
+  local ans="${KFX_REMOTE_REFRESH:-y}"
+  if [[ ! -s "$path" ]]; then ans="y"; fi
   if [[ "$ans" == "y" ]]; then
     log "[DL ] ${name} <- ${url}"
     download_atomic "$url" "$path"
@@ -306,7 +314,43 @@ ask_default(){
   printf -v "$__var" "%s" "$__val"
 }
 
+read_secret_twice(){
+  local __var="$1"; shift
+  local __prompt="$1"; shift
+  local __a="" __b=""
+  while true; do
+    read -r -s -p "${__prompt}: " __a
+    echo
+    read -r -s -p "${__prompt} wiederholen: " __b
+    echo
+    if [[ -z "$__a" ]]; then
+      echo "Passwort darf nicht leer sein."
+      continue
+    fi
+    if [[ "$__a" != "$__b" ]]; then
+      echo "Passwoerter stimmen nicht ueberein."
+      continue
+    fi
+    printf -v "$__var" "%s" "$__a"
+    return 0
+  done
+}
+
 sanitize_digits(){ echo "$1" | tr -cd '0-9'; }
+
+detect_current_user_candidate(){
+  local cand=""
+  cand="${SUDO_USER:-}"
+  if [[ -z "$cand" || "$cand" == "root" || "$cand" == "admin" ]]; then
+    cand="$(logname 2>/dev/null || true)"
+  fi
+  if [[ -z "$cand" || "$cand" == "root" || "$cand" == "admin" ]]; then
+    cand="$(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $1 != "admin" && $1 != "nobody" {print $1; exit}')"
+  fi
+  if [[ -n "$cand" && "$cand" != "root" && "$cand" != "admin" ]] && id "$cand" >/dev/null 2>&1; then
+    printf '%s\n' "$cand"
+  fi
+}
 
 quote_env_value(){
   local s="${1-}"
@@ -343,8 +387,15 @@ else
 fi
 
 if [[ "$RESET_OPTS" == "n" ]]; then
-  log "[OK] Verwende vorhandene Optionen aus ${ENVFILE}"
-  exit 0
+  # shellcheck disable=SC1090
+  source "$ENVFILE"
+  if [[ -z "${KFX_ADMIN_PASSWORD:-}" ]]; then
+    log "[INFO] Vorhandene Optionen sind aelter als 3.3.0; Eingaben werden neu gesammelt."
+    RESET_OPTS="y"
+  else
+    log "[OK] Verwende vorhandene Optionen aus ${ENVFILE}"
+    exit 0
+  fi
 fi
 
 read -r -p "Hostname für diese Maschine (z.B. fax): " KFX_HOSTNAME
@@ -358,20 +409,26 @@ else
   echo -e "127.0.1.1\t${KFX_HOSTNAME}" >> /etc/hosts
 fi
 
-read -r -p "DynDNS / Public FQDN (z.B. myhost.dyndns.org): " PUBLIC_FQDN
-[[ -n "${PUBLIC_FQDN}" ]] || die "PUBLIC_FQDN darf nicht leer sein."
+echo
+echo "Hinweis: Diese Provider-Konfiguration ist fuer 1&1 Deutschland vorbereitet."
+echo "Bei anderem Provider muessen vor allem PJSIP/Dialplan angepasst werden:"
+echo "  /etc/asterisk/pjsip.conf, /etc/asterisk/extensions.conf"
+echo "  installer-modular/pjsip-1und1.sh, installer-modular/extensions.sh"
+echo "DynDNS / Public FQDN ist optional, zur optimalen Stabilitaet aber unbedingt empfohlen."
+read -r -p "DynDNS / Public FQDN (Enter = leer lassen): " PUBLIC_FQDN
 
 read -r -p "SIP Nummer (gleich Username, nur Ziffern): " SIP_NUMBER_RAW
 SIP_NUMBER="$(sanitize_digits "${SIP_NUMBER_RAW}")"
 [[ -n "${SIP_NUMBER}" ]] || die "SIP Nummer ist leer/ungültig."
 unset SIP_NUMBER_RAW
 
-# SIP Passwort bleibt interaktiv (Provider)
 echo
 echo "==== SIP Passwort eingeben (sichtbar aus = nein) ===="
-read -r -s -p "SIP Passwort: " SIP_PASSWORD
+read_secret_twice SIP_PASSWORD "SIP Passwort"
+
 echo
-[[ -n "${SIP_PASSWORD}" ]] || die "SIP Passwort darf nicht leer sein."
+echo "==== Admin-Passwort eingeben (Linux admin + Samba admin; sichtbar aus = nein) ===="
+read_secret_twice ADMIN_PASSWORD "Admin-Passwort"
 
 read -r -p "FAX DID (Enter = ${SIP_NUMBER}): " FAX_DID_IN
 FAX_DID="$(sanitize_digits "${FAX_DID_IN:-$SIP_NUMBER}")"
@@ -379,15 +436,29 @@ FAX_DID="$(sanitize_digits "${FAX_DID_IN:-$SIP_NUMBER}")"
 unset FAX_DID_IN
 
 ask_default KFX_PRACTICE_NAME "Praxis-Kopfzeile fuer ausgehende Faxe" "KienzleFax"
-KFX_HOSTNAME_ENV="$(quote_env_value "$KFX_HOSTNAME")"
-PUBLIC_FQDN_ENV="$(quote_env_value "$PUBLIC_FQDN")"
-SIP_PASSWORD_ENV="$(quote_env_value "$SIP_PASSWORD")"
-KFX_PRACTICE_NAME_ENV="$(quote_env_value "$KFX_PRACTICE_NAME")"
-KFX_CALLERID_NAME_ENV="$(quote_env_value "Fax")"
 
-# AMI Secret NICHT interaktiv (lokal). Konfigurierbar via DEFAULT_AMI_SECRET oder später in ENVFILE.
-AMI_SECRET="${DEFAULT_AMI_SECRET}"
-AMI_SECRET_ENV="$(quote_env_value "$AMI_SECRET")"
+ask_yes_no REMOTE_REFRESH "Remote-Module aus GitHub holen/aktualisieren?" "y"
+ask_yes_no WEB_REFRESH "Weboberflaeche neu herunterladen/aktualisieren?" "y"
+ask_yes_no AST_MANUAL_MENUSELECT "Asterisk-Modulauswahl manuell zur Pruefung oeffnen? Beenden mit X" "n"
+
+if command -v asterisk >/dev/null 2>&1; then
+  ask_yes_no AST_REBUILD "Asterisk ist bereits installiert. Nochmal aus Source kompilieren?" "n"
+else
+  AST_REBUILD="y"
+fi
+
+ask_yes_no INSTALL_REPORT "Installationsbericht mit Klartext-Passwoertern erzeugen?" "y"
+
+REMOVE_USER_NAME=""
+REMOVE_USER_HOME="n"
+CURRENT_USER_CANDIDATE="$(detect_current_user_candidate || true)"
+if [[ -n "$CURRENT_USER_CANDIDATE" ]]; then
+  ask_yes_no REMOVE_CURRENT_USER "Aktuellen Benutzer '${CURRENT_USER_CANDIDATE}' nach Admin-Anlage entfernen?" "n"
+  if [[ "$REMOVE_CURRENT_USER" == "y" ]]; then
+    REMOVE_USER_NAME="$CURRENT_USER_CANDIDATE"
+    ask_yes_no REMOVE_USER_HOME "Home-Verzeichnis von '${CURRENT_USER_CANDIDATE}' ebenfalls loeschen?" "n"
+  fi
+fi
 
 ask_default SIP_BIND_PORT "SIP Bind Port (PJSIP extern; Provider-Config)" "${DEFAULT_SIP_BIND_PORT}"
 [[ "$SIP_BIND_PORT" =~ ^[0-9]+$ ]] || die "SIP_BIND_PORT ungültig"
@@ -398,6 +469,24 @@ ask_default RTP_END   "RTP End-Port"   "${DEFAULT_RTP_END}"
 [[ "$RTP_END" =~ ^[0-9]+$ ]] || die "RTP_END ungültig"
 [ "$RTP_START" -lt "$RTP_END" ] || die "RTP_START muss < RTP_END sein"
 
+echo
+echo "Hinweis Portweiterleitung nur fuer Fax-Kommunikation:"
+echo "  UDP ${SIP_BIND_PORT} -> dieses System (SIP)"
+echo "  UDP ${RTP_START}-${RTP_END} -> dieses System (RTP)"
+echo "Eine feste IP per DHCP-Reservierung im Router wird empfohlen."
+
+KFX_HOSTNAME_ENV="$(quote_env_value "$KFX_HOSTNAME")"
+PUBLIC_FQDN_ENV="$(quote_env_value "$PUBLIC_FQDN")"
+SIP_PASSWORD_ENV="$(quote_env_value "$SIP_PASSWORD")"
+ADMIN_PASSWORD_ENV="$(quote_env_value "$ADMIN_PASSWORD")"
+KFX_PRACTICE_NAME_ENV="$(quote_env_value "$KFX_PRACTICE_NAME")"
+KFX_CALLERID_NAME_ENV="$(quote_env_value "Fax")"
+REMOVE_USER_NAME_ENV="$(quote_env_value "$REMOVE_USER_NAME")"
+
+# AMI Secret NICHT interaktiv (lokal). Konfigurierbar via DEFAULT_AMI_SECRET oder später in ENVFILE.
+AMI_SECRET="${DEFAULT_AMI_SECRET}"
+AMI_SECRET_ENV="$(quote_env_value "$AMI_SECRET")"
+
 ask_default AST_REF "Asterisk Git-Ref (Branch/Tag/Commit) für Build" "${ASTERISK_GIT_REF_DEFAULT}"
 AST_REF_ENV="$(quote_env_value "$AST_REF")"
 
@@ -407,12 +496,20 @@ KFX_HOSTNAME=${KFX_HOSTNAME_ENV}
 KFX_PUBLIC_FQDN=${PUBLIC_FQDN_ENV}
 KFX_SIP_NUMBER=${SIP_NUMBER}
 KFX_SIP_PASSWORD=${SIP_PASSWORD_ENV}
+KFX_ADMIN_PASSWORD=${ADMIN_PASSWORD_ENV}
 KFX_FAX_DID=${FAX_DID}
 KFX_AMI_SECRET=${AMI_SECRET_ENV}
 KFX_SIP_BIND_PORT=${SIP_BIND_PORT}
 KFX_RTP_START=${RTP_START}
 KFX_RTP_END=${RTP_END}
 KFX_AST_REF=${AST_REF_ENV}
+KFX_REMOTE_REFRESH=${REMOTE_REFRESH}
+KFX_WEB_REFRESH=${WEB_REFRESH}
+KFX_ASTERISK_MANUAL_MENUSELECT=${AST_MANUAL_MENUSELECT}
+KFX_REBUILD_ASTERISK=${AST_REBUILD}
+KFX_INSTALL_REPORT_WITH_PASSWORDS=${INSTALL_REPORT}
+KFX_REMOVE_USER_NAME=${REMOVE_USER_NAME_ENV}
+KFX_REMOVE_USER_HOME=${REMOVE_USER_HOME}
 
 # defaults used by dialplan module
 KFX_CALLERID_NAME=${KFX_CALLERID_NAME_ENV}
@@ -513,47 +610,40 @@ die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "[$(date -Is)] $*"; }
 sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
 
-ask_yes_no(){
-  local __var="$1"; shift
-  local __prompt="$1"; shift
-  local __def="$1"; shift
-  local __val=""
-  while true; do
-    read -r -p "${__prompt} [${__def}]: " __val
-    __val="${__val:-$__def}"
-    case "$__val" in
-      y|Y|yes|YES) printf -v "$__var" "y"; return 0;;
-      n|N|no|NO)   printf -v "$__var" "n"; return 0;;
-      *) echo "Bitte y/n eingeben.";;
-    esac
-  done
-}
+ENVFILE="/etc/kienzlefax-installer.env"
+[[ -f "$ENVFILE" ]] || die "ENV fehlt: $ENVFILE"
+# shellcheck disable=SC1090
+set -a
+source "$ENVFILE"
+set +a
+
+[[ -n "${KFX_ADMIN_PASSWORD:-}" ]] || die "KFX_ADMIN_PASSWORD fehlt in ${ENVFILE}; Optionen bitte neu setzen."
 
 sep "Admin-Account anlegen + sudo + Samba"
-if id admin >/dev/null 2>&1; then
-  ask_yes_no REGEN "User 'admin' existiert bereits. Neu generieren (inkl. Passwort neu setzen)?" "n"
-  if [[ "$REGEN" == "n" ]]; then
-    log "[OK] admin unverändert gelassen."
-    exit 0
-  fi
-  log "[INFO] admin bleibt bestehen; Passwörter werden neu gesetzt."
-else
+if ! id admin >/dev/null 2>&1; then
   useradd -m -s /bin/bash admin
   log "[OK] User 'admin' angelegt."
 fi
 
-usermod -aG sudo admin || true
+usermod -aG sudo admin
+printf 'admin:%s\n' "$KFX_ADMIN_PASSWORD" | chpasswd
 
-echo
-echo "==== Linux-Login-Passwort für 'admin' setzen (2× Eingabe) ===="
-passwd admin
+if ! id -nG admin | tr ' ' '\n' | grep -qx sudo; then
+  die "User admin ist nicht in der Gruppe sudo."
+fi
 
-echo
-echo "==== Samba-Passwort für 'admin' setzen (2× Eingabe) ===="
-smbpasswd -a admin || true
-smbpasswd -e admin || true
+if command -v smbpasswd >/dev/null 2>&1; then
+  if command -v pdbedit >/dev/null 2>&1 && pdbedit -L -u admin >/dev/null 2>&1; then
+    printf '%s\n%s\n' "$KFX_ADMIN_PASSWORD" "$KFX_ADMIN_PASSWORD" | smbpasswd -s admin
+  else
+    printf '%s\n%s\n' "$KFX_ADMIN_PASSWORD" "$KFX_ADMIN_PASSWORD" | smbpasswd -a -s admin
+  fi
+  smbpasswd -e admin || true
+else
+  die "smbpasswd fehlt; Samba-Paketinstallation pruefen."
+fi
 
-log "[OK] admin: sudo+Samba gesetzt."
+log "[OK] admin: Passwort, sudo und Samba gesetzt."
 EOF
   chmod +x "${MOD_DIR}/30-admin-user.sh"
 
@@ -594,9 +684,8 @@ sep "Webroot bootstrappen (kienzlefax.php + faxton.mp3) + index redirect"
 mkdir -p "${WEBROOT}"
 
 KFXPHP="${WEBROOT}/kienzlefax.php"
-DEF="n"
-[[ -s "$KFXPHP" ]] || DEF="y"
-ask_yes_no DO_PHP "kienzlefax.php neu herunterladen/aktualisieren?" "$DEF"
+DO_PHP="${KFX_WEB_REFRESH:-y}"
+[[ -s "$KFXPHP" ]] || DO_PHP="y"
 if [[ "$DO_PHP" == "y" ]]; then
   curl -fsSL -o "${KFXPHP}" "${WEB_URL_RAW}"
   log "[OK] kienzlefax.php geladen."
@@ -1017,6 +1106,36 @@ make_asterisk_with_retry(){
   make -j1
 }
 
+configure_asterisk_modules(){
+  local ms="./menuselect/menuselect"
+  local failed=0
+  make menuselect.makeopts
+  [[ -x "$ms" ]] || die "menuselect CLI fehlt: $ms"
+
+  for mod in res_fax app_fax res_fax_spandsp format_tiff; do
+    if ! "$ms" --enable "$mod" menuselect.makeopts; then
+      log "[WARN] Asterisk-Modul konnte nicht automatisch aktiviert werden: $mod"
+      failed=1
+    fi
+  done
+  if ! "$ms" --check-deps menuselect.makeopts; then
+    log "[WARN] Asterisk-menuselect meldet fehlende Abhaengigkeiten."
+    failed=1
+  fi
+
+  if [[ "${KFX_ASTERISK_MANUAL_MENUSELECT:-n}" == "y" ]]; then
+    echo
+    echo "Manuelle Asterisk-Modulpruefung. Beenden/Speichern im Menue mit X."
+    make menuselect
+    "$ms" --check-deps menuselect.makeopts
+    failed=0
+  fi
+
+  if [[ "$failed" != "0" ]]; then
+    die "Asterisk-Fax-Module konnten nicht automatisch aktiviert werden. Installer erneut starten und manuelle Asterisk-Modulpruefung mit y waehlen."
+  fi
+}
+
 ENVFILE="/etc/kienzlefax-installer.env"
 [[ -f "$ENVFILE" ]] || die "ENV fehlt: $ENVFILE"
 # shellcheck disable=SC1090
@@ -1025,7 +1144,7 @@ source "$ENVFILE"
 ASTERISK_SRC_DIR="/usr/src/asterisk"
 ASTERISK_GIT_URL="https://github.com/asterisk/asterisk.git"
 
-sep "Asterisk: Source holen + Build (INTERAKTIV menuselect)"
+sep "Asterisk: Source holen + Build (Fax-Module nichtinteraktiv)"
 mkdir -p "$(dirname "$ASTERISK_SRC_DIR")"
 if [[ ! -d "$ASTERISK_SRC_DIR/.git" ]]; then
   rm -rf "$ASTERISK_SRC_DIR"
@@ -1039,16 +1158,7 @@ git checkout -f "$KFX_AST_REF"
 make distclean >/dev/null 2>&1 || true
 ./configure
 
-echo
-echo "WICHTIG: Jetzt kommt make menuselect (interaktiv)."
-echo "Bitte dort mindestens prüfen/aktivieren:"
-echo "  - res_fax"
-echo "  - app_fax (SendFAX/ReceiveFAX)"
-echo "  - res_fax_spandsp (falls verfügbar/gewünscht)"
-echo "  - format_tiff"
-echo
-read -r -p "ENTER drücken um menuselect zu starten..." _
-make menuselect
+configure_asterisk_modules
 
 BUILD_JOBS="$(asterisk_build_jobs)"
 make_asterisk_with_retry "$BUILD_JOBS"
@@ -1256,6 +1366,187 @@ systemctl enable --now kienzlefax-worker
 log "[OK] Worker Unit aktiv."
 EOF
   chmod +x "${MOD_DIR}/90-worker-unit.sh"
+
+  # 95-install-report
+  cat >"${MOD_DIR}/95-install-report.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+die(){ echo "ERROR: $*" >&2; exit 1; }
+log(){ echo "[$(date -Is)] $*"; }
+sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
+
+ENVFILE="/etc/kienzlefax-installer.env"
+[[ -f "$ENVFILE" ]] || die "ENV fehlt: $ENVFILE"
+# shellcheck disable=SC1090
+set -a
+source "$ENVFILE"
+set +a
+
+if [[ "${KFX_INSTALL_REPORT_WITH_PASSWORDS:-y}" != "y" ]]; then
+  log "[OK] Installationsbericht mit Passwoertern wurde abgewählt."
+  exit 0
+fi
+
+OUT_DIR="/var/spool/asterisk/fax"
+install -d -m 0777 "$OUT_DIR"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+OUT="${OUT_DIR}/installationsbericht_kienzlefax_${STAMP}_bitte_loeschen_mit_passwoertern.pdf"
+HOST="$(hostname 2>/dev/null || echo "${KFX_HOSTNAME:-kienzlefax}")"
+IPS="$(hostname -I 2>/dev/null | xargs || true)"
+[[ -n "$IPS" ]] || IPS="nicht ermittelt"
+
+if ! HOST="$HOST" IPS="$IPS" python3 - "$OUT" <<'PY'
+import os
+import sys
+import textwrap
+from datetime import datetime
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.pdfgen import canvas
+
+out = sys.argv[1]
+env = os.environ
+
+def e(name, default=""):
+    return env.get(name, default)
+
+generated = datetime.now().astimezone().replace(microsecond=0).isoformat()
+hostname = env.get("HOST", "")
+ips = env.get("IPS", "")
+
+lines = [
+    "KienzleFax Installationsbericht",
+    "BITTE LOESCHEN: Dieses Dokument enthaelt Passwoerter im Klartext.",
+    "",
+    f"Erzeugt: {generated}",
+    f"Hostname: {hostname}",
+    f"Aktuelle lokale IP-Adresse(n): {ips}",
+    "",
+    "Empfehlung Netzwerk:",
+    "- Fuer stabile Portweiterleitungen im Router eine feste IP per DHCP-Reservierung setzen.",
+    "- Die Portweiterleitungen sollen auf diese reservierte IP zeigen.",
+    "- DynDNS/Public FQDN ist optional, zur optimalen Stabilitaet aber unbedingt empfohlen.",
+    "",
+    "Provider-Hinweis:",
+    "- Diese Konfiguration ist fuer 1&1 Deutschland vorbereitet.",
+    "- Providerabhaengige Dateien: /etc/asterisk/pjsip.conf und /etc/asterisk/extensions.conf.",
+    "- Installer-Module dazu: installer-modular/pjsip-1und1.sh und installer-modular/extensions.sh.",
+    "",
+    "Zugangsdaten:",
+    f"- SIP Nummer / Username: {e('KFX_SIP_NUMBER')}",
+    f"- SIP Passwort: {e('KFX_SIP_PASSWORD')}",
+    "- Linux Benutzer: admin",
+    f"- Admin Passwort: {e('KFX_ADMIN_PASSWORD')}",
+    "- Samba Benutzer: admin",
+    "- Samba Passwort: identisch mit Admin Passwort",
+    "",
+    "Fax-Portweiterleitungen im Router, nur fuer Fax-Kommunikation:",
+    f"- UDP {e('KFX_SIP_BIND_PORT', '5070')} -> KienzleFax-System (SIP/PJSIP)",
+    f"- UDP {e('KFX_RTP_START', '12000')}-{e('KFX_RTP_END', '12049')} -> KienzleFax-System (RTP)",
+    "- Keine Web-Portweiterleitung fuer 80/443 erforderlich, sofern kein Fernzugriff gewuenscht ist.",
+    "",
+    "Wichtige Dateien:",
+    "- /etc/kienzlefax-installer.env",
+    "- /etc/asterisk/pjsip.conf",
+    "- /etc/asterisk/extensions.conf",
+    "- /etc/asterisk/manager.conf",
+    "- /etc/default/kienzlefax-worker",
+    "- /etc/samba/smb.conf",
+    "- /etc/cups/cupsd.conf",
+    "- /usr/local/bin/kienzlefax-worker.py",
+    "- /usr/local/bin/pdf_with_header.sh",
+    "- /usr/local/bin/scan-ocr-watch.sh",
+    "",
+    "Samba-Shares und Verzeichnisse:",
+    "- pdf-zu-fax -> /srv/kienzlefax/pdf-zu-fax",
+    "- fax-eingang -> /var/spool/asterisk/fax",
+    "- hierhin-scannen-fuer-ocr -> /srv/scan/eingang",
+    "- scan-eingang -> /srv/scan/ocr",
+    "",
+    "Weitere Verzeichnisse:",
+    "- Sendeberichte: /srv/kienzlefax/sendeberichte",
+    "- Sendefehler Eingang: /srv/kienzlefax/sendefehler/eingang",
+    "- Sendefehler Berichte: /srv/kienzlefax/sendefehler/berichte",
+    "- Interne Queue: /srv/kienzlefax/queue",
+    "- Interne Verarbeitung: /srv/kienzlefax/processing",
+    "- Fax-OCR Eingang intern: /srv/scan/fax-eingang",
+    "- Fax-OCR Archiv intern: /srv/scan/fax-archiv",
+]
+
+c = canvas.Canvas(out, pagesize=A4)
+w, h = A4
+left = 18 * mm
+top = h - 18 * mm
+bottom = 16 * mm
+y = top
+
+def draw_line(text, bold=False):
+    global y
+    if y < bottom:
+        c.showPage()
+        y = top
+    c.setFont("Helvetica-Bold" if bold else "Helvetica", 11 if bold else 9)
+    c.drawString(left, y, text)
+    y -= 5.2 * mm
+
+for idx, line in enumerate(lines):
+    if line == "":
+        y -= 2.5 * mm
+        continue
+    wrapped = textwrap.wrap(line, width=95) or [line]
+    for part_idx, part in enumerate(wrapped):
+        draw_line(part, bold=(idx == 0 or line.startswith("BITTE LOESCHEN")))
+
+c.save()
+PY
+then
+  log "[WARN] Installationsbericht konnte nicht als PDF erzeugt werden."
+  exit 0
+fi
+
+chmod 0666 "$OUT" || true
+log "[OK] Installationsbericht erzeugt: $OUT"
+log "[WARN] Dieser Bericht enthaelt Passwoerter im Klartext und sollte nach der Dokumentation geloescht werden."
+EOF
+  chmod +x "${MOD_DIR}/95-install-report.sh"
+
+  # 96-remove-initial-user
+  cat >"${MOD_DIR}/96-remove-initial-user.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+die(){ echo "ERROR: $*" >&2; exit 1; }
+log(){ echo "[$(date -Is)] $*"; }
+sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
+
+ENVFILE="/etc/kienzlefax-installer.env"
+[[ -f "$ENVFILE" ]] || die "ENV fehlt: $ENVFILE"
+# shellcheck disable=SC1090
+source "$ENVFILE"
+
+[[ -n "${KFX_REMOVE_USER_NAME:-}" ]] || exit 0
+
+sep "Optionaler Benutzer-Abschluss"
+case "$KFX_REMOVE_USER_NAME" in
+  root|admin) die "Sicherheitsabbruch: Benutzer '${KFX_REMOVE_USER_NAME}' darf nicht entfernt werden.";;
+esac
+
+id admin >/dev/null 2>&1 || die "admin existiert nicht; Benutzer '${KFX_REMOVE_USER_NAME}' wird nicht entfernt."
+if ! id -nG admin | tr ' ' '\n' | grep -qx sudo; then
+  die "admin ist nicht in sudo; Benutzer '${KFX_REMOVE_USER_NAME}' wird nicht entfernt."
+fi
+
+if id "$KFX_REMOVE_USER_NAME" >/dev/null 2>&1; then
+  if [[ "${KFX_REMOVE_USER_HOME:-n}" == "y" ]]; then
+    userdel -r "$KFX_REMOVE_USER_NAME" || log "[WARN] Benutzer '${KFX_REMOVE_USER_NAME}' konnte nicht entfernt werden. Vermutlich laufen noch Prozesse dieses Benutzers."
+  else
+    userdel "$KFX_REMOVE_USER_NAME" || log "[WARN] Benutzer '${KFX_REMOVE_USER_NAME}' konnte nicht entfernt werden. Vermutlich laufen noch Prozesse dieses Benutzers."
+  fi
+else
+  log "[OK] Benutzer '${KFX_REMOVE_USER_NAME}' existiert nicht mehr."
+fi
+EOF
+  chmod +x "${MOD_DIR}/96-remove-initial-user.sh"
 }
 
 # ------------------------------------------------------------------------------
@@ -1267,7 +1558,14 @@ export DEBIAN_FRONTEND=noninteractive
 sep "Bootstrap lokale Module"
 bootstrap_local_modules
 
-sep "Remote Module einzeln holen/aktualisieren"
+sep "Optionen sammeln"
+run_module "${MOD_DIR}/00-base.sh"
+
+# Load ENV early so the remaining installation can run without further prompts.
+# shellcheck disable=SC1090
+source "$ENVFILE"
+
+sep "Remote Module holen/aktualisieren"
 maybe_fetch_one "extensions.sh"      "$URL_EXTENSIONS"      "${MOD_CACHE}/extensions.sh"
 maybe_fetch_one "pjsip-1und1.sh"     "$URL_PJSIP_1UND1"     "${MOD_CACHE}/pjsip-1und1.sh"
 maybe_fetch_one "worker.sh"          "$URL_WORKER"          "${MOD_CACHE}/worker.sh"
@@ -1276,7 +1574,6 @@ maybe_fetch_one "pdf_with_header.sh" "$URL_PDF_WITH_HEADER" "${MOD_CACHE}/pdf_wi
 maybe_fetch_one "scan_ocr.sh"        "$URL_SCAN_OCR"        "${MOD_CACHE}/scan_ocr.sh"
 
 sep "Module ausführen (feste Reihenfolge)"
-run_module "${MOD_DIR}/00-base.sh"
 run_module "${MOD_DIR}/10-packages.sh"
 run_module "${MOD_DIR}/20-dirs-acl.sh"
 run_module "${MOD_DIR}/30-admin-user.sh"
@@ -1286,15 +1583,7 @@ run_module "${MOD_DIR}/50-cups-samba.sh"
 sep "Remote Scan-OCR installieren"
 run_remote_script "${MOD_CACHE}/scan_ocr.sh"
 
-# Asterisk build decision
-ASTERISK_DETECTED="n"
-command -v asterisk >/dev/null 2>&1 && ASTERISK_DETECTED="y"
-if [[ "$ASTERISK_DETECTED" == "y" ]]; then
-  ask_yes_no DO_ASTERISK_BUILD "Asterisk ist bereits installiert. Nochmal aus Source kompilieren?" "n"
-else
-  DO_ASTERISK_BUILD="y"
-fi
-
+DO_ASTERISK_BUILD="${KFX_REBUILD_ASTERISK:-y}"
 if [[ "$DO_ASTERISK_BUILD" == "y" ]]; then
   run_module "${MOD_DIR}/60-asterisk-build.sh"
 else
@@ -1359,6 +1648,10 @@ run_module "${MOD_DIR}/90-worker-unit.sh"
 sep "Remote pdf_with_header.sh installieren"
 run_remote_script "${MOD_CACHE}/pdf_with_header.sh"
 
+sep "Installationsbericht"
+run_module "${MOD_DIR}/95-install-report.sh"
+run_module "${MOD_DIR}/96-remove-initial-user.sh"
+
 sep "Reloads + Status"
 asterisk_rx "core reload"
 asterisk_rx "pjsip reload"
@@ -1379,4 +1672,7 @@ echo "Web SSL (self-signed 50y): https://$(hostname)/"
 echo "SIP Bind Port (Provider): ${KFX_SIP_BIND_PORT}"
 echo "RTP: ${KFX_RTP_START}-${KFX_RTP_END}"
 echo "AMI: 127.0.0.1:5038 user=kfx (secret in /etc/default/kienzlefax-worker)"
+if [[ "${KFX_INSTALL_REPORT_WITH_PASSWORDS:-y}" == "y" ]]; then
+  echo "Installationsbericht: /var/spool/asterisk/fax/installationsbericht_kienzlefax_*_bitte_loeschen_mit_passwoertern.pdf"
+fi
 echo "Remote module cache: ${MOD_CACHE}"
