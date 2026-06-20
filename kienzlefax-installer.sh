@@ -2,7 +2,7 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.3.2
+# Version: 3.3.6
 # Stand:   2026-06-20
 # Autor:   Dr. Thomas Kienzle
 #
@@ -90,6 +90,23 @@
 # - Laufoptionen werden bei jedem Installerstart neu abgefragt, auch wenn die Grundkonfiguration
 #   wiederverwendet wird: Remote-Module, Web-Update, Asterisk-Rebuild, Bericht, Benutzerentfernung.
 # - Installationsbericht warnt klar: Web-Ports 80/443 niemals ins Internet weiterleiten.
+#
+# NEU in 3.3.3:
+# - Ausgehende Fax-Kopfzeile nutzt ein schmaleres Headerband und kleinere Schrift,
+#   damit weitergeleitete Faxe deutlich weniger verkleinert werden.
+#
+# NEU in 3.3.4:
+# - Samba-Share `sendeberichte` verzichtet auf eine nicht angelegte Force-Gruppe,
+#   damit der Admin-Zugriff nicht an einer fehlenden lokalen Gruppe scheitert.
+#
+# NEU in 3.3.5:
+# - Admin-User uebernimmt vorhandene SSH-authorized_keys des bisherigen Installationsusers,
+#   damit Public-Key-only-SSH den Admin-Zugang nicht blockiert.
+# - Wenn der optionale alte User wegen laufender Prozesse nicht geloescht werden kann,
+#   wird sein Login gesperrt und sein SSH-Key deaktiviert.
+#
+# NEU in 3.3.6:
+# - Admin-Passwort kann am Anfang wahlweise manuell gesetzt oder sicher generiert werden.
 # ==============================================================================
 
 set -euo pipefail
@@ -345,6 +362,25 @@ read_secret_twice(){
   done
 }
 
+generate_secure_password(){
+  local pw=""
+  if command -v python3 >/dev/null 2>&1; then
+    pw="$(python3 - <<'PY'
+import secrets
+alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+print("".join(secrets.choice(alphabet) for _ in range(28)))
+PY
+)"
+  fi
+
+  if [[ ${#pw} -lt 24 ]] && command -v openssl >/dev/null 2>&1; then
+    pw="$(openssl rand -base64 64 2>/dev/null | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 28 || true)"
+  fi
+
+  [[ ${#pw} -ge 24 ]] || die "Konnte kein sicheres Admin-Passwort generieren."
+  printf '%s' "$pw"
+}
+
 sanitize_digits(){ echo "$1" | tr -cd '0-9'; }
 
 detect_current_user_candidate(){
@@ -488,8 +524,15 @@ echo "==== SIP Passwort eingeben (sichtbar aus = nein) ===="
 read_secret_twice SIP_PASSWORD "SIP Passwort"
 
 echo
-echo "==== Admin-Passwort eingeben (Linux admin + Samba admin; sichtbar aus = nein) ===="
-read_secret_twice ADMIN_PASSWORD "Admin-Passwort"
+echo "==== Admin-Passwort (Linux admin + Samba admin) ===="
+ask_yes_no ADMIN_PASSWORD_GENERATE "Sicheres Admin-Passwort automatisch generieren?" "y"
+if [[ "$ADMIN_PASSWORD_GENERATE" == "y" ]]; then
+  ADMIN_PASSWORD="$(generate_secure_password)"
+  echo "[OK] Admin-Passwort wurde generiert. Es steht im Installationsbericht und root-only in ${ENVFILE}."
+else
+  echo "Admin-Passwort manuell eingeben (sichtbar aus = nein)."
+  read_secret_twice ADMIN_PASSWORD "Admin-Passwort"
+fi
 
 read -r -p "FAX DID (Enter = ${SIP_NUMBER}): " FAX_DID_IN
 FAX_DID="$(sanitize_digits "${FAX_DID_IN:-$SIP_NUMBER}")"
@@ -660,6 +703,45 @@ set +a
 
 [[ -n "${KFX_ADMIN_PASSWORD:-}" ]] || die "KFX_ADMIN_PASSWORD fehlt in ${ENVFILE}; Optionen bitte neu setzen."
 
+detect_source_ssh_user(){
+  local cand=""
+  cand="${SUDO_USER:-}"
+  if [[ -z "$cand" || "$cand" == "root" || "$cand" == "admin" ]]; then
+    cand="$(logname 2>/dev/null || true)"
+  fi
+  if [[ -n "$cand" && "$cand" != "root" && "$cand" != "admin" ]] && id "$cand" >/dev/null 2>&1; then
+    printf '%s\n' "$cand"
+  fi
+}
+
+copy_authorized_keys_to_admin(){
+  local src_user src_home admin_home src_keys dst_keys
+  src_user="$(detect_source_ssh_user || true)"
+  [[ -n "$src_user" ]] || return 0
+
+  src_home="$(getent passwd "$src_user" | cut -d: -f6 || true)"
+  admin_home="$(getent passwd admin | cut -d: -f6 || true)"
+  [[ -n "$src_home" && -n "$admin_home" ]] || return 0
+
+  src_keys="${src_home}/.ssh/authorized_keys"
+  dst_keys="${admin_home}/.ssh/authorized_keys"
+  [[ -s "$src_keys" ]] || return 0
+
+  install -d -m 0700 -o admin -g admin "${admin_home}/.ssh"
+  touch "$dst_keys"
+  chmod 0600 "$dst_keys"
+  chown admin:admin "$dst_keys"
+
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    grep -Fxq "$key" "$dst_keys" 2>/dev/null || printf '%s\n' "$key" >>"$dst_keys"
+  done <"$src_keys"
+
+  chmod 0600 "$dst_keys"
+  chown admin:admin "$dst_keys"
+  log "[OK] SSH authorized_keys von '${src_user}' fuer admin uebernommen."
+}
+
 sep "Admin-Account anlegen + sudo + Samba"
 if ! id admin >/dev/null 2>&1; then
   useradd -m -s /bin/bash admin
@@ -683,6 +765,8 @@ if command -v smbpasswd >/dev/null 2>&1; then
 else
   die "smbpasswd fehlt; Samba-Paketinstallation pruefen."
 fi
+
+copy_authorized_keys_to_admin
 
 log "[OK] admin: Passwort, sudo und Samba gesetzt."
 EOF
@@ -1050,7 +1134,6 @@ cat > /etc/samba/smb.conf <<EOFSMB
    read only = yes
    guest ok = no
    valid users = admin
-   force group = kienzlefax
    create mask = 0640
    directory mask = 2750
 
@@ -1579,6 +1662,27 @@ case "$KFX_REMOVE_USER_NAME" in
   root|admin) die "Sicherheitsabbruch: Benutzer '${KFX_REMOVE_USER_NAME}' darf nicht entfernt werden.";;
 esac
 
+disable_user_login(){
+  local user="$1" home shell stamp
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  log "[WARN] Deaktiviere Login fuer Benutzer '${user}', weil vollstaendiges Loeschen momentan nicht moeglich ist."
+
+  passwd -l "$user" >/dev/null 2>&1 || true
+  chage -E 0 "$user" >/dev/null 2>&1 || true
+  gpasswd -d "$user" sudo >/dev/null 2>&1 || true
+
+  shell="/usr/sbin/nologin"
+  [[ -x "$shell" ]] || shell="$(command -v nologin 2>/dev/null || true)"
+  if [[ -n "$shell" && -x "$shell" ]]; then
+    usermod -s "$shell" "$user" >/dev/null 2>&1 || true
+  fi
+
+  home="$(getent passwd "$user" | cut -d: -f6 || true)"
+  if [[ -n "$home" && -f "${home}/.ssh/authorized_keys" ]]; then
+    mv "${home}/.ssh/authorized_keys" "${home}/.ssh/authorized_keys.disabled-kienzlefax.${stamp}" 2>/dev/null || true
+  fi
+}
+
 id admin >/dev/null 2>&1 || die "admin existiert nicht; Benutzer '${KFX_REMOVE_USER_NAME}' wird nicht entfernt."
 if ! id -nG admin | tr ' ' '\n' | grep -qx sudo; then
   die "admin ist nicht in sudo; Benutzer '${KFX_REMOVE_USER_NAME}' wird nicht entfernt."
@@ -1586,9 +1690,15 @@ fi
 
 if id "$KFX_REMOVE_USER_NAME" >/dev/null 2>&1; then
   if [[ "${KFX_REMOVE_USER_HOME:-n}" == "y" ]]; then
-    userdel -r "$KFX_REMOVE_USER_NAME" || log "[WARN] Benutzer '${KFX_REMOVE_USER_NAME}' konnte nicht entfernt werden. Vermutlich laufen noch Prozesse dieses Benutzers."
+    if ! userdel -r "$KFX_REMOVE_USER_NAME"; then
+      log "[WARN] Benutzer '${KFX_REMOVE_USER_NAME}' konnte nicht entfernt werden. Vermutlich laufen noch Prozesse dieses Benutzers."
+      disable_user_login "$KFX_REMOVE_USER_NAME"
+    fi
   else
-    userdel "$KFX_REMOVE_USER_NAME" || log "[WARN] Benutzer '${KFX_REMOVE_USER_NAME}' konnte nicht entfernt werden. Vermutlich laufen noch Prozesse dieses Benutzers."
+    if ! userdel "$KFX_REMOVE_USER_NAME"; then
+      log "[WARN] Benutzer '${KFX_REMOVE_USER_NAME}' konnte nicht entfernt werden. Vermutlich laufen noch Prozesse dieses Benutzers."
+      disable_user_login "$KFX_REMOVE_USER_NAME"
+    fi
   fi
 else
   log "[OK] Benutzer '${KFX_REMOVE_USER_NAME}' existiert nicht mehr."

@@ -44,7 +44,10 @@ Diese Datei fasst die Projektvorgaben zusammen. Sie dient als verbindliche Arbei
 - Grundkonfiguration darf wiederverwendet werden, aber Laufoptionen muessen bei jedem Installerstart neu gefragt werden: Remote-Module aktualisieren, Weboberflaeche aktualisieren, Asterisk-Rebuild, manuelles menuselect, Installationsbericht, optionaler Benutzerentfernungs-Schritt.
 - Wenn Asterisk erkannt wird, fragt der Installer am Anfang, ob Asterisk erneut kompiliert werden soll; Default bei vorhandenem Asterisk: `nein`.
 - Der Installer fragt am Anfang ein Admin-Passwort ab und setzt damit Linux-User `admin` und Samba-User `admin`; `admin` muss normale sudo-Rechte mit Passwortabfrage haben.
+- Das Admin-Passwort kann am Anfang entweder manuell gesetzt oder sicher generiert werden; generierte Passwoerter nicht im Terminal-Log ausgeben, sondern nur in ENV/Installationsbericht.
+- Wenn SSH auf Public-Key-only steht, soll der Installer vorhandene `authorized_keys` des bisherigen Installationsusers nach `admin` uebernehmen, damit `admin` erreichbar ist.
 - Optional darf der bisherige Erstbenutzer entfernt werden, aber nur nach Sicherheitschecks und nie `root` oder `admin`.
+- Falls der alte Erstbenutzer wegen aktiver SSH-/Login-Prozesse nicht direkt geloescht werden kann, muss der Installer dessen Login sperren und vorhandene SSH-Keys deaktivieren.
 - Wenn User `admin` bereits existiert, fragt der Installer, ob `admin` neu generiert bzw. Passwörter neu gesetzt werden sollen; Default: `nein`.
 
 ## Aktuelle Remote-Module
@@ -204,7 +207,7 @@ WantedBy=multi-user.target
 - Samba `smb.conf` darf deterministisch geschrieben werden, wenn bisher so vorgesehen.
 - Shares: `printers`, `pdf-zu-fax`, `sendefehler-eingang`, `sendefehler-berichte`, `sendeberichte`, `fax-eingang`.
 - `fax-eingang` zeigt auf `/var/spool/asterisk/fax`.
-- `sendeberichte` nur fuer `admin`, `guest ok = no`.
+- `sendeberichte` nur fuer `admin`, `guest ok = no`; keine nicht angelegte `force group` setzen.
 - `pdf-zu-fax` und Fehler-Eingänge `guest ok = yes`, sofern bisher so vorgesehen.
 
 ## Scan-OCR
@@ -229,7 +232,7 @@ WantedBy=multi-user.target
 - Der bestehende Share `fax-eingang` zeigt weiter auf `/var/spool/asterisk/fax` und enthaelt dadurch OCR-Ergebnis oder Fallback-PDF, nicht die Roh-PDF vor OCR.
 - Installationsbericht mit Klartext-Passwoertern wird standardmaessig erzeugt, wenn am Anfang nicht abgewählt. Ziel: `/var/spool/asterisk/fax/installationsbericht_kienzlefax_*_bitte_loeschen_mit_passwoertern.pdf`.
 - Bericht enthaelt SIP-Passwort, Admin-Passwort, aktuelle lokale IP, Empfehlung feste IP per DHCP-Reservierung, Fax-Portweiterleitungen, wichtige Config-Dateien und Share-/Verzeichnisuebersicht.
-- Ausgehende Fax-Kopfzeile darf Inhalte nicht ueberdrucken: A4 beibehalten, oben Headerband reservieren, Originalinhalt minimal darunter verkleinern.
+- Ausgehende Fax-Kopfzeile darf Inhalte nicht ueberdrucken: A4 beibehalten, oben nur ein schmales Headerband reservieren, Originalinhalt minimal darunter verkleinern. Default: Headerband 6 mm, Top-Offset 4 mm, Schrift 8 pt; staerkere Verkleinerung nur nach Ruecksprache.
 
 ## Remote-Script-Kompatibilität
 
