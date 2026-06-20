@@ -2,7 +2,7 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.3.0
+# Version: 3.3.1
 # Stand:   2026-06-20
 # Autor:   Dr. Thomas Kienzle
 #
@@ -81,6 +81,10 @@
 # - Installationsbericht mit SIP-/Admin-Passwort, aktueller IP, Portweiterleitungen, Config-Dateien und Share-Uebersicht.
 # - Ausgehende Fax-Kopfzeile reserviert ein Headerband und verkleinert den Seiteninhalt minimal.
 # - OCR-Eingangsshare heisst `hierhin-scannen-fuer-ocr` statt `scan-to-ocr`.
+#
+# NEU in 3.3.1:
+# - Asterisk-menuselect behandelt versionsabhaengig fehlende Optionen `app_fax` und `format_tiff`
+#   als optional; Pflicht fuer Fax bleibt `res_fax` und `res_fax_spandsp`.
 # ==============================================================================
 
 set -euo pipefail
@@ -1112,12 +1116,19 @@ configure_asterisk_modules(){
   make menuselect.makeopts
   [[ -x "$ms" ]] || die "menuselect CLI fehlt: $ms"
 
-  for mod in res_fax app_fax res_fax_spandsp format_tiff; do
+  for mod in res_fax res_fax_spandsp; do
     if ! "$ms" --enable "$mod" menuselect.makeopts; then
-      log "[WARN] Asterisk-Modul konnte nicht automatisch aktiviert werden: $mod"
+      log "[WARN] Asterisk-Pflichtmodul konnte nicht automatisch aktiviert werden: $mod"
       failed=1
     fi
   done
+
+  for mod in app_fax format_tiff; do
+    if ! "$ms" --enable "$mod" menuselect.makeopts; then
+      log "[INFO] Asterisk-Option ist in diesem Source-Tree nicht vorhanden oder nicht separat waehlbar: $mod"
+    fi
+  done
+
   if ! "$ms" --check-deps menuselect.makeopts; then
     log "[WARN] Asterisk-menuselect meldet fehlende Abhaengigkeiten."
     failed=1

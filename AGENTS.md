@@ -74,7 +74,8 @@ Diese Datei fasst die Projektvorgaben zusammen. Sie dient als verbindliche Arbei
 - `make menuselect` wird standardmaessig nicht geoeffnet; falls es manuell geoeffnet wird, im Hinweis klar sagen: Beenden/Speichern mit `X`.
 - Auf frischen Raspberry-Pi-OS/Systemd-Systemen darf `systemd-sysv-install enable asterisk` den Installer nicht blockieren; der Installer stellt deshalb eine native `/etc/systemd/system/asterisk.service` sicher und fuehrt `make config` nur mit Timeout aus.
 - Asterisk/pjproject kann auf Raspberry Pi bei zu viel Parallelisierung mit unspezifischem `Error 2` abbrechen; Installer nicht mit `make -j$(nproc)` bauen lassen, sondern max. 2 Jobs und automatischer Retry `make -j1`.
-- Nichtinteraktiv aktivieren: `res_fax`, `app_fax` / `SendFAX` / `ReceiveFAX`, `res_fax_spandsp`, `format_tiff`.
+- Nichtinteraktiv als Pflicht aktivieren: `res_fax`, `res_fax_spandsp`.
+- Versionsabhaengig optionale Menuselect-Namen wie `app_fax` und `format_tiff` nur aktivieren, wenn vorhanden; deren Fehlen darf den Build nicht abbrechen.
 - Asterisk-PJSIP bindet an `0.0.0.0`.
 - SIP-Port wird am Anfang abgefragt; Default `5070`.
 - RTP-Range wird am Anfang abgefragt; Default `12000-12049`.
