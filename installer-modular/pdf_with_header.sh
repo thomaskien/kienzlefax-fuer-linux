@@ -14,7 +14,7 @@ set -euo pipefail
 #   PRACTICE_NAME="Praxis Dr. Beispiel"
 #   DATE_FMT="%d.%m.%Y %H:%M"
 #   TOP_OFFSET_MM="4"     # distance from top edge to text baseline (smaller => higher)
-#   HEADER_BAND_MM="6"    # slim reserved top band; original content is scaled below it
+#   HEADER_BAND_MM="3"    # slim reserved top band; original content is scaled below it
 #   FONT_NAME="Helvetica"
 #   FONT_SIZE="8"
 #   LEFT_MARGIN_MM="12"
@@ -37,7 +37,7 @@ PRACTICE_NAME="${PRACTICE_NAME:-KienzleFax}"
 DATE_FMT="${DATE_FMT:-%d.%m.%Y %H:%M}"
 
 TOP_OFFSET_MM="${TOP_OFFSET_MM:-4}"
-HEADER_BAND_MM="${HEADER_BAND_MM:-6}"
+HEADER_BAND_MM="${HEADER_BAND_MM:-3}"
 LEFT_MARGIN_MM="${LEFT_MARGIN_MM:-12}"
 RIGHT_MARGIN_MM="${RIGHT_MARGIN_MM:-12}"
 

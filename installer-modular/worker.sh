@@ -3,7 +3,7 @@ sudo tee /usr/local/bin/kienzlefax-worker.py >/dev/null <<'PY'
 # -*- coding: utf-8 -*-
 """
 kienzlefax-worker.py — Asterisk-Only Worker (SendFAX)
-Version: 1.3.12
+Version: 1.3.14
 Stand:  2026-06-23
 Autor:  Dr. Thomas Kienzle
 
@@ -62,6 +62,13 @@ Changelog (komplett):
     aktuelle Seite aus `fax show session`, Gesamtseiten aus `tiffinfo doc.tif`,
     Datenrate, Session, Kanal und Call-Dauer werden in job.json unter
     live.asterisk_fax geschrieben.
+- 1.3.13:
+  - Live-Session-Erkennung robuster:
+    Faxsessions werden ueber `fax show session <id>` und `File Name` dem Job zugeordnet,
+    statt die Session-ID aus einer kanalabhaengigen Tabellenzeile ableiten zu muessen.
+- 1.3.14:
+  - FIX: `fax show sessions` auf Asterisk listet die Session-ID als Spalte FAXID,
+    nicht zwingend am Zeilenanfang. Parser erkennt dieses Tabellenformat jetzt.
 """
 
 import fcntl
@@ -248,20 +255,31 @@ def _tiff_page_count(path: str) -> Optional[int]:
             _tiff_pages_cache.pop(k, None)
     return pages
 
-def _parse_fax_sessions(text: str) -> Dict[str, int]:
-    out: Dict[str, int] = {}
+def _parse_fax_session_ids(text: str) -> List[int]:
+    out: List[int] = []
     for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
-        m = re.match(r"^(\d+)\s+(\S+)", line)
-        if not m:
+        low = line.lower()
+        if low.startswith("current fax sessions") or low.startswith("channel ") or "fax sessions" in low:
             continue
-        channel = m.group(2)
-        try:
-            out[channel] = int(m.group(1))
-        except Exception:
-            pass
+
+        candidates: List[str] = []
+        m = re.match(r"^(\d+)\b", line)
+        if m:
+            candidates.append(m.group(1))
+        else:
+            parts = line.split()
+            candidates.extend(p for p in parts if re.match(r"^\d+$", p))
+
+        for cand in candidates:
+            try:
+                sid = int(cand)
+            except Exception:
+                continue
+            if sid not in out:
+                out.append(sid)
     return out
 
 def _parse_fax_session_details(text: str) -> Dict[str, Any]:
@@ -305,32 +323,23 @@ def _find_job_for_tiff(tiff_path: str) -> Optional[Path]:
 
 def _collect_asterisk_fax_live() -> Dict[str, Dict[str, Any]]:
     channels = _active_sendfax_channels()
-    if not channels:
-        return {}
 
-    session_by_channel = _parse_fax_sessions(_run_asterisk_rx("fax show sessions", timeout=5))
     out: Dict[str, Dict[str, Any]] = {}
+    live_by_file: Dict[str, Dict[str, Any]] = {}
 
-    for channel in channels:
-        tiff_path = _channel_sendfax_file(channel)
-        jp = _find_job_for_tiff(tiff_path)
+    for session_id in _parse_fax_session_ids(_run_asterisk_rx("fax show sessions", timeout=5)):
+        details = _parse_fax_session_details(_run_asterisk_rx(f"fax show session {session_id}", timeout=5))
+        detail_file = str(details.get("file_name") or "").strip()
+        if not detail_file:
+            continue
+        jp = _find_job_for_tiff(detail_file)
         if jp is None:
             continue
 
-        jobid = jp.parent.name
-        session_id = session_by_channel.get(channel)
-        details: Dict[str, Any] = {}
-        if session_id is not None:
-            details = _parse_fax_session_details(_run_asterisk_rx(f"fax show session {session_id}", timeout=5))
-
-        detail_file = str(details.get("file_name") or "").strip()
-        if detail_file:
-            tiff_path = detail_file
-
-        out[jobid] = {
+        live_by_file[detail_file] = {
             "active": True,
             "updated_at": now_iso(),
-            "channel": str(details.get("channel") or channel),
+            "channel": str(details.get("channel") or ""),
             "session": details.get("session") if details.get("session") is not None else session_id,
             "operation": str(details.get("operation") or ""),
             "state": str(details.get("state") or ""),
@@ -341,6 +350,37 @@ def _collect_asterisk_fax_live() -> Dict[str, Dict[str, Any]]:
             "page_number": details.get("page_number"),
             "tx_pages": details.get("tx_pages"),
             "rx_pages": details.get("rx_pages"),
+            "file_name": detail_file,
+            "total_pages": _tiff_page_count(detail_file),
+        }
+        out[jp.parent.name] = live_by_file[detail_file]
+
+    for channel in channels:
+        tiff_path = _channel_sendfax_file(channel)
+        jp = _find_job_for_tiff(tiff_path)
+        if jp is None:
+            continue
+
+        jobid = jp.parent.name
+        if jobid in out:
+            if not out[jobid].get("channel"):
+                out[jobid]["channel"] = channel
+            continue
+
+        out[jobid] = {
+            "active": True,
+            "updated_at": now_iso(),
+            "channel": channel,
+            "session": None,
+            "operation": "",
+            "state": "",
+            "last_status": "",
+            "ecm_mode": "",
+            "data_rate": None,
+            "image_resolution": "",
+            "page_number": None,
+            "tx_pages": None,
+            "rx_pages": None,
             "file_name": tiff_path,
             "total_pages": _tiff_page_count(tiff_path),
         }
@@ -1247,7 +1287,7 @@ def step_submit() -> None:
 def main() -> None:
     ensure_dirs()
     acquire_lock()
-    log("started (v1.3.12)")
+    log("started (v1.3.14)")
     try:
         while True:
             step_update_asterisk_fax_live()
