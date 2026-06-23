@@ -3,11 +3,35 @@
  * kienzlefax.php
  * Producer Web-UI (sendet NICHT selbst).
  *
- * Version: 1.4
+ * Version: 1.4.6
  * Author: Dr. Thomas Kienzle
- * Stand: 2026-06-22
+ * Stand: 2026-06-23
  *
  * Changelog (komplett):
+ * - 1.4.6 (2026-06-23):
+ *   - UI: Eingangszaehler in der Sidebar kompakter dargestellt, damit der Eingaenge-Tab nicht zu breit wird.
+ *
+ * - 1.4.5 (2026-06-23):
+ *   - UI: Eingaenge-Tab zeigt prominent getrennte Live-Zaehler fuer Fax-Eingang und Scan-Eingang.
+ *   - Audio: Bei neu eingegangenen Fax-/Scan-Dateien wird eine dezente Glocke abgespielt.
+ *
+ * - 1.4.4 (2026-06-23):
+ *   - UI: Neue Ansicht Eingaenge mit Fax-Eingang und Scan-Eingang; Faxdateien zeigen Datum/Uhrzeit,
+ *     Absendernummer und gespeicherten Telefonbuchnamen.
+ *
+ * - 1.4.3 (2026-06-23):
+ *   - UI: Beim erneuten Senden aus der Quelle Sendefehler wird der zugehoerige Fehlerbericht
+ *     automatisch sofort ins Sendeprotokoll uebernommen.
+ *
+ * - 1.4.2 (2026-06-23):
+ *   - UI: Aktive Jobs zeigen die Fax-Datenrate nur noch im Tooltip, nicht mehr in der kompakten Statuszeile.
+ *
+ * - 1.4.1 (2026-06-23):
+ *   - UI: Aktive Jobs zeigen bei bekannter Gesamtseitenzahl ab Sendebeginn 1/gesamt statt ?/gesamt.
+ *   - UI: Sendeprotokoll liest Asterisk-Faxseiten aus result.faxpages_sent/result.faxpages_total/result.faxpages_raw.
+ *   - UI: Sendeprotokoll zeigt Ende in deutscher Zeit.
+ *   - UI: Sendeprotokoll zeigt bevorzugt die echte Asterisk-Uebertragungsdauer aus live.asterisk_fax.elapsed_sec.
+ *
  * - 1.4 (2026-06-22):
  *   - Quellen: fax-Drucker und PDF-zu-Fax-Ordner werden aus /srv/kienzlefax/config/sources.json geladen;
  *     bei fehlender/ungueltiger Datei bleibt der alte Standard fax1..fax5 + pdf-zu-fax + sendefehler aktiv.
@@ -16,6 +40,7 @@
  *   - Beauftragen: Bei Fehlern waehrend der Job-Anlage werden Teil-Jobs bestmoeglich entfernt und Originale bleiben liegen.
  *   - UI: PDF-Liste der aktuellen Quelle aktualisiert automatisch per AJAX, ohne Empfaenger-Eingaben zu ersetzen.
  *   - UI: Aktive Jobs zeigen Asterisk-Live-Details: aktuelle/gesamte Seiten, Call-Dauer und Datenrate.
+ *   - UI: Sendeprotokoll zeigt Ende in deutscher Zeit und bevorzugt die echte Asterisk-Uebertragungsdauer.
  *   - UI: Footer verlinkt kienzlefax auf kienzlefax.de.
  *
  * - 1.3 (2026-02-15):
@@ -172,6 +197,8 @@ $DIR_PROC     = $BASE . '/processing';
 $DIR_ARCHIVE  = $BASE . '/sendeberichte';
 $DIR_FAIL_IN  = $BASE . '/sendefehler/eingang';
 $DIR_FAIL_REP = $BASE . '/sendefehler/berichte';
+$DIR_FAX_INBOX  = '/var/spool/asterisk/fax';
+$DIR_SCAN_INBOX = '/srv/scan/ocr';
 
 $DB_PATH      = $BASE . '/phonebook.sqlite';
 
@@ -211,9 +238,10 @@ $MAX_LIST_FILES   = 500;
 $MAX_ACTIVE_JOBS  = 12;
 $MAX_FAIL_LIST    = 200;
 $MAX_ARCHIVE_LIST = 25;
+$MAX_INBOX_LIST   = 200;
 
 $APP_TITLE   = 'kienzlefax';
-$APP_VERSION = '1.4';
+$APP_VERSION = '1.4.6';
 $APP_AUTHOR  = 'Dr. Thomas Kienzle';
 
 // Audio-Datei (liegt neben dieser PHP)
@@ -487,12 +515,56 @@ function parse_iso_time(?string $s): ?int {
   return $t === false ? null : $t;
 }
 
+function format_local_datetime(?string $s): string {
+  $s = trim((string)$s);
+  if ($s === '') return '';
+  try {
+    $dt = new DateTimeImmutable($s);
+    $dt = $dt->setTimezone(new DateTimeZone('Europe/Berlin'));
+    return $dt->format('d.m.Y H:i:s');
+  } catch (Throwable $e) {
+    return $s;
+  }
+}
+
+function format_unix_local_datetime(?int $ts): string {
+  if ($ts === null || $ts <= 0) return '';
+  try {
+    $dt = (new DateTimeImmutable('@' . $ts))->setTimezone(new DateTimeZone('Europe/Berlin'));
+    return $dt->format('d.m.Y H:i:s');
+  } catch (Throwable $e) {
+    return '';
+  }
+}
+
 function format_duration(?int $sec): string {
   if ($sec === null || $sec < 0) return '';
   $m = intdiv($sec, 60);
   $s = $sec % 60;
   if ($m <= 0) return $s . ' s';
   return $m . ' min ' . $s . ' s';
+}
+
+function extract_transmission_duration_sec(array $j): ?int {
+  if (isset($j['live']) && is_array($j['live']) && isset($j['live']['asterisk_fax']) && is_array($j['live']['asterisk_fax'])) {
+    $af = $j['live']['asterisk_fax'];
+    if (isset($af['elapsed_sec']) && is_numeric($af['elapsed_sec'])) {
+      return max(0, (int)$af['elapsed_sec']);
+    }
+    if (!empty($af['connected_at']) && !empty($af['updated_at'])) {
+      $t1 = parse_iso_time((string)$af['connected_at']);
+      $t2 = parse_iso_time((string)$af['updated_at']);
+      if ($t1 !== null && $t2 !== null && $t2 >= $t1) return $t2 - $t1;
+    }
+  }
+
+  if (isset($j['result']) && is_array($j['result'])) {
+    foreach (['elapsed_sec', 'duration_sec', 'tx_time_sec'] as $k) {
+      if (isset($j['result'][$k]) && is_numeric($j['result'][$k])) return max(0, (int)$j['result'][$k]);
+    }
+  }
+
+  return null;
 }
 
 function format_hms_compact(?int $sec): string {
@@ -561,6 +633,17 @@ function is_aborted_job(array $j): bool {
 
 function extract_pages(array $j): string {
   if (isset($j['result']) && is_array($j['result'])) {
+    if (array_key_exists('faxpages_sent', $j['result']) || array_key_exists('faxpages_total', $j['result'])) {
+      $sentS = array_key_exists('faxpages_sent', $j['result']) ? trim((string)$j['result']['faxpages_sent']) : '';
+      $totalS = array_key_exists('faxpages_total', $j['result']) ? trim((string)$j['result']['faxpages_total']) : '';
+      if ($sentS !== '' && $totalS !== '') return $sentS . '/' . $totalS;
+      if ($sentS !== '') return $sentS;
+      if ($totalS !== '') return $totalS;
+    }
+
+    $fr = isset($j['result']['faxpages_raw']) ? trim((string)$j['result']['faxpages_raw']) : '';
+    if ($fr !== '') return $fr;
+
     $rp = isset($j['result']['pages']) ? (string)$j['result']['pages'] : '';
     if ($rp !== '') return $rp;
 
@@ -579,6 +662,82 @@ function extract_pages(array $j): string {
   return '';
 }
 
+function failed_pdf_for_json(string $jsonFn): string {
+  if (!preg_match('/\A(.+)\.json\z/i', $jsonFn, $m)) return '';
+  return $m[1] . '__FAILED.pdf';
+}
+
+function move_failure_report_to_archive(string $jsonFn): bool {
+  if ($jsonFn === '' || !preg_match('/\.json\z/i', $jsonFn)) return false;
+
+  $jsonPath = $GLOBALS['DIR_FAIL_REP'] . '/' . $jsonFn;
+  if (!within_dir($jsonPath, $GLOBALS['DIR_FAIL_REP']) || !is_file($jsonPath)) return false;
+
+  $destJson = $GLOBALS['DIR_ARCHIVE'] . '/' . $jsonFn;
+  if (is_file($destJson)) {
+    $destJson = $GLOBALS['DIR_ARCHIVE'] . '/' . preg_replace('/\.json\z/i', '', $jsonFn) . '.moved.' . random_suffix(6) . '.json';
+  }
+
+  if (!@rename($jsonPath, $destJson)) return false;
+
+  $pdfFn = failed_pdf_for_json($jsonFn);
+  if ($pdfFn !== '') {
+    $srcPdf = $GLOBALS['DIR_FAIL_REP'] . '/' . $pdfFn;
+    if (within_dir($srcPdf, $GLOBALS['DIR_FAIL_REP']) && is_file($srcPdf)) {
+      $destPdf = $GLOBALS['DIR_ARCHIVE'] . '/' . $pdfFn;
+      if (is_file($destPdf)) {
+        $destPdf = $GLOBALS['DIR_ARCHIVE'] . '/' . preg_replace('/\.pdf\z/i', '', $pdfFn) . '.moved.' . random_suffix(6) . '.pdf';
+      }
+      @rename($srcPdf, $destPdf);
+    }
+  }
+
+  return true;
+}
+
+function find_failure_report_for_resend_pdf(string $pdfFn): ?string {
+  if (!preg_match('/\A(.+)\.pdf\z/i', $pdfFn, $m)) return null;
+  $stem = $m[1];
+
+  $exact = $stem . '.json';
+  $exactPath = $GLOBALS['DIR_FAIL_REP'] . '/' . $exact;
+  if (within_dir($exactPath, $GLOBALS['DIR_FAIL_REP']) && is_file($exactPath)) return $exact;
+
+  $candidates = [];
+  if (!is_dir($GLOBALS['DIR_FAIL_REP'])) return null;
+  $dh = opendir($GLOBALS['DIR_FAIL_REP']);
+  if ($dh === false) return null;
+
+  while (($e = readdir($dh)) !== false) {
+    if (!preg_match('/\.json\z/i', $e)) continue;
+    $p = $GLOBALS['DIR_FAIL_REP'] . '/' . $e;
+    if (!within_dir($p, $GLOBALS['DIR_FAIL_REP']) || !is_file($p)) continue;
+
+    $match = false;
+    if (preg_match('/\A(.+)\.json\z/i', $e, $jm)) {
+      $jsonStem = $jm[1];
+      if ($jsonStem === $stem || str_starts_with($jsonStem, $stem . '__JOB-')) $match = true;
+    }
+
+    if (!$match) {
+      $j = read_json_file($p);
+      if (is_array($j)) {
+        $srcFn = basename((string)($j['source']['filename_original'] ?? ''));
+        if ($srcFn === $pdfFn) $match = true;
+      }
+    }
+
+    if ($match) {
+      $candidates[] = ['file' => $e, 'mtime' => @filemtime($p) ?: 0];
+    }
+  }
+  closedir($dh);
+
+  if (count($candidates) === 0) return null;
+  usort($candidates, static fn($a, $b) => ($a['mtime'] <=> $b['mtime']) ?: strcmp((string)$a['file'], (string)$b['file']));
+  return (string)$candidates[0]['file'];
+}
+
 function format_size(?int $bytes): string {
   if ($bytes === null || $bytes < 0) return '—';
   if ($bytes < 1024) return $bytes . ' B';
@@ -586,6 +745,103 @@ function format_size(?int $bytes): string {
   if ($kb < 1024) return (string)round($kb) . ' KB';
   $mb = $kb / 1024;
   return number_format($mb, 1, '.', '') . ' MB';
+}
+
+function list_inbox_pdfs(string $dir, int $limit): array {
+  $files = [];
+  if (!is_dir($dir)) return $files;
+  $dh = opendir($dir);
+  if ($dh === false) return $files;
+
+  while (($e = readdir($dh)) !== false) {
+    if ($e === '' || $e[0] === '.') continue;
+    if (!preg_match('/\.pdf\z/i', $e)) continue;
+    $p = $dir . '/' . $e;
+    if (!is_file($p)) continue;
+
+    $mtime = @filemtime($p);
+    $size = @filesize($p);
+    $files[] = [
+      'filename' => $e,
+      'mtime' => is_int($mtime) ? $mtime : 0,
+      'mtime_local' => is_int($mtime) ? format_unix_local_datetime($mtime) : '',
+      'size' => is_int($size) ? $size : null,
+    ];
+  }
+  closedir($dh);
+
+  usort($files, static function(array $a, array $b): int {
+    $cmp = ((int)$b['mtime']) <=> ((int)$a['mtime']);
+    return $cmp !== 0 ? $cmp : strcmp((string)$b['filename'], (string)$a['filename']);
+  });
+  if (count($files) > $limit) $files = array_slice($files, 0, $limit);
+  return $files;
+}
+
+function summarize_inbox_pdfs(string $dir): array {
+  $count = 0;
+  $latest = 0;
+  if (!is_dir($dir)) return ['count' => 0, 'latest_mtime' => 0];
+  $dh = opendir($dir);
+  if ($dh === false) return ['count' => 0, 'latest_mtime' => 0];
+
+  while (($e = readdir($dh)) !== false) {
+    if ($e === '' || $e[0] === '.') continue;
+    if (!preg_match('/\.pdf\z/i', $e)) continue;
+    $p = $dir . '/' . $e;
+    if (!is_file($p)) continue;
+    $count++;
+    $mtime = @filemtime($p);
+    if (is_int($mtime) && $mtime > $latest) $latest = $mtime;
+  }
+  closedir($dh);
+  return ['count' => $count, 'latest_mtime' => $latest];
+}
+
+function inbox_badge_class(int $count): string {
+  return $count > 0 ? 'warn' : 'ok';
+}
+
+function format_incoming_fax_stamp(string $datePart, string $timePart): string {
+  $dt = DateTimeImmutable::createFromFormat('!Ymd His', $datePart . ' ' . $timePart, new DateTimeZone('Europe/Berlin'));
+  if (!$dt) return '';
+  return $dt->format('d.m.Y H:i:s');
+}
+
+function parse_incoming_fax_filename(string $filename): array {
+  $out = [
+    'datetime_local' => '',
+    'number_raw' => '',
+    'number_norm' => '',
+    'counter' => '',
+  ];
+
+  if (!preg_match('/\A(\d{8})-(\d{6})_([0-9+]+)_([^\/]+)\.pdf\z/i', $filename, $m)) {
+    return $out;
+  }
+
+  $out['datetime_local'] = format_incoming_fax_stamp($m[1], $m[2]);
+  $out['number_raw'] = (string)$m[3];
+  $out['number_norm'] = normalize_fax_number((string)$m[3]);
+  $out['counter'] = (string)$m[4];
+  return $out;
+}
+
+function build_contact_lookup_by_number(array $contacts): array {
+  $out = [];
+  foreach ($contacts as $c) {
+    if (!is_array($c)) continue;
+    $norm = normalize_fax_number((string)($c['number'] ?? ''));
+    if ($norm === '' || isset($out[$norm])) continue;
+    $out[$norm] = $c;
+  }
+  return $out;
+}
+
+function inbox_dir_for_box(string $box): string {
+  if ($box === 'fax') return (string)$GLOBALS['DIR_FAX_INBOX'];
+  if ($box === 'scan') return (string)$GLOBALS['DIR_SCAN_INBOX'];
+  return '';
 }
 
 function hhmm_from_iso(?string $iso): string {
@@ -712,6 +968,16 @@ if ($download !== '') {
     if (!filename_is_sendable_pdf($file, $GLOBALS['EXCLUDE_SUFFIXES'], $GLOBALS['EXCLUDE_CONTAINS'])) { http_response_code(400); echo "Bad file"; exit; }
     $path = $GLOBALS['ALLOW_SOURCES'][$src] . '/' . $file;
     if (!within_dir($path, $GLOBALS['ALLOW_SOURCES'][$src])) { http_response_code(400); echo "Bad path"; exit; }
+    send_file_pdf($path, $file);
+  }
+
+  if ($type === 'inboxpdf') {
+    $box = (string)($_GET['box'] ?? '');
+    $dir = inbox_dir_for_box($box);
+    if ($dir === '') { http_response_code(400); echo "Bad box"; exit; }
+    if ($file === '' || $file !== basename($file) || !preg_match('/\.pdf\z/i', $file)) { http_response_code(400); echo "Bad file"; exit; }
+    $path = $dir . '/' . $file;
+    if (!within_dir($path, $dir)) { http_response_code(400); echo "Bad path"; exit; }
     send_file_pdf($path, $file);
   }
 
@@ -890,6 +1156,17 @@ if ($action === 'create_jobs') {
           if ($removeFailed > 0) {
             add_err("Hinweis: $removeFailed Quellen-Datei(en) konnten nach der Job-Anlage nicht entfernt werden.");
           }
+
+          if ($src === 'sendefehler') {
+            $adoptedReports = 0;
+            foreach ($valid as $fn) {
+              $jsonFn = find_failure_report_for_resend_pdf($fn);
+              if ($jsonFn !== null && move_failure_report_to_archive($jsonFn)) $adoptedReports++;
+            }
+            if ($adoptedReports > 0) {
+              add_ok("✅ Fehlerbericht(e) automatisch ins Sendeprotokoll übernommen: $adoptedReports.");
+            }
+          }
         }
       } catch (Throwable $e) {
         foreach ($pendingJobs as $jobDirs) {
@@ -985,11 +1262,8 @@ if ($action === 'fail_cleanup') {
       if (!is_file($jsonPath)) continue;
 
       $pdfFn = '';
-      if (preg_match('/\A(.+)\.json\z/i', $jsonFn, $m)) {
-        $stem = $m[1];
-        $cand = $stem . '__FAILED.pdf';
-        if (is_file($DIR_FAIL_REP . '/' . $cand)) $pdfFn = $cand;
-      }
+      $cand = failed_pdf_for_json($jsonFn);
+      if ($cand !== '' && is_file($DIR_FAIL_REP . '/' . $cand)) $pdfFn = $cand;
 
       if ($op === 'delete') {
         $ok = true;
@@ -1002,24 +1276,9 @@ if ($action === 'fail_cleanup') {
         }
         if ($ok) { $deleted++; $done++; }
       } else { // adopt
-        $destJson = $DIR_ARCHIVE . '/' . $jsonFn;
-        if (is_file($destJson)) {
-          $destJson = $DIR_ARCHIVE . '/' . preg_replace('/\.json\z/i', '', $jsonFn) . '.moved.' . random_suffix(6) . '.json';
-        }
-        $ok = @rename($jsonPath, $destJson);
-        if ($ok) {
+        if (move_failure_report_to_archive($jsonFn)) {
           $moved++;
           $done++;
-          if ($pdfFn !== '') {
-            $srcPdf = $DIR_FAIL_REP . '/' . $pdfFn;
-            $destPdf = $DIR_ARCHIVE . '/' . $pdfFn;
-            if (is_file($destPdf)) {
-              $destPdf = $DIR_ARCHIVE . '/' . preg_replace('/\.pdf\z/i', '', $pdfFn) . '.moved.' . random_suffix(6) . '.pdf';
-            }
-            if (within_dir($srcPdf, $DIR_FAIL_REP) && is_file($srcPdf)) {
-              @rename($srcPdf, $destPdf);
-            }
-          }
         }
       }
     }
@@ -1097,6 +1356,12 @@ foreach (array_reverse($queueJobs) as $jid) {
 
 $failCount = count_json_files($DIR_FAIL_REP, 999);
 $hasFails = ($failCount > 0);
+$inboxFaxSummary = summarize_inbox_pdfs($DIR_FAX_INBOX);
+$inboxScanSummary = summarize_inbox_pdfs($DIR_SCAN_INBOX);
+$inboxFaxCount = (int)$inboxFaxSummary['count'];
+$inboxScanCount = (int)$inboxScanSummary['count'];
+$inboxTotalCount = $inboxFaxCount + $inboxScanCount;
+$inboxLatestMtime = max((int)$inboxFaxSummary['latest_mtime'], (int)$inboxScanSummary['latest_mtime']);
 
 // -------------------- AJAX (Soft Refresh) --------------------
 $ajax = (string)($_GET['ajax'] ?? '');
@@ -1106,6 +1371,12 @@ if ($ajax === 'status') {
     'queue_count' => count($queueJobs),
     'processing_count' => count($procJobs),
     'fail_count' => $failCount,
+    'inbox_counts' => [
+      'fax' => $inboxFaxCount,
+      'scan' => $inboxScanCount,
+      'total' => $inboxTotalCount,
+      'latest_mtime' => $inboxLatestMtime,
+    ],
     'active_jobs' => build_active_jobs_payload($activePreview),
   ];
   if ($view === '' && isset($ALLOW_SOURCES[$src])) {
@@ -1218,6 +1489,33 @@ foreach ($contacts as $c) {
     .chip.fail{ background: rgba(255,77,109,.12); }
     .chip.warn{ background: rgba(255,176,32,.18); }
     .chip.abort{ background: rgba(255,77,109,.10); border-color: rgba(255,77,109,.55); }
+    .inbox-tab-row{ display:inline-flex; align-items:center; gap:6px; }
+    .inbox-tab{ gap:8px; }
+    .inbox-badges{ display:inline-flex; gap:5px; align-items:center; }
+    .inbox-badge{
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      min-width:42px;
+      padding:4px 7px;
+      border-radius:999px;
+      border:1px solid var(--line);
+      font-size:12px;
+      font-weight:950;
+      line-height:1;
+      font-variant-numeric: tabular-nums;
+    }
+    .inbox-badge.ok{ background:rgba(24,169,87,.13); color:#116b3a; border-color:rgba(24,169,87,.25); }
+    .inbox-badge.warn{ background:rgba(255,176,32,.24); color:#7b4b00; border-color:rgba(255,176,32,.42); }
+    .inbox-tab-row .inbox-badge{
+      min-width:22px;
+      height:22px;
+      padding:0 5px;
+      font-size:12px;
+      box-shadow:0 3px 8px rgba(18,34,64,.05);
+    }
+    .section-title.with-badges{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .section-title .inbox-badge{ font-size:13px; padding:6px 9px; min-width:52px; }
 
     .stack{ display:grid; gap:10px; }
     .checkline{ display:flex; align-items:flex-end; gap:14px; margin-top:12px; flex-wrap:wrap; }
@@ -1314,6 +1612,15 @@ foreach ($contacts as $c) {
         <?php $t = (string)$sourceDef['id']; ?>
         <a class="tab <?=($view==='' && $src===$t)?'active':''?>" href="?src=<?=h($t)?>">📄 <?=h(source_label($t))?></a>
       <?php endforeach; ?>
+      <span class="inbox-tab-row">
+      <a id="inboxTab" class="tab inbox-tab <?=($view==='inbox')?'active':''?>" href="?view=inbox" title="Eingänge: Fax <?=$inboxFaxCount?>, Scan <?=$inboxScanCount?>">
+        📥 Eingänge
+      </a>
+        <span class="inbox-badges" aria-label="Eingangszähler">
+          <span class="inbox-badge <?=h(inbox_badge_class($inboxFaxCount))?>" data-inbox-count="fax" data-inbox-compact="1" title="Fax-Eingang"><?=h((string)$inboxFaxCount)?></span>
+          <span class="inbox-badge <?=h(inbox_badge_class($inboxScanCount))?>" data-inbox-count="scan" data-inbox-compact="1" title="Scan-Eingang"><?=h((string)$inboxScanCount)?></span>
+        </span>
+      </span>
       <a class="tab <?=($view==='sendelog')?'active':''?>" href="?view=sendelog">✅ Sendeprotokoll</a>
       <a class="tab <?=($view==='phonebook')?'active':''?>" href="?view=phonebook">📇 Telefonbuch</a>
       <a id="failTab" class="tab <?=($view==='sendefehler-berichte')?'active':''?> <?=($hasFails ? 'pulse-danger' : '')?>" href="?view=sendefehler-berichte" title="Fehlerberichte (<?=$failCount?>)">⚠️ Fehlerberichte</a>
@@ -1378,12 +1685,10 @@ foreach ($contacts as $c) {
                   $t0 = parse_iso_time((string)$af['connected_at']);
                   if ($t0 !== null) $elapsed = max(0, time() - $t0);
                 }
-                $rate = isset($af['data_rate']) ? (int)$af['data_rate'] : null;
-                $pageText = ($page !== null && $totalPages !== null) ? ($page . '/' . $totalPages) : (($page !== null) ? (string)$page : (($totalPages !== null) ? ('?/' . $totalPages) : 'läuft'));
+                $pageText = ($page !== null && $totalPages !== null) ? ($page . '/' . $totalPages) : (($page !== null) ? (string)$page : (($totalPages !== null) ? ('1/' . $totalPages) : 'läuft'));
                 $parts = ['Sende: ' . $pageText];
                 $dur = format_hms_compact($elapsed);
                 if ($dur !== '') $parts[] = $dur;
-                if ($rate !== null && $rate > 0) $parts[] = $rate . ' bit/s';
                 $line2 = implode(' · ', $parts);
               } elseif ($where === 'processing' && $sent !== null && $total !== null) {
                 $line2 = 'Sende: ' . $sent . '/' . $total;
@@ -1402,6 +1707,7 @@ foreach ($contacts as $c) {
                 if (!empty($af['session'])) $tips[] = 'Session: ' . (string)$af['session'];
                 if (!empty($af['channel'])) $tips[] = 'Kanal: ' . (string)$af['channel'];
                 if (!empty($af['connected_at'])) $tips[] = 'Callzeit: ' . format_hms_compact(isset($af['elapsed_sec']) ? (int)$af['elapsed_sec'] : null);
+                if (!empty($af['data_rate'])) $tips[] = 'Datenrate: ' . (string)$af['data_rate'] . ' bit/s';
                 if (!empty($af['file_name'])) $tips[] = 'TIFF: ' . (string)$af['file_name'];
                 if (!empty($af['updated_at'])) $tips[] = 'Update: ' . (string)$af['updated_at'];
                 if (count($tips) > 0) $tooltip2 = $line2 . "\n" . implode("\n", $tips);
@@ -1507,6 +1813,104 @@ foreach ($contacts as $c) {
         </div>
       </div>
 
+    <?php elseif ($view === 'inbox'): ?>
+      <?php
+        $faxItems = list_inbox_pdfs($DIR_FAX_INBOX, $MAX_INBOX_LIST);
+        $scanItems = list_inbox_pdfs($DIR_SCAN_INBOX, $MAX_INBOX_LIST);
+        $contactByNumber = build_contact_lookup_by_number($contacts);
+        $faxCount = $inboxFaxCount;
+        $scanCount = $inboxScanCount;
+      ?>
+
+      <h2 class="section-title with-badges">
+        <span>📥 Eingänge</span>
+        <span class="inbox-badges" aria-label="Eingangszähler">
+          <span class="inbox-badge <?=h(inbox_badge_class($faxCount))?>" data-inbox-count="fax" title="Fax-Eingang"><?=h('Fax ' . (string)$faxCount)?></span>
+          <span class="inbox-badge <?=h(inbox_badge_class($scanCount))?>" data-inbox-count="scan" title="Scan-Eingang"><?=h('Scan ' . (string)$scanCount)?></span>
+        </span>
+      </h2>
+
+      <div class="stack">
+        <div class="subtle">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+            <div>
+              <div style="font-weight:900; font-size:16px;">Fax-Eingang</div>
+              <div class="mut mono" style="margin-top:3px;"><?=h($DIR_FAX_INBOX)?></div>
+            </div>
+            <span class="chip <?=($faxCount > 0) ? 'warn' : 'ok'?>"><?=h((string)$faxCount)?> Datei<?=($faxCount === 1) ? '' : 'en'?></span>
+          </div>
+
+          <table class="tbl" style="margin-top:10px;">
+            <thead>
+              <tr><th>Datei</th><th class="nowrap">Datum/Uhrzeit</th><th>Absender</th><th class="nowrap">Größe</th><th class="right nowrap">Dokument</th></tr>
+            </thead>
+            <tbody>
+            <?php if (!is_dir($DIR_FAX_INBOX)): ?>
+              <tr><td colspan="5" class="mut">Verzeichnis nicht vorhanden oder nicht lesbar.</td></tr>
+            <?php elseif ($faxCount === 0): ?>
+              <tr><td colspan="5" class="mut">Keine nicht weggeräumten Fax-PDFs gefunden.</td></tr>
+            <?php else: ?>
+              <?php foreach ($faxItems as $it): ?>
+                <?php
+                  $fn = (string)$it['filename'];
+                  $parsed = parse_incoming_fax_filename($fn);
+                  $timeDisplay = (string)$parsed['datetime_local'];
+                  if ($timeDisplay === '') $timeDisplay = (string)$it['mtime_local'];
+                  $numRaw = (string)$parsed['number_raw'];
+                  $numNorm = (string)$parsed['number_norm'];
+                  $contact = ($numNorm !== '' && isset($contactByNumber[$numNorm])) ? $contactByNumber[$numNorm] : null;
+                  $senderName = is_array($contact) ? (string)($contact['name'] ?? '') : '';
+                ?>
+                <tr>
+                  <td style="font-weight:900;"><span class="ellipsis fn" title="<?=h($fn)?>"><?=h($fn)?></span></td>
+                  <td class="nowrap" title="<?=h($parsed['datetime_local'] !== '' ? 'aus Dateiname' : 'Dateizeit')?>"><?=h($timeDisplay !== '' ? $timeDisplay : '—')?></td>
+                  <td>
+                    <div style="font-weight:900;"><?=h($senderName !== '' ? $senderName : (($numRaw !== '') ? 'Nicht im Telefonbuch' : '—'))?></div>
+                    <div class="mono mut"><?=h($numRaw !== '' ? $numRaw : '—')?></div>
+                  </td>
+                  <td class="nowrap"><?=h(format_size($it['size']))?></td>
+                  <td class="right nowrap"><a class="btn ghost small" href="?download=inboxpdf&amp;box=fax&amp;file=<?=h(rawurlencode($fn))?>">📄 PDF</a></td>
+                </tr>
+              <?php endforeach; ?>
+            <?php endif; ?>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="subtle">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+            <div>
+              <div style="font-weight:900; font-size:16px;">Scan-Eingang</div>
+              <div class="mut mono" style="margin-top:3px;"><?=h($DIR_SCAN_INBOX)?></div>
+            </div>
+            <span class="chip <?=($scanCount > 0) ? 'warn' : 'ok'?>"><?=h((string)$scanCount)?> Datei<?=($scanCount === 1) ? '' : 'en'?></span>
+          </div>
+
+          <table class="tbl" style="margin-top:10px;">
+            <thead>
+              <tr><th>Datei</th><th class="nowrap">Geändert</th><th class="nowrap">Größe</th><th class="right nowrap">Dokument</th></tr>
+            </thead>
+            <tbody>
+            <?php if (!is_dir($DIR_SCAN_INBOX)): ?>
+              <tr><td colspan="4" class="mut">Verzeichnis nicht vorhanden oder nicht lesbar.</td></tr>
+            <?php elseif ($scanCount === 0): ?>
+              <tr><td colspan="4" class="mut">Keine nicht weggeräumten Scan-PDFs gefunden.</td></tr>
+            <?php else: ?>
+              <?php foreach ($scanItems as $it): ?>
+                <?php $fn = (string)$it['filename']; ?>
+                <tr>
+                  <td style="font-weight:900;"><span class="ellipsis fn" title="<?=h($fn)?>"><?=h($fn)?></span></td>
+                  <td class="nowrap"><?=h((string)$it['mtime_local'] !== '' ? (string)$it['mtime_local'] : '—')?></td>
+                  <td class="nowrap"><?=h(format_size($it['size']))?></td>
+                  <td class="right nowrap"><a class="btn ghost small" href="?download=inboxpdf&amp;box=scan&amp;file=<?=h(rawurlencode($fn))?>">📄 PDF</a></td>
+                </tr>
+              <?php endforeach; ?>
+            <?php endif; ?>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
     <?php elseif ($view === 'sendelog'): ?>
       <?php
         $showAll = isset($_GET['all']) && ((string)$_GET['all'] === '1');
@@ -1570,9 +1974,14 @@ foreach ($contacts as $c) {
               $isOk = (strcasecmp($status, 'OK') === 0) || (stripos($status, 'ok') !== false);
 
               $dur = '';
-              $t1 = parse_iso_time($start);
-              $t2 = parse_iso_time($end);
-              if ($t1 !== null && $t2 !== null) $dur = format_duration($t2 - $t1);
+              $txSec = extract_transmission_duration_sec($j);
+              if ($txSec !== null) {
+                $dur = format_duration($txSec);
+              } else {
+                $t1 = parse_iso_time($start);
+                $t2 = parse_iso_time($end);
+                if ($t1 !== null && $t2 !== null) $dur = format_duration($t2 - $t1);
+              }
 
               $pages = extract_pages($j);
 
@@ -1589,7 +1998,7 @@ foreach ($contacts as $c) {
                 <?php elseif ($isOk): ?><span class="chip ok">✅ Senden erfolgreich</span>
                 <?php else: ?><span class="chip fail">❌ Fehlgeschlagen</span><?php endif; ?>
               </td>
-              <td class="nowrap"><?=h($end)?></td>
+              <td class="nowrap" title="<?=h($end)?>"><?=h(format_local_datetime($end))?></td>
               <td><div style="font-weight:900;"><?=h($name)?></div><div class="mono mut"><?=h($num)?></div></td>
               <td class="nowrap"><?=h($dur ?: '—')?></td>
               <td class="nowrap"><?=h($pages ?: '—')?></td>
@@ -1940,11 +2349,17 @@ foreach ($contacts as $c) {
 </footer>
 
 <script>
-  // 1.4 Live-AJAX (+ Sound): KPIs, aktive Jobs, Fehlerpuls und PDF-Liste der aktuellen Quelle.
+  // 1.4 Live-AJAX (+ Sound): KPIs, aktive Jobs, Fehlerpuls, Eingangszaehler und PDF-Liste der aktuellen Quelle.
   (function(){
     // -------------------- Sound (faxton.mp3) --------------------
     const SOUND_URL = <?=json_encode($ALERT_MP3, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)?>;
     const CURRENT_SRC = <?=json_encode($view === '' ? $src : '', JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)?>;
+    const INITIAL_INBOX_COUNTS = <?=json_encode([
+      'fax' => $inboxFaxCount,
+      'scan' => $inboxScanCount,
+      'total' => $inboxTotalCount,
+      'latest_mtime' => $inboxLatestMtime,
+    ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)?>;
     const bell = document.getElementById('soundBell');
 
     function soundEnabled(){
@@ -1971,9 +2386,15 @@ foreach ($contacts as $c) {
     let lastFailCount = Number(localStorage.getItem('kf_last_fail_count') || '0');
     if (!Number.isFinite(lastFailCount) || lastFailCount < 0) lastFailCount = 0;
 
+    let lastInboxTotal = Number(INITIAL_INBOX_COUNTS.total || 0);
+    if (!Number.isFinite(lastInboxTotal) || lastInboxTotal < 0) lastInboxTotal = 0;
+    let lastInboxLatestMtime = Number(INITIAL_INBOX_COUNTS.latest_mtime || 0);
+    if (!Number.isFinite(lastInboxLatestMtime) || lastInboxLatestMtime < 0) lastInboxLatestMtime = 0;
+
     const kpiQueue = document.getElementById('kpiQueue');
     const kpiProc  = document.getElementById('kpiProc');
     const failTab  = document.getElementById('failTab');
+    const inboxTab = document.getElementById('inboxTab');
     const listEl   = document.getElementById('activeJobsList');
     const sourceFilesBody = document.getElementById('sourceFilesBody');
     let lastSourceFilesSig = null;
@@ -1998,12 +2419,68 @@ foreach ($contacts as $c) {
       return Number.isFinite(n) ? n : null;
     }
 
+    function playSoftInboxBell(){
+      if (!soundEnabled()) return;
+      try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        const ctx = playSoftInboxBell.ctx || (playSoftInboxBell.ctx = new Ctx());
+        if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+        const now = ctx.currentTime;
+
+        [0, 0.12].forEach((delay, index) => {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(index === 0 ? 880 : 1175, now + delay);
+          gain.gain.setValueAtTime(0.0001, now + delay);
+          gain.gain.exponentialRampToValueAtTime(0.055, now + delay + 0.018);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + delay + 0.32);
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start(now + delay);
+          osc.stop(now + delay + 0.34);
+        });
+      } catch (e) {}
+    }
+
+    function updateInboxBadges(counts){
+      if (!counts || typeof counts !== 'object') return;
+      const fax = safeNumber(counts.fax);
+      const scan = safeNumber(counts.scan);
+      const total = safeNumber(counts.total);
+      const latest = safeNumber(counts.latest_mtime);
+
+      const values = {fax: fax === null ? 0 : fax, scan: scan === null ? 0 : scan};
+      document.querySelectorAll('[data-inbox-count]').forEach(el => {
+        const kind = el.getAttribute('data-inbox-count');
+        if (kind !== 'fax' && kind !== 'scan') return;
+        const n = values[kind];
+        const compact = el.getAttribute('data-inbox-compact') === '1';
+        el.textContent = compact ? String(n) : ((kind === 'fax' ? 'Fax ' : 'Scan ') + String(n));
+        el.classList.toggle('warn', n > 0);
+        el.classList.toggle('ok', n <= 0);
+      });
+
+      if (inboxTab) {
+        inboxTab.title = 'Eingänge: Fax ' + values.fax + ', Scan ' + values.scan;
+      }
+
+      const nextTotal = total === null ? (values.fax + values.scan) : total;
+      const nextLatest = latest === null ? 0 : latest;
+      if ((nextTotal > lastInboxTotal || nextLatest > lastInboxLatestMtime) && nextTotal > 0) {
+        playSoftInboxBell();
+      }
+
+      lastInboxTotal = nextTotal;
+      lastInboxLatestMtime = nextLatest;
+    }
+
     function buildAsteriskFaxLine(live, nowMs){
       if (!live || !live.asterisk_fax || !live.asterisk_fax.active) return '';
       const af = live.asterisk_fax;
       const page = safeNumber(af.page_number);
       const total = safeNumber(af.total_pages);
-      const rate = safeNumber(af.data_rate);
       let elapsed = safeNumber(af.elapsed_sec);
 
       if (safeText(af.connected_at)) {
@@ -2014,11 +2491,10 @@ foreach ($contacts as $c) {
       let pageText = 'läuft';
       if (page !== null && total !== null) pageText = String(page) + '/' + String(total);
       else if (page !== null) pageText = String(page);
-      else if (total !== null) pageText = '?/' + String(total);
+      else if (total !== null) pageText = '1/' + String(total);
 
       const parts = ['Sende: ' + pageText];
       if (elapsed !== null) parts.push(fmtHMS(elapsed));
-      if (rate !== null && rate > 0) parts.push(String(rate) + ' bit/s');
       return parts.join(' · ');
     }
 
@@ -2091,6 +2567,7 @@ foreach ($contacts as $c) {
             const t0 = Date.parse(safeText(af.connected_at));
             if (!isNaN(t0)) extra.push('Callzeit: ' + fmtHMS((Date.now() - t0) / 1000));
           }
+          if (safeNumber(af.data_rate) !== null && safeNumber(af.data_rate) > 0) extra.push('Datenrate: ' + String(safeNumber(af.data_rate)) + ' bit/s');
           if (safeText(af.file_name)) extra.push('TIFF: ' + safeText(af.file_name));
           if (safeText(af.updated_at)) extra.push('Update: ' + safeText(af.updated_at));
         }
@@ -2220,6 +2697,7 @@ foreach ($contacts as $c) {
           localStorage.setItem('kf_last_fail_count', String(lastFailCount));
         }
 
+        updateInboxBadges(j.inbox_counts || null);
         renderJobs(j.active_jobs || []);
         renderSourceFiles(j.source_files || null);
       } catch (e) {
