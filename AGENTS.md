@@ -45,7 +45,7 @@ Diese Datei fasst die Projektvorgaben zusammen. Sie dient als verbindliche Arbei
 - Wenn Asterisk erkannt wird, fragt der Installer am Anfang, ob Asterisk erneut kompiliert werden soll; Default bei vorhandenem Asterisk: `nein`.
 - Der Installer fragt am Anfang ein Admin-Passwort ab und setzt damit Linux-User `admin` und Samba-User `admin`; `admin` muss normale sudo-Rechte mit Passwortabfrage haben.
 - Das Admin-Passwort kann am Anfang entweder manuell gesetzt oder sicher generiert werden; generierte Passwoerter nicht im Terminal-Log ausgeben, sondern nur in ENV/Installationsbericht.
-- Wenn SSH auf Public-Key-only steht, soll der Installer vorhandene `authorized_keys` des bisherigen Installationsusers nach `admin` uebernehmen, damit `admin` erreichbar ist.
+- Wenn SSH auf Public-Key-only steht, soll der Installer vorhandene `authorized_keys` des bisherigen Installationsusers nach `admin` und nach `/root/.ssh/authorized_keys` uebernehmen, damit `admin` erreichbar ist und root-Wartungszugang per Key moeglich bleibt, sofern SSHD root-login erlaubt.
 - Optional darf der bisherige Erstbenutzer entfernt werden, aber nur nach Sicherheitschecks und nie `root` oder `admin`.
 - Falls der alte Erstbenutzer wegen aktiver SSH-/Login-Prozesse nicht direkt geloescht werden kann, muss der Installer dessen Login sperren und vorhandene SSH-Keys deaktivieren.
 - Wenn User `admin` bereits existiert, fragt der Installer, ob `admin` neu generiert bzw. Passwörter neu gesetzt werden sollen; Default: `nein`.
@@ -53,6 +53,7 @@ Diese Datei fasst die Projektvorgaben zusammen. Sie dient als verbindliche Arbei
 ## Aktuelle Remote-Module
 
 - `https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/extensions.sh`
+- `https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/pjsip-provider.sh`
 - `https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/pjsip-1und1.sh`
 - `https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/worker.sh`
 - `https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/agi.sh`
@@ -87,11 +88,13 @@ Diese Datei fasst die Projektvorgaben zusammen. Sie dient als verbindliche Arbei
 - Portweiterleitungen nur fuer Fax-Kommunikation empfehlen: UDP SIP-Port und UDP RTP-Range.
 - Webports 80/443 niemals ins Internet weiterleiten oder relativieren; Hinweis im Bericht: Das wuerde Patientendaten exponieren.
 
-## PJSIP / Provider 1und1
+## PJSIP / Provider
 
-- `pjsip.conf` wird nur im Provider-Modul `pjsip-1und1.sh` befüllt.
+- `pjsip.conf` wird nur im Provider-Modul `pjsip-provider.sh` befüllt; `pjsip-1und1.sh` bleibt als alte 1&1-Vorlage/Kompatibilitaetsdatei erhalten.
 - Keine doppelte Ownership der `pjsip.conf`.
 - Das Provider-Modul arbeitet aus Installer-Variablen und sourct `/etc/kienzlefax-installer.env`.
+- Installer fragt den Provider am Anfang ab: `1und1`, `telekom`, `sipgate`, `manual`. Telekom/sipgate sind Templates mit zu pruefenden Default-Feldern; bei `manual` schreibt der Installer `pjsip.conf` nicht automatisch.
+- Der generische Dialplan-Endpoint ist `KFX_PJSIP_ENDPOINT`, Default `kfx-provider-endpoint`; Provider-Templates muessen diesen Endpoint bereitstellen.
 - SIP-Passwoerter und andere freie String-Werte muessen shell-sicher gequotet in `/etc/kienzlefax-installer.env` stehen; ungequotete Sonderzeichen koennen zu `pjsip show registrations => Rejected` fuehren.
 - Neue Variablen bevorzugt mit `KFX_*`; Legacy-Variablen wie `PJSIP_USER` und `PJSIP_PASS` nur kompatibel unterstützen.
 - Keine `set -u`/unbound-variable Fehler.
@@ -192,8 +195,8 @@ WantedBy=multi-user.target
 ## Verzeichnisse, Rechte, CUPS Und Samba
 
 - Basis: `/srv/kienzlefax`.
-- Eingänge: `/srv/kienzlefax/incoming/fax1` bis `fax5`.
-- Drop-in: `/srv/kienzlefax/pdf-zu-fax`.
+- Eingänge: `/srv/kienzlefax/incoming/fax1` bis `faxN`; der Installer fragt `N` ab, Default 5, erlaubt 1 bis 100.
+- Drop-in: Standard `/srv/kienzlefax/pdf-zu-fax`; optional mehrere getrennte Drop-ins `/srv/kienzlefax/pdf-zu-fax1` bis `pdf-zu-faxN` fuer Arbeitsplaetze.
 - Fehler: `/srv/kienzlefax/sendefehler/eingang`, `/srv/kienzlefax/sendefehler/berichte`.
 - Queue: `/srv/kienzlefax/staging`, `/srv/kienzlefax/queue`, `/srv/kienzlefax/processing`.
 - Berichte: `/srv/kienzlefax/sendeberichte`.
@@ -201,14 +204,15 @@ WantedBy=multi-user.target
 - Asterisk Fax: `/var/spool/asterisk/fax1`, `/var/spool/asterisk/fax`.
 - Rechte zunächst großzügig wie im Projekt üblich; bestehende Rechte-Logik nicht ohne Rücksprache verschärfen.
 - CUPS Backend: `/usr/lib/cups/backend/kienzlefaxpdf`.
-- Drucker: `fax1` bis `fax5`.
-- Backend schreibt PDFs nach `/srv/kienzlefax/incoming/fax1` bis `fax5`.
+- Drucker: `fax1` bis `faxN`, gemaess Installer-Abfrage.
+- Backend schreibt PDFs nach `/srv/kienzlefax/incoming/fax1` bis `faxN`.
 - `cups-browsed` deaktivieren, falls vorhanden, damit keine `implicitclass`-Probleme entstehen.
 - Samba `smb.conf` darf deterministisch geschrieben werden, wenn bisher so vorgesehen.
-- Shares: `printers`, `pdf-zu-fax`, `sendefehler-eingang`, `sendefehler-berichte`, `sendeberichte`, `fax-eingang`.
+- Shares: `printers`, `pdf-zu-fax` oder `pdf-zu-fax1..N`, `sendefehler-eingang`, `sendefehler-berichte`, `sendeberichte`, `fax-eingang`.
 - `fax-eingang` zeigt auf `/var/spool/asterisk/fax`.
 - `sendeberichte` nur fuer `admin`, `guest ok = no`; keine nicht angelegte `force group` setzen.
-- `pdf-zu-fax` und Fehler-Eingänge `guest ok = yes`, sofern bisher so vorgesehen.
+- `pdf-zu-fax`/`pdf-zu-faxN` und Fehler-Eingänge `guest ok = yes`, sofern bisher so vorgesehen.
+- `/srv/kienzlefax/config/sources.json` ist die verbindliche Quellenliste fuer das Webinterface. Format bleibt `schema_version`, `default_source`, `sources[]` mit `id`, `label`, `kind`, `path`, `enabled`, `sendable`, `order`.
 
 ## Scan-OCR
 

@@ -3,11 +3,21 @@
  * kienzlefax.php
  * Producer Web-UI (sendet NICHT selbst).
  *
- * Version: 1.3
+ * Version: 1.4
  * Author: Dr. Thomas Kienzle
- * Stand: 2026-02-15
+ * Stand: 2026-06-22
  *
  * Changelog (komplett):
+ * - 1.4 (2026-06-22):
+ *   - Quellen: fax-Drucker und PDF-zu-Fax-Ordner werden aus /srv/kienzlefax/config/sources.json geladen;
+ *     bei fehlender/ungueltiger Datei bleibt der alte Standard fax1..fax5 + pdf-zu-fax + sendefehler aktiv.
+ *   - Beauftragen: Mehrere Empfaenger pro Absenden moeglich; pro PDF x Empfaenger wird ein eigener Job erzeugt.
+ *   - Beauftragen: Jeder Job erhaelt eigene Kopien doc.pdf und source.pdf; Originale werden erst nach erfolgreicher Job-Anlage entfernt.
+ *   - Beauftragen: Bei Fehlern waehrend der Job-Anlage werden Teil-Jobs bestmoeglich entfernt und Originale bleiben liegen.
+ *   - UI: PDF-Liste der aktuellen Quelle aktualisiert automatisch per AJAX, ohne Empfaenger-Eingaben zu ersetzen.
+ *   - UI: Aktive Jobs zeigen Asterisk-Live-Details: aktuelle/gesamte Seiten, Call-Dauer und Datenrate.
+ *   - UI: Footer verlinkt kienzlefax auf kienzlefax.de.
+ *
  * - 1.3 (2026-02-15):
  *   - UI: 🔔 Glocke (Sound an/aus) in Kopfzeile; AUS-Zustand mit dickem rotem, schrägem Durchstreich-Strich.
  *   - Audio: faxton.mp3 (liegt neben kienzlefax.php) wird nur bei NEUEM Sendefehler abgespielt (fail_count steigt, via AJAX-Status).
@@ -72,6 +82,84 @@ error_reporting(E_ALL);
 ini_set('display_errors', '0');
 mb_internal_encoding('UTF-8');
 
+function source_id_is_valid(string $id): bool {
+  return (bool)preg_match('/\A[a-z0-9][a-z0-9_-]{0,63}\z/', $id);
+}
+
+function normalize_source_definitions(array $rawSources): array {
+  $out = [];
+  $seen = [];
+
+  foreach ($rawSources as $item) {
+    if (!is_array($item)) continue;
+
+    $id = trim((string)($item['id'] ?? ''));
+    $path = trim((string)($item['path'] ?? ''));
+    if (!source_id_is_valid($id)) continue;
+    if ($path === '' || !str_starts_with($path, '/')) continue;
+    if (strpos($path, "\0") !== false) continue;
+    if (isset($seen[$id])) continue;
+
+    $enabled = (bool)($item['enabled'] ?? true);
+    $sendable = (bool)($item['sendable'] ?? true);
+    if (!$enabled || !$sendable) continue;
+
+    $label = trim((string)($item['label'] ?? ''));
+    if ($label === '') $label = $id;
+
+    $kind = trim((string)($item['kind'] ?? 'source'));
+    if ($kind === '') $kind = 'source';
+
+    $order = (int)($item['order'] ?? ((count($out) + 1) * 10));
+
+    $out[] = [
+      'id' => $id,
+      'label' => $label,
+      'kind' => $kind,
+      'path' => rtrim($path, '/'),
+      'order' => $order,
+    ];
+    $seen[$id] = true;
+  }
+
+  usort($out, static function(array $a, array $b): int {
+    $cmp = ((int)$a['order']) <=> ((int)$b['order']);
+    return $cmp !== 0 ? $cmp : strcmp((string)$a['id'], (string)$b['id']);
+  });
+
+  return $out;
+}
+
+function load_source_config(string $configPath, array $fallbackSources, string $fallbackDefault): array {
+  $sources = [];
+  $default = '';
+
+  if (is_file($configPath) && is_readable($configPath)) {
+    $raw = @file_get_contents($configPath);
+    if ($raw !== false) {
+      $j = json_decode($raw, true);
+      if (is_array($j)) {
+        $sources = normalize_source_definitions(is_array($j['sources'] ?? null) ? $j['sources'] : []);
+        $default = trim((string)($j['default_source'] ?? ''));
+      }
+    }
+  }
+
+  if (count($sources) === 0) {
+    $sources = normalize_source_definitions($fallbackSources);
+    $default = $fallbackDefault;
+  }
+
+  $ids = [];
+  foreach ($sources as $s) $ids[(string)$s['id']] = true;
+
+  if ($default === '' || !isset($ids[$default])) {
+    $default = isset($ids[$fallbackDefault]) ? $fallbackDefault : (string)($sources[0]['id'] ?? '');
+  }
+
+  return ['sources' => $sources, 'default_source' => $default];
+}
+
 // -------------------- Konfiguration --------------------
 $BASE = '/srv/kienzlefax';
 
@@ -87,15 +175,34 @@ $DIR_FAIL_REP = $BASE . '/sendefehler/berichte';
 
 $DB_PATH      = $BASE . '/phonebook.sqlite';
 
-$ALLOW_SOURCES = [
-  'fax1' => $DIR_INCOMING . '/fax1',
-  'fax2' => $DIR_INCOMING . '/fax2',
-  'fax3' => $DIR_INCOMING . '/fax3',
-  'fax4' => $DIR_INCOMING . '/fax4',
-  'fax5' => $DIR_INCOMING . '/fax5',
-  'pdf-zu-fax' => $DIR_DROPIN,
-  'sendefehler' => $DIR_FAIL_IN, // sendefehler/eingang ist sendbar
+$SOURCE_CONFIG_PATH = $BASE . '/config/sources.json';
+
+$FALLBACK_SOURCES = [
+  ['id' => 'fax1', 'label' => 'Faxdrucker 1', 'kind' => 'fax_printer', 'path' => $DIR_INCOMING . '/fax1', 'enabled' => true, 'sendable' => true, 'order' => 10],
+  ['id' => 'fax2', 'label' => 'Faxdrucker 2', 'kind' => 'fax_printer', 'path' => $DIR_INCOMING . '/fax2', 'enabled' => true, 'sendable' => true, 'order' => 20],
+  ['id' => 'fax3', 'label' => 'Faxdrucker 3', 'kind' => 'fax_printer', 'path' => $DIR_INCOMING . '/fax3', 'enabled' => true, 'sendable' => true, 'order' => 30],
+  ['id' => 'fax4', 'label' => 'Faxdrucker 4', 'kind' => 'fax_printer', 'path' => $DIR_INCOMING . '/fax4', 'enabled' => true, 'sendable' => true, 'order' => 40],
+  ['id' => 'fax5', 'label' => 'Faxdrucker 5', 'kind' => 'fax_printer', 'path' => $DIR_INCOMING . '/fax5', 'enabled' => true, 'sendable' => true, 'order' => 50],
+  ['id' => 'pdf-zu-fax', 'label' => 'PDF zu Fax', 'kind' => 'dropin', 'path' => $DIR_DROPIN, 'enabled' => true, 'sendable' => true, 'order' => 100],
+  ['id' => 'sendefehler', 'label' => 'Sendefehler', 'kind' => 'failed_inbox', 'path' => $DIR_FAIL_IN, 'enabled' => true, 'sendable' => true, 'order' => 900],
 ];
+
+$SOURCE_CONFIG = load_source_config($SOURCE_CONFIG_PATH, $FALLBACK_SOURCES, 'fax1');
+$SOURCE_DEFS = $SOURCE_CONFIG['sources'];
+$DEFAULT_SOURCE = (string)$SOURCE_CONFIG['default_source'];
+
+$ALLOW_SOURCES = [];
+$SOURCE_LABELS = [];
+$SOURCE_KINDS = [];
+foreach ($SOURCE_DEFS as $sourceDef) {
+  $sid = (string)$sourceDef['id'];
+  $ALLOW_SOURCES[$sid] = (string)$sourceDef['path'];
+  $SOURCE_LABELS[$sid] = (string)$sourceDef['label'];
+  $SOURCE_KINDS[$sid] = (string)$sourceDef['kind'];
+}
+if ($DEFAULT_SOURCE === '' || !isset($ALLOW_SOURCES[$DEFAULT_SOURCE])) {
+  $DEFAULT_SOURCE = (string)(array_key_first($ALLOW_SOURCES) ?? 'fax1');
+}
 
 $EXCLUDE_SUFFIXES = ['__OK.pdf', '__FAILED.pdf'];
 $EXCLUDE_CONTAINS = ['__REPORT__'];
@@ -106,7 +213,7 @@ $MAX_FAIL_LIST    = 200;
 $MAX_ARCHIVE_LIST = 25;
 
 $APP_TITLE   = 'kienzlefax';
-$APP_VERSION = '1.3';
+$APP_VERSION = '1.4';
 $APP_AUTHOR  = 'Dr. Thomas Kienzle';
 
 // Audio-Datei (liegt neben dieser PHP)
@@ -161,6 +268,29 @@ function list_source_pdfs(string $dir, array $excludeSuffixes, array $excludeCon
   return $files;
 }
 
+function source_label(string $src): string {
+  return (string)($GLOBALS['SOURCE_LABELS'][$src] ?? $src);
+}
+
+function build_source_files_payload(string $src, string $dir, array $excludeSuffixes, array $excludeContains, int $limit): array {
+  $files = [];
+  foreach (list_source_pdfs($dir, $excludeSuffixes, $excludeContains, $limit) as $fn) {
+    $p = $dir . '/' . $fn;
+    $sz = is_file($p) ? filesize($p) : null;
+    $files[] = [
+      'filename' => $fn,
+      'size' => is_int($sz) ? $sz : null,
+      'size_label' => format_size(is_int($sz) ? $sz : null),
+    ];
+  }
+
+  return [
+    'src' => $src,
+    'label' => source_label($src),
+    'files' => $files,
+  ];
+}
+
 function list_job_dirs(string $dir): array {
   $out = [];
   if (!is_dir($dir)) return $out;
@@ -212,6 +342,25 @@ function json_write_atomic(string $path, array $data): void {
   }
 }
 
+function remove_job_dir_safe(string $dir, string $baseDir): void {
+  $name = basename($dir);
+  if (!validate_job_id($name)) return;
+  if (!within_dir($dir, $baseDir) || !is_dir($dir)) return;
+
+  $items = scandir($dir);
+  if ($items === false) return;
+  foreach ($items as $item) {
+    if ($item === '.' || $item === '..') continue;
+    $path = $dir . '/' . $item;
+    if (is_dir($path)) {
+      remove_job_dir_safe($path, $dir);
+    } elseif (within_dir($path, $dir)) {
+      @unlink($path);
+    }
+  }
+  @rmdir($dir);
+}
+
 function open_db(string $dbPath): PDO {
   $pdo = new PDO('sqlite:' . $dbPath, null, null, [
     PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
@@ -253,6 +402,68 @@ function upsert_contact(PDO $pdo, ?int $id, string $name, string $number, string
   }
 }
 
+function collect_recipients_from_post(PDO $pdo): array {
+  $raw = $_POST['recipients'] ?? null;
+  if (!is_array($raw)) {
+    $raw = [[
+      'contact_id' => $_POST['contact_id'] ?? '',
+      'name' => $_POST['recipient_name'] ?? '',
+      'number' => $_POST['recipient_number'] ?? '',
+      'save_to_phonebook' => isset($_POST['save_to_phonebook']) ? '1' : '',
+    ]];
+  }
+
+  $recipients = [];
+  $errors = [];
+  $blockNo = 0;
+
+  foreach ($raw as $item) {
+    if (!is_array($item)) continue;
+    $blockNo++;
+
+    $contactIdRaw = trim((string)($item['contact_id'] ?? ''));
+    $name = trim((string)($item['name'] ?? ''));
+    $numberRaw = trim((string)($item['number'] ?? ''));
+    $saveToPhonebook = isset($item['save_to_phonebook']) && (string)$item['save_to_phonebook'] !== '';
+
+    if ($contactIdRaw === '' && $name === '' && $numberRaw === '' && !$saveToPhonebook) {
+      continue;
+    }
+
+    $contactId = null;
+    if ($contactIdRaw !== '') {
+      $contactId = (int)$contactIdRaw;
+      $c = $contactId > 0 ? get_contact($pdo, $contactId) : null;
+      if ($c) {
+        if ($name === '') $name = (string)$c['name'];
+        if ($numberRaw === '') $numberRaw = (string)$c['number'];
+      } else {
+        $errors[] = "Empfänger $blockNo: Telefonbuch-Eintrag nicht gefunden.";
+      }
+    }
+
+    $norm = normalize_fax_number($numberRaw);
+    if ($name === '') $errors[] = "Empfänger $blockNo: Empfängername fehlt.";
+    if ($norm === '') $errors[] = "Empfänger $blockNo: Faxnummer fehlt/ungültig.";
+
+    if ($name !== '' && $norm !== '') {
+      $recipients[] = [
+        'label_no' => $blockNo,
+        'contact_id' => $contactId,
+        'name' => $name,
+        'number' => $norm,
+        'save_to_phonebook' => $saveToPhonebook,
+      ];
+    }
+  }
+
+  if (count($recipients) === 0 && count($errors) === 0) {
+    $errors[] = "Mindestens ein Empfänger fehlt.";
+  }
+
+  return ['recipients' => $recipients, 'errors' => $errors];
+}
+
 function send_file_pdf(string $path, string $downloadName): void {
   if (!is_file($path)) { http_response_code(404); echo "Not found"; exit; }
   header('Content-Type: application/pdf');
@@ -282,6 +493,16 @@ function format_duration(?int $sec): string {
   $s = $sec % 60;
   if ($m <= 0) return $s . ' s';
   return $m . ' min ' . $s . ' s';
+}
+
+function format_hms_compact(?int $sec): string {
+  if ($sec === null || $sec < 0) return '';
+  $sec = (int)$sec;
+  $h = intdiv($sec, 3600);
+  $m = intdiv($sec % 3600, 60);
+  $s = $sec % 60;
+  if ($h > 0) return $h . ':' . str_pad((string)$m, 2, '0', STR_PAD_LEFT) . ':' . str_pad((string)$s, 2, '0', STR_PAD_LEFT);
+  return $m . ':' . str_pad((string)$s, 2, '0', STR_PAD_LEFT);
 }
 
 function count_json_files(string $dir, int $cap = 999): int {
@@ -402,6 +623,7 @@ function build_active_jobs_payload(array $activePreview): array {
     $state = '';
     $faxstat = '';
     $liveUpdatedAt = '';
+    $asteriskFax = null;
 
     if (is_array($live)) {
       $liveUpdatedAt = (string)($live['updated_at'] ?? '');
@@ -417,6 +639,28 @@ function build_active_jobs_payload(array $activePreview): array {
       }
       $state = (string)($live['state'] ?? '');
       $faxstat = (string)($live['faxstat_status'] ?? '');
+      if (isset($live['asterisk_fax']) && is_array($live['asterisk_fax'])) {
+        $af = $live['asterisk_fax'];
+        $asteriskFax = [
+          'active' => (bool)($af['active'] ?? false),
+          'updated_at' => (string)($af['updated_at'] ?? ''),
+          'connected_at' => (string)($af['connected_at'] ?? ''),
+          'elapsed_sec' => isset($af['elapsed_sec']) ? (int)$af['elapsed_sec'] : null,
+          'channel' => (string)($af['channel'] ?? ''),
+          'session' => isset($af['session']) ? (int)$af['session'] : null,
+          'operation' => (string)($af['operation'] ?? ''),
+          'state' => (string)($af['state'] ?? ''),
+          'last_status' => (string)($af['last_status'] ?? ''),
+          'ecm_mode' => (string)($af['ecm_mode'] ?? ''),
+          'data_rate' => isset($af['data_rate']) ? (int)$af['data_rate'] : null,
+          'image_resolution' => (string)($af['image_resolution'] ?? ''),
+          'page_number' => isset($af['page_number']) ? (int)$af['page_number'] : null,
+          'total_pages' => isset($af['total_pages']) ? (int)$af['total_pages'] : null,
+          'tx_pages' => isset($af['tx_pages']) ? (int)$af['tx_pages'] : null,
+          'rx_pages' => isset($af['rx_pages']) ? (int)$af['rx_pages'] : null,
+          'file_name' => (string)($af['file_name'] ?? ''),
+        ];
+      }
     }
 
     $out[] = [
@@ -434,6 +678,7 @@ function build_active_jobs_payload(array $activePreview): array {
         'dials' => ['done' => $dialsDone, 'max' => $dialsMax, 'raw' => $dialsRaw],
         'state' => $state,
         'faxstat_status' => $faxstat,
+        'asterisk_fax' => $asteriskFax,
       ] : null,
     ];
   }
@@ -523,26 +768,9 @@ if ($action === 'create_jobs') {
   if (!isset($ALLOW_SOURCES[$src])) {
     add_err("Ungültige Quelle.");
   } else {
-    $contact_id = trim((string)($_POST['contact_id'] ?? ''));
-    $recipient_name = trim((string)($_POST['recipient_name'] ?? ''));
-    $recipient_number = trim((string)($_POST['recipient_number'] ?? ''));
-
-    $save_to_phonebook = isset($_POST['save_to_phonebook']);
-
-    if ($contact_id !== '') {
-      $c = get_contact($pdo, (int)$contact_id);
-      if ($c) {
-        if ($recipient_name === '') $recipient_name = (string)$c['name'];
-        if ($recipient_number === '') $recipient_number = (string)$c['number'];
-      } else {
-        add_err("Telefonbuch-Eintrag nicht gefunden.");
-      }
-    }
-
-    $norm = normalize_fax_number($recipient_number);
-
-    if ($recipient_name === '') add_err("Empfängername fehlt.");
-    if ($norm === '') add_err("Faxnummer fehlt/ungültig.");
+    $recipientData = collect_recipients_from_post($pdo);
+    $recipients = is_array($recipientData['recipients'] ?? null) ? $recipientData['recipients'] : [];
+    foreach (($recipientData['errors'] ?? []) as $err) add_err((string)$err);
 
     $ecm = isset($_POST['ecm']);
     $res = (string)($_POST['resolution'] ?? 'fine');
@@ -561,89 +789,117 @@ if ($action === 'create_jobs') {
     if (count($valid) === 0) add_err("Keine gültigen PDFs ausgewählt.");
 
     if (count($flash['err']) === 0) {
+      $pendingJobs = [];
+      $queuedDirs = [];
       $created = 0;
-      $movedSources = 0;
+      $removedSources = 0;
+      $removeFailed = 0;
 
-      foreach ($valid as $fn) {
-        $jobid = make_job_id();
-        $jobStagingDir = $DIR_STAGING . '/' . $jobid;
-        $jobQueueDir   = $DIR_QUEUE . '/' . $jobid;
+      try {
+        foreach ($valid as $fn) {
+          $srcPath = $srcDir . '/' . $fn;
+          if (!within_dir($srcPath, $srcDir) || !is_file($srcPath)) {
+            throw new RuntimeException("Quelle nicht gefunden: $fn");
+          }
 
-        if (!mkdir($jobStagingDir, 0775, true) && !is_dir($jobStagingDir)) {
-          add_err("Konnte staging-Jobordner nicht anlegen: $jobid");
-          continue;
-        }
+          foreach ($recipients as $recipient) {
+            $jobid = make_job_id();
+            $jobStagingDir = $DIR_STAGING . '/' . $jobid;
+            $jobQueueDir   = $DIR_QUEUE . '/' . $jobid;
 
-        $srcPath = $srcDir . '/' . $fn;
+            if (is_dir($jobStagingDir) || is_dir($jobQueueDir)) {
+              throw new RuntimeException("Jobordner existiert bereits: $jobid");
+            }
+            if (!mkdir($jobStagingDir, 0775, true) && !is_dir($jobStagingDir)) {
+              throw new RuntimeException("Konnte staging-Jobordner nicht anlegen: $jobid");
+            }
 
-        $docPath = $jobStagingDir . '/doc.pdf';
-        if (!copy($srcPath, $docPath)) {
-          @rmdir($jobStagingDir);
-          add_err("Konnte PDF nicht kopieren: " . $fn);
-          continue;
-        }
+            $pendingJobs[] = ['staging' => $jobStagingDir, 'queue' => $jobQueueDir];
 
-        $job = [
-          "job_id" => $jobid,
-          "created_at" => date('c'),
-          "source" => [
-            "src" => $src,
-            "filename_original" => $fn,
-          ],
-          "recipient" => [
-            "name" => $recipient_name,
-            "number" => $norm,
-          ],
-          "options" => [
-            "ecm" => $ecm,
-            "resolution" => $res,
-          ],
-          "status" => "queued",
-        ];
+            $docPath = $jobStagingDir . '/doc.pdf';
+            $sourcePath = $jobStagingDir . '/source.pdf';
+            if (!copy($srcPath, $docPath)) {
+              throw new RuntimeException("Konnte doc.pdf nicht kopieren: $fn");
+            }
+            if (!copy($srcPath, $sourcePath)) {
+              throw new RuntimeException("Konnte source.pdf nicht kopieren: $fn");
+            }
 
-        try {
-          json_write_atomic($jobStagingDir . '/job.json', $job);
-        } catch (Throwable $e) {
-          @unlink($docPath);
-          @unlink($jobStagingDir . '/job.json');
-          @rmdir($jobStagingDir);
-          add_err("Konnte job.json nicht schreiben ($jobid): " . $e->getMessage());
-          continue;
-        }
+            $job = [
+              "job_id" => $jobid,
+              "created_at" => date('c'),
+              "source" => [
+                "src" => $src,
+                "filename_original" => $fn,
+              ],
+              "recipient" => [
+                "name" => (string)$recipient['name'],
+                "number" => (string)$recipient['number'],
+              ],
+              "options" => [
+                "ecm" => $ecm,
+                "resolution" => $res,
+              ],
+              "status" => "queued",
+            ];
 
-        if (!rename($jobStagingDir, $jobQueueDir)) {
-          add_err("Konnte Job nicht in queue verschieben ($jobid).");
-          continue;
-        }
-
-        $created++;
-
-        $destSource = $jobQueueDir . '/source.pdf';
-        if (!file_exists($destSource)) {
-          if (@rename($srcPath, $destSource)) {
-            $movedSources++;
+            json_write_atomic($jobStagingDir . '/job.json', $job);
           }
         }
-      }
 
-      if ($save_to_phonebook && count($flash['err']) === 0) {
-        try {
-          $cid = ($contact_id !== '') ? (int)$contact_id : null;
-          upsert_contact($pdo, $cid, $recipient_name, $norm, '');
-          add_ok("Empfänger im Telefonbuch gespeichert.");
+        foreach ($pendingJobs as $jobDirs) {
+          $stagingDir = (string)$jobDirs['staging'];
+          $queueDir = (string)$jobDirs['queue'];
+          if (!rename($stagingDir, $queueDir)) {
+            throw new RuntimeException("Konnte Job nicht in queue verschieben: " . basename($queueDir));
+          }
+          $queuedDirs[] = $queueDir;
+          $created++;
+        }
+
+        foreach ($valid as $fn) {
+          $srcPath = $srcDir . '/' . $fn;
+          if (within_dir($srcPath, $srcDir) && is_file($srcPath) && @unlink($srcPath)) {
+            $removedSources++;
+          } else {
+            $removeFailed++;
+          }
+        }
+
+        $savedContacts = 0;
+        foreach ($recipients as $recipient) {
+          if (empty($recipient['save_to_phonebook'])) continue;
+          try {
+            $cid = isset($recipient['contact_id']) && $recipient['contact_id'] ? (int)$recipient['contact_id'] : null;
+            upsert_contact($pdo, $cid, (string)$recipient['name'], (string)$recipient['number'], '');
+            $savedContacts++;
+          } catch (Throwable $e) {
+            add_err("Telefonbuch-Fehler bei Empfänger " . (string)$recipient['label_no'] . ": " . $e->getMessage());
+          }
+        }
+        if ($savedContacts > 0) {
+          add_ok("Empfänger im Telefonbuch gespeichert: $savedContacts.");
           $contacts = get_contacts($pdo);
-        } catch (Throwable $e) {
-          add_err("Telefonbuch-Fehler: " . $e->getMessage());
         }
-      }
 
-      if ($created > 0) {
-        add_ok("✅ Beauftragt: $created Job(s).");
-        if ($movedSources > 0) {
-          add_ok("📦 Quellen-Datei(en) verschoben: $movedSources → queue/<jobid>/source.pdf");
-        } else {
-          add_ok("Hinweis: Falls eine Quelle-Datei liegen bleibt, fehlen Schreibrechte zum Verschieben in die queue.");
+        if ($created > 0) {
+          add_ok("✅ Beauftragt: $created Job(s).");
+          if ($removedSources > 0) {
+            add_ok("📦 Quellen-Datei(en) entfernt: $removedSources. Jeder Job enthält eine eigene source.pdf.");
+          }
+          if ($removeFailed > 0) {
+            add_err("Hinweis: $removeFailed Quellen-Datei(en) konnten nach der Job-Anlage nicht entfernt werden.");
+          }
         }
+      } catch (Throwable $e) {
+        foreach ($pendingJobs as $jobDirs) {
+          remove_job_dir_safe((string)$jobDirs['staging'], $DIR_STAGING);
+          remove_job_dir_safe((string)$jobDirs['queue'], $DIR_QUEUE);
+        }
+        foreach ($queuedDirs as $queueDir) {
+          remove_job_dir_safe((string)$queueDir, $DIR_QUEUE);
+        }
+        add_err("Job-Anlage abgebrochen: " . $e->getMessage() . " Originaldateien wurden nicht entfernt.");
       }
     }
   }
@@ -701,7 +957,7 @@ if ($action === 'delete_source_files') {
       if (!is_file($path)) continue;
       if (@unlink($path)) $deleted++;
     }
-    if ($deleted > 0) add_ok("🗑️ Gelöscht: $deleted Datei(en) aus Quelle " . $src . ".");
+    if ($deleted > 0) add_ok("🗑️ Gelöscht: $deleted Datei(en) aus Quelle " . source_label($src) . ".");
     else add_err("Keine Dateien gelöscht (keine Auswahl / keine Rechte).");
   }
 }
@@ -818,8 +1074,8 @@ if ($action === 'cancel_job') {
 
 // -------------------- View / Source --------------------
 $view = (string)($_GET['view'] ?? '');
-$src  = (string)($_GET['src'] ?? 'fax1');
-if ($view === '' && !isset($ALLOW_SOURCES[$src])) $src = 'fax1';
+$src  = (string)($_GET['src'] ?? $DEFAULT_SOURCE);
+if ($view === '' && !isset($ALLOW_SOURCES[$src])) $src = $DEFAULT_SOURCE;
 
 // -------------------- Sidebar Data --------------------
 $queueJobs = list_job_dirs($DIR_QUEUE);
@@ -852,6 +1108,9 @@ if ($ajax === 'status') {
     'fail_count' => $failCount,
     'active_jobs' => build_active_jobs_payload($activePreview),
   ];
+  if ($view === '' && isset($ALLOW_SOURCES[$src])) {
+    $payload['source_files'] = build_source_files_payload($src, $ALLOW_SOURCES[$src], $EXCLUDE_SUFFIXES, $EXCLUDE_CONTAINS, $MAX_LIST_FILES);
+  }
   header('Content-Type: application/json; charset=utf-8');
   echo json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n";
   exit;
@@ -964,6 +1223,13 @@ foreach ($contacts as $c) {
     .checkline{ display:flex; align-items:flex-end; gap:14px; margin-top:12px; flex-wrap:wrap; }
     .optstack{ display:grid; gap:8px; align-content:start; }
     .optstack label{ margin:0; font-weight:900; color:var(--ink); display:flex; align-items:center; gap:10px; }
+    .recipient-head{ display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:10px; }
+    .recipient-list{ display:grid; gap:10px; }
+    .recipient-block{ border:1px solid var(--line); border-radius:12px; background:#fff; padding:12px; }
+    .recipient-title-row{ display:flex; justify-content:space-between; align-items:center; gap:12px; }
+    .recipient-title{ font-weight:900; }
+    .recipient-row{ display:grid; grid-template-columns: minmax(220px, 1fr) minmax(180px, 280px); gap:14px; align-items:end; }
+    .inline-check{ margin:10px 0 0; font-weight:900; color:var(--ink); display:flex; align-items:center; gap:10px; }
 
     .actionrow{
       display:grid;
@@ -1009,6 +1275,14 @@ foreach ($contacts as $c) {
       font-size: 12px;
       margin-top:auto;
     }
+    footer a{ color:inherit; font-weight:900; text-decoration:none; }
+    footer a:hover{ text-decoration:underline; }
+
+    @media (max-width: 820px){
+      .wrap{ grid-template-columns: 1fr; }
+      .recipient-row, .actionrow, .row{ grid-template-columns: 1fr; }
+      .ellipsis.fn{ max-width: 58vw; }
+    }
   </style>
 </head>
 <body>
@@ -1036,8 +1310,9 @@ foreach ($contacts as $c) {
     <div class="mut" style="font-size:13px; font-weight:900; margin-bottom:8px;">Bitte wählen:</div>
 
     <div class="tabs">
-      <?php foreach (['fax1','fax2','fax3','fax4','fax5','pdf-zu-fax','sendefehler'] as $t): ?>
-        <a class="tab <?=($view==='' && $src===$t)?'active':''?>" href="?src=<?=h($t)?>">📄 <?=h($t)?></a>
+      <?php foreach ($SOURCE_DEFS as $sourceDef): ?>
+        <?php $t = (string)$sourceDef['id']; ?>
+        <a class="tab <?=($view==='' && $src===$t)?'active':''?>" href="?src=<?=h($t)?>">📄 <?=h(source_label($t))?></a>
       <?php endforeach; ?>
       <a class="tab <?=($view==='sendelog')?'active':''?>" href="?view=sendelog">✅ Sendeprotokoll</a>
       <a class="tab <?=($view==='phonebook')?'active':''?>" href="?view=phonebook">📇 Telefonbuch</a>
@@ -1079,6 +1354,7 @@ foreach ($contacts as $c) {
 
               $sent = null; $total = null; $done = null; $max = null;
               $faxstat = ''; $state = '';
+              $af = null;
               if (is_array($live)) {
                 if (isset($live['progress']) && is_array($live['progress'])) {
                   if (isset($live['progress']['sent'])) $sent = (int)$live['progress']['sent'];
@@ -1090,10 +1366,26 @@ foreach ($contacts as $c) {
                 }
                 $faxstat = (string)($live['faxstat_status'] ?? '');
                 $state = (string)($live['state'] ?? '');
+                $af = (isset($live['asterisk_fax']) && is_array($live['asterisk_fax'])) ? $live['asterisk_fax'] : null;
               }
 
               $line2 = '';
-              if ($where === 'processing' && $sent !== null && $total !== null) {
+              if (is_array($af) && !empty($af['active'])) {
+                $page = isset($af['page_number']) ? (int)$af['page_number'] : null;
+                $totalPages = isset($af['total_pages']) ? (int)$af['total_pages'] : null;
+                $elapsed = isset($af['elapsed_sec']) ? (int)$af['elapsed_sec'] : null;
+                if ($elapsed === null && !empty($af['connected_at'])) {
+                  $t0 = parse_iso_time((string)$af['connected_at']);
+                  if ($t0 !== null) $elapsed = max(0, time() - $t0);
+                }
+                $rate = isset($af['data_rate']) ? (int)$af['data_rate'] : null;
+                $pageText = ($page !== null && $totalPages !== null) ? ($page . '/' . $totalPages) : (($page !== null) ? (string)$page : (($totalPages !== null) ? ('?/' . $totalPages) : 'läuft'));
+                $parts = ['Sende: ' . $pageText];
+                $dur = format_hms_compact($elapsed);
+                if ($dur !== '') $parts[] = $dur;
+                if ($rate !== null && $rate > 0) $parts[] = $rate . ' bit/s';
+                $line2 = implode(' · ', $parts);
+              } elseif ($where === 'processing' && $sent !== null && $total !== null) {
                 $line2 = 'Sende: ' . $sent . '/' . $total;
               } elseif ($where === 'queue') {
                 $hm = hhmm_from_iso($createdAt);
@@ -1104,7 +1396,16 @@ foreach ($contacts as $c) {
 
               $tooltip1 = trim("Fax: $rNum\nDatei: $file\nJob: $jid");
               $tooltip2 = $line2;
-              if ($where === 'processing') {
+              if (is_array($af) && !empty($af['active'])) {
+                $tips = [];
+                if (!empty($af['state']) || !empty($af['last_status'])) $tips[] = 'Status: ' . trim((string)($af['state'] ?? '') . ' / ' . (string)($af['last_status'] ?? ''), ' /');
+                if (!empty($af['session'])) $tips[] = 'Session: ' . (string)$af['session'];
+                if (!empty($af['channel'])) $tips[] = 'Kanal: ' . (string)$af['channel'];
+                if (!empty($af['connected_at'])) $tips[] = 'Callzeit: ' . format_hms_compact(isset($af['elapsed_sec']) ? (int)$af['elapsed_sec'] : null);
+                if (!empty($af['file_name'])) $tips[] = 'TIFF: ' . (string)$af['file_name'];
+                if (!empty($af['updated_at'])) $tips[] = 'Update: ' . (string)$af['updated_at'];
+                if (count($tips) > 0) $tooltip2 = $line2 . "\n" . implode("\n", $tips);
+              } elseif ($where === 'processing') {
                 $parts = [];
                 if ($sent !== null && $total !== null) $parts[] = "Sende: $sent/$total";
                 if ($submittedAt !== '') $parts[] = "submitted";
@@ -1143,7 +1444,7 @@ foreach ($contacts as $c) {
     </div>
 
     <div class="mut" style="font-size:13px; margin-top:12px;">
-      <b>Hinweis:</b> Fehler erneut senden: Tab <b>sendefehler</b> (Eingang) öffnen und dort beauftragen.
+      <b>Hinweis:</b> Fehler erneut senden: Tab <b><?=h(source_label('sendefehler'))?></b> öffnen und dort beauftragen.
     </div>
   </div>
 
@@ -1308,10 +1609,10 @@ foreach ($contacts as $c) {
       <div class="subtle" style="margin-bottom:10px;">
         <div style="font-weight:900;">Erneut senden?</div>
         <div class="mut" style="margin-top:6px;">
-          Bitte die Original-PDF im Tab <b>sendefehler</b> (Eingang) auswählen und neu beauftragen.
+          Bitte die Original-PDF im Tab <b><?=h(source_label('sendefehler'))?></b> auswählen und neu beauftragen.
         </div>
         <div class="checkline">
-          <a class="btn primary" href="?src=sendefehler">↩️ Zum erneuten Senden (sendefehler)</a>
+          <a class="btn primary" href="?src=sendefehler">↩️ Zum erneuten Senden (<?=h(source_label('sendefehler'))?>)</a>
         </div>
       </div>
 
@@ -1400,42 +1701,56 @@ foreach ($contacts as $c) {
       <?php
         $srcDir = $ALLOW_SOURCES[$src];
         $pdfs = list_source_pdfs($srcDir, $EXCLUDE_SUFFIXES, $EXCLUDE_CONTAINS, $MAX_LIST_FILES);
+        $srcLabel = source_label($src);
       ?>
 
-      <h2 class="section-title">📄 Quelle: <?=h($src)?></h2>
+      <h2 class="section-title">📄 Quelle: <?=h($srcLabel)?></h2>
 
       <form method="post" class="stack">
         <input type="hidden" name="action" value="create_jobs">
         <input type="hidden" name="src" value="<?=h($src)?>">
 
         <div class="subtle recipient-limits">
-          <div style="font-weight:900; font-size:16px;">Empfänger</div>
+          <div class="recipient-head">
+            <div style="font-weight:900; font-size:16px;">Empfänger</div>
+            <button class="btn ghost small" type="button" id="addRecipientBtn">➕ Weiteren Empfänger hinzufügen</button>
+          </div>
 
-          <label>Telefonbuch (optional)</label>
-          <select name="contact_id" id="contact_id">
-            <option value="">— Kontakt wählen —</option>
-            <?php foreach ($contacts as $c): ?>
-              <option value="<?=(int)$c['id']?>"><?=h($c['name'])?> · <?=h($c['number'])?></option>
-            <?php endforeach; ?>
-          </select>
+          <div id="recipientsList" class="recipient-list">
+            <div class="recipient-block" data-recipient-index="0">
+              <div class="recipient-title-row">
+                <div class="recipient-title">Empfänger 1</div>
+                <button class="btn ghost small recipient-remove" type="button" data-role="remove-recipient" style="display:none;">Entfernen</button>
+              </div>
 
-          <div class="recipient-row">
-            <div>
-              <label>Empfängername</label>
-              <input type="text" name="recipient_name" id="recipient_name" placeholder="z.B. Radiologie XY">
-            </div>
-            <div>
-              <label>Faxnummer</label>
-              <input type="text" name="recipient_number" id="recipient_number" placeholder="z.B. 02331...">
+              <label>Telefonbuch (optional)</label>
+              <select name="recipients[0][contact_id]" data-role="contact">
+                <option value="">— Kontakt wählen —</option>
+                <?php foreach ($contacts as $c): ?>
+                  <option value="<?=(int)$c['id']?>"><?=h($c['name'])?> · <?=h($c['number'])?></option>
+                <?php endforeach; ?>
+              </select>
+
+              <div class="recipient-row">
+                <div>
+                  <label>Empfängername</label>
+                  <input type="text" name="recipients[0][name]" data-role="name" placeholder="z.B. Radiologie XY">
+                </div>
+                <div>
+                  <label>Faxnummer</label>
+                  <input type="text" name="recipients[0][number]" data-role="number" placeholder="z.B. 02331...">
+                </div>
+              </div>
+
+              <label class="inline-check">
+                <input type="checkbox" name="recipients[0][save_to_phonebook]" value="1" data-role="save">
+                Im Telefonbuch speichern
+              </label>
             </div>
           </div>
 
           <div class="actionrow">
             <div class="optstack">
-              <label>
-                <input type="checkbox" name="save_to_phonebook" id="save_to_phonebook">
-                Im Telefonbuch speichern
-              </label>
               <label>
                 <input type="checkbox" name="ecm" checked>
                 ECM
@@ -1458,6 +1773,39 @@ foreach ($contacts as $c) {
           </div>
         </div>
 
+        <template id="recipientTemplate">
+          <div class="recipient-block" data-recipient-index="">
+            <div class="recipient-title-row">
+              <div class="recipient-title">Empfänger</div>
+              <button class="btn ghost small recipient-remove" type="button" data-role="remove-recipient">Entfernen</button>
+            </div>
+
+            <label>Telefonbuch (optional)</label>
+            <select data-role="contact">
+              <option value="">— Kontakt wählen —</option>
+              <?php foreach ($contacts as $c): ?>
+                <option value="<?=(int)$c['id']?>"><?=h($c['name'])?> · <?=h($c['number'])?></option>
+              <?php endforeach; ?>
+            </select>
+
+            <div class="recipient-row">
+              <div>
+                <label>Empfängername</label>
+                <input type="text" data-role="name" placeholder="z.B. Radiologie XY">
+              </div>
+              <div>
+                <label>Faxnummer</label>
+                <input type="text" data-role="number" placeholder="z.B. 02331...">
+              </div>
+            </div>
+
+            <label class="inline-check">
+              <input type="checkbox" value="1" data-role="save">
+              Im Telefonbuch speichern
+            </label>
+          </div>
+        </template>
+
         <div class="subtle">
           <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
             <div>
@@ -1474,7 +1822,7 @@ foreach ($contacts as $c) {
 
           <table class="tbl" style="margin-top:10px;">
             <thead><tr><th class="nowrap"></th><th>Datei</th><th class="nowrap">Größe</th><th class="right nowrap">Vorschau</th></tr></thead>
-            <tbody>
+            <tbody id="sourceFilesBody">
             <?php if (count($pdfs) === 0): ?>
               <tr><td colspan="4" class="mut">Keine sendbaren PDFs gefunden.</td></tr>
             <?php else: ?>
@@ -1500,18 +1848,83 @@ foreach ($contacts as $c) {
 
       <script>
         const CONTACTS = <?=json_encode($contactMap, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)?>;
+        const recipientList = document.getElementById('recipientsList');
+        const recipientTemplate = document.getElementById('recipientTemplate');
+        const addRecipientBtn = document.getElementById('addRecipientBtn');
 
-        const sel = document.getElementById('contact_id');
-        const nameEl = document.getElementById('recipient_name');
-        const numEl  = document.getElementById('recipient_number');
+        function recipientBlocks() {
+          return Array.from(recipientList.querySelectorAll('.recipient-block'));
+        }
 
-        function fillFromContact() {
+        function setRecipientIndex(block, index) {
+          block.dataset.recipientIndex = String(index);
+          const no = index + 1;
+          const title = block.querySelector('.recipient-title');
+          if (title) title.textContent = 'Empfänger ' + no;
+
+          const contact = block.querySelector('[data-role="contact"]');
+          const name = block.querySelector('[data-role="name"]');
+          const number = block.querySelector('[data-role="number"]');
+          const save = block.querySelector('[data-role="save"]');
+
+          if (contact) contact.name = 'recipients[' + index + '][contact_id]';
+          if (name) name.name = 'recipients[' + index + '][name]';
+          if (number) number.name = 'recipients[' + index + '][number]';
+          if (save) save.name = 'recipients[' + index + '][save_to_phonebook]';
+        }
+
+        function updateRecipientRemoveButtons() {
+          recipientBlocks().forEach((block, index) => {
+            setRecipientIndex(block, index);
+            const remove = block.querySelector('[data-role="remove-recipient"]');
+            if (remove) remove.style.display = index === 0 ? 'none' : '';
+          });
+        }
+
+        function fillRecipientFromContact(block) {
+          const sel = block.querySelector('[data-role="contact"]');
+          if (!sel) return;
           const id = sel.value;
           if (!id || !CONTACTS[id]) return;
-          nameEl.value = CONTACTS[id].name || '';
-          numEl.value  = CONTACTS[id].number || '';
+
+          const nameEl = block.querySelector('[data-role="name"]');
+          const numEl = block.querySelector('[data-role="number"]');
+          if (nameEl) nameEl.value = CONTACTS[id].name || '';
+          if (numEl) numEl.value = CONTACTS[id].number || '';
         }
-        sel.addEventListener('change', fillFromContact);
+
+        if (addRecipientBtn && recipientTemplate && recipientList) {
+          addRecipientBtn.addEventListener('click', () => {
+            const frag = recipientTemplate.content.cloneNode(true);
+            const block = frag.querySelector('.recipient-block');
+            recipientList.appendChild(frag);
+            if (block) {
+              setRecipientIndex(block, recipientBlocks().length - 1);
+              const contact = block.querySelector('[data-role="contact"]');
+              if (contact) contact.focus();
+            }
+            updateRecipientRemoveButtons();
+          });
+        }
+
+        if (recipientList) {
+          recipientList.addEventListener('change', (ev) => {
+            const target = ev.target;
+            if (!target || !target.matches('[data-role="contact"]')) return;
+            const block = target.closest('.recipient-block');
+            if (block) fillRecipientFromContact(block);
+          });
+
+          recipientList.addEventListener('click', (ev) => {
+            const btn = ev.target && ev.target.closest('[data-role="remove-recipient"]');
+            if (!btn) return;
+            const block = btn.closest('.recipient-block');
+            if (block) block.remove();
+            updateRecipientRemoveButtons();
+          });
+
+          updateRecipientRemoveButtons();
+        }
 
         function selectAll(on) {
           document.querySelectorAll('.filebox').forEach(b => b.checked = on);
@@ -1523,14 +1936,15 @@ foreach ($contacts as $c) {
 </div>
 
 <footer>
-  <?=h($APP_TITLE)?> · v<?=h($APP_VERSION)?> · <?=h($APP_AUTHOR)?>
+  <a href="https://kienzlefax.de/" target="_blank" rel="noopener"><?=h($APP_TITLE)?></a> · v<?=h($APP_VERSION)?> · <?=h($APP_AUTHOR)?>
 </footer>
 
 <script>
-  // 1.3 Live-AJAX (+ Sound): nur KPIs + aktive Jobs + Fehlerpuls (keine Formulare/Tabellen anfassen).
+  // 1.4 Live-AJAX (+ Sound): KPIs, aktive Jobs, Fehlerpuls und PDF-Liste der aktuellen Quelle.
   (function(){
     // -------------------- Sound (faxton.mp3) --------------------
     const SOUND_URL = <?=json_encode($ALERT_MP3, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)?>;
+    const CURRENT_SRC = <?=json_encode($view === '' ? $src : '', JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)?>;
     const bell = document.getElementById('soundBell');
 
     function soundEnabled(){
@@ -1561,6 +1975,8 @@ foreach ($contacts as $c) {
     const kpiProc  = document.getElementById('kpiProc');
     const failTab  = document.getElementById('failTab');
     const listEl   = document.getElementById('activeJobsList');
+    const sourceFilesBody = document.getElementById('sourceFilesBody');
+    let lastSourceFilesSig = null;
 
     function pad2(n){ return (n<10?'0':'') + n; }
 
@@ -1576,11 +1992,44 @@ foreach ($contacts as $c) {
 
     function safeText(s){ return (s===null || s===undefined) ? '' : String(s); }
 
+    function safeNumber(v){
+      if (v === null || v === undefined || v === '') return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    function buildAsteriskFaxLine(live, nowMs){
+      if (!live || !live.asterisk_fax || !live.asterisk_fax.active) return '';
+      const af = live.asterisk_fax;
+      const page = safeNumber(af.page_number);
+      const total = safeNumber(af.total_pages);
+      const rate = safeNumber(af.data_rate);
+      let elapsed = safeNumber(af.elapsed_sec);
+
+      if (safeText(af.connected_at)) {
+        const t0 = Date.parse(safeText(af.connected_at));
+        if (!isNaN(t0)) elapsed = Math.max(0, Math.floor((nowMs - t0) / 1000));
+      }
+
+      let pageText = 'läuft';
+      if (page !== null && total !== null) pageText = String(page) + '/' + String(total);
+      else if (page !== null) pageText = String(page);
+      else if (total !== null) pageText = '?/' + String(total);
+
+      const parts = ['Sende: ' + pageText];
+      if (elapsed !== null) parts.push(fmtHMS(elapsed));
+      if (rate !== null && rate > 0) parts.push(String(rate) + ' bit/s');
+      return parts.join(' · ');
+    }
+
     function buildLine2(job, nowMs){
       const where = safeText(job.where);
       const submitted = safeText(job.submitted_at) !== '';
       const startedAt = safeText(job.started_at);
       const live = job.live || null;
+
+      const asteriskLine = buildAsteriskFaxLine(live, nowMs);
+      if (asteriskLine) return asteriskLine;
 
       if (where === 'processing' && live && live.progress && live.dials) {
         const sent  = (live.progress.sent !== null && live.progress.sent !== undefined) ? live.progress.sent : null;
@@ -1633,6 +2082,18 @@ foreach ($contacts as $c) {
       const live = job.live || null;
       if (live) {
         const extra = [];
+        const af = live.asterisk_fax || null;
+        if (af && af.active) {
+          if (safeText(af.state) || safeText(af.last_status)) extra.push('Status: ' + [safeText(af.state), safeText(af.last_status)].filter(Boolean).join(' / '));
+          if (safeText(af.session)) extra.push('Session: ' + safeText(af.session));
+          if (safeText(af.channel)) extra.push('Kanal: ' + safeText(af.channel));
+          if (safeText(af.connected_at)) {
+            const t0 = Date.parse(safeText(af.connected_at));
+            if (!isNaN(t0)) extra.push('Callzeit: ' + fmtHMS((Date.now() - t0) / 1000));
+          }
+          if (safeText(af.file_name)) extra.push('TIFF: ' + safeText(af.file_name));
+          if (safeText(af.updated_at)) extra.push('Update: ' + safeText(af.updated_at));
+        }
         if (safeText(live.state)) extra.push('state ' + safeText(live.state));
         if (safeText(live.faxstat_status)) extra.push(safeText(live.faxstat_status));
         if (extra.length) t2 = t2 + '\n' + extra.join('\n');
@@ -1648,6 +2109,41 @@ foreach ($contacts as $c) {
         .replace(/>/g,'&gt;')
         .replace(/"/g,'&quot;')
         .replace(/'/g,'&#039;');
+    }
+
+    function renderSourceFiles(payload){
+      if (!sourceFilesBody || !payload || !Array.isArray(payload.files)) return;
+
+      const files = payload.files;
+      const sig = files.map(f => safeText(f.filename) + '\t' + safeText(f.size)).join('\n');
+      if (sig === lastSourceFilesSig) return;
+      lastSourceFilesSig = sig;
+
+      const checked = new Set(
+        Array.from(sourceFilesBody.querySelectorAll('.filebox:checked')).map(b => b.value)
+      );
+
+      if (files.length === 0) {
+        sourceFilesBody.innerHTML = '<tr><td colspan="4" class="mut">Keine sendbaren PDFs gefunden.</td></tr>';
+        return;
+      }
+
+      const src = safeText(payload.src) || CURRENT_SRC;
+      sourceFilesBody.innerHTML = files.map(f => {
+        const fn = safeText(f.filename);
+        const sizeLabel = safeText(f.size_label) || '—';
+        const isChecked = checked.has(fn) ? ' checked' : '';
+        const href = '?download=srcpdf&src=' + encodeURIComponent(src) + '&file=' + encodeURIComponent(fn);
+        return `
+<tr>
+  <td class="nowrap"><input type="checkbox" name="files[]" value="${escapeHtml(fn)}" class="filebox"${isChecked}></td>
+  <td style="font-weight:900;">
+    <span class="ellipsis fn" title="${escapeHtml(fn)}">${escapeHtml(fn)}</span>
+  </td>
+  <td class="nowrap">${escapeHtml(sizeLabel)}</td>
+  <td class="right nowrap"><a class="btn ghost small" href="${escapeHtml(href)}">👁️ PDF</a></td>
+</tr>`;
+      }).join('');
     }
 
     function renderJobs(activeJobs){
@@ -1725,13 +2221,14 @@ foreach ($contacts as $c) {
         }
 
         renderJobs(j.active_jobs || []);
+        renderSourceFiles(j.source_files || null);
       } catch (e) {
         // still
       }
     }
 
     poll();
-    setInterval(poll, 3000);
+    setInterval(poll, 5000);
   })();
 </script>
 
