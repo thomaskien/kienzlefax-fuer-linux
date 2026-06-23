@@ -3,8 +3,8 @@ sudo tee /usr/local/bin/kienzlefax-worker.py >/dev/null <<'PY'
 # -*- coding: utf-8 -*-
 """
 kienzlefax-worker.py — Asterisk-Only Worker (SendFAX)
-Version: 1.3.11
-Stand:  2026-06-19
+Version: 1.3.12
+Stand:  2026-06-23
 Autor:  Dr. Thomas Kienzle
 
 Changelog (komplett):
@@ -57,6 +57,11 @@ Changelog (komplett):
   - Verwaiste SENDING-Jobs mit DIALSTATUS=ANSWER und normalem Hangup werden als
     OK_ASSUMED_NO_SEND_END archiviert statt als Fehler, weil die Praxis zeigt:
     Fax ist versendet, nur send_end fehlt. Kein Retry, kein Doppelversand.
+- 1.3.12:
+  - Live-Details fuer aktive Asterisk-SendFAX-Sessions:
+    aktuelle Seite aus `fax show session`, Gesamtseiten aus `tiffinfo doc.tif`,
+    Datenrate, Session, Kanal und Call-Dauer werden in job.json unter
+    live.asterisk_fax geschrieben.
 """
 
 import fcntl
@@ -97,6 +102,10 @@ ORPHAN_CALL_TIMEOUT_SEC = float(os.environ.get("KFX_ORPHAN_CALL_TIMEOUT_SEC", "1
 # wichtig: Default 3600 wie im funktionierenden System
 AMI_ORIGINATE_WAIT_SEC = int(os.environ.get("KFX_AMI_ORIGINATE_WAIT_SEC", "3600"))
 
+ASTERISK_BIN = os.environ.get("KFX_ASTERISK_BIN", "asterisk")
+TIFFINFO_BIN = os.environ.get("KFX_TIFFINFO_BIN", "tiffinfo")
+FAX_LIVE_REFRESH_SEC = float(os.environ.get("KFX_FAX_LIVE_REFRESH_SEC", "2.0"))
+
 TIFF_DPI = os.environ.get("KFX_TIFF_DPI", "204x196")
 TIFF_DEVICE = os.environ.get("KFX_TIFF_DEVICE", "tiffg4")
 
@@ -104,6 +113,8 @@ LOCKFILE = BASE / ".kienzlefax-worker.lock"
 LOG_PREFIX = "kienzlefax-worker"
 _lock_fd: Optional[int] = None
 _next_submit_ts: float = 0.0
+_last_fax_live_ts: float = 0.0
+_tiff_pages_cache: Dict[str, Tuple[float, Optional[int]]] = {}
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -157,6 +168,225 @@ def list_jobdirs(root: Path) -> List[Path]:
 def run_cmd(cmd: List[str], *, env: Optional[dict]=None, timeout: Optional[int]=None) -> Tuple[int, str, str]:
     p = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
     return p.returncode, (p.stdout or ""), (p.stderr or "")
+
+def _int_or_none(value: Any) -> Optional[int]:
+    s = str(value or "").strip()
+    if not s:
+        return None
+    m = re.search(r"-?\d+", s)
+    if not m:
+        return None
+    try:
+        return int(m.group(0))
+    except Exception:
+        return None
+
+def _run_asterisk_rx(cmd: str, timeout: int = 5) -> str:
+    try:
+        rc, so, se = run_cmd([ASTERISK_BIN, "-rx", cmd], timeout=timeout)
+    except Exception as e:
+        log(f"fax live: asterisk command failed ({cmd}): {e}")
+        return ""
+    if rc != 0:
+        err = (se or so or "").strip()
+        if err:
+            log(f"fax live: asterisk rc={rc} cmd={cmd} err={err}")
+        return ""
+    return so
+
+def _active_sendfax_channels() -> List[str]:
+    txt = _run_asterisk_rx("core show channels concise", timeout=5)
+    out: List[str] = []
+    for line in txt.splitlines():
+        parts = line.split("!")
+        if len(parts) < 6:
+            continue
+        app = parts[5].strip()
+        if app.lower() != "sendfax":
+            continue
+        ch = parts[0].strip()
+        if ch and ch not in out:
+            out.append(ch)
+    return out
+
+def _channel_sendfax_file(channel: str) -> str:
+    txt = _run_asterisk_rx(f"core show channel {channel}", timeout=5)
+    for line in txt.splitlines():
+        m = re.match(r"^\s*Data:\s*(.+?)\s*$", line)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+def _tiff_page_count(path: str) -> Optional[int]:
+    if not path:
+        return None
+    if shutil.which(TIFFINFO_BIN) is None:
+        return None
+
+    try:
+        st = os.stat(path)
+        cache_key = f"{path}:{st.st_mtime_ns}:{st.st_size}"
+    except Exception:
+        cache_key = path
+
+    cached = _tiff_pages_cache.get(cache_key)
+    if cached is not None:
+        return cached[1]
+
+    pages: Optional[int] = None
+    try:
+        rc, so, _ = run_cmd([TIFFINFO_BIN, path], timeout=10)
+        if rc == 0:
+            n = sum(1 for line in so.splitlines() if line.startswith("TIFF Directory"))
+            pages = n if n > 0 else None
+    except Exception as e:
+        log(f"fax live: tiffinfo failed for {path}: {e}")
+
+    _tiff_pages_cache[cache_key] = (time.time(), pages)
+    if len(_tiff_pages_cache) > 100:
+        for k, _ in sorted(_tiff_pages_cache.items(), key=lambda kv: kv[1][0])[:25]:
+            _tiff_pages_cache.pop(k, None)
+    return pages
+
+def _parse_fax_sessions(text: str) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^(\d+)\s+(\S+)", line)
+        if not m:
+            continue
+        channel = m.group(2)
+        try:
+            out[channel] = int(m.group(1))
+        except Exception:
+            pass
+    return out
+
+def _parse_fax_session_details(text: str) -> Dict[str, Any]:
+    raw: Dict[str, str] = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        key = k.strip().lower().replace(" ", "_")
+        raw[key] = v.strip()
+
+    return {
+        "channel": raw.get("channel", ""),
+        "session": _int_or_none(raw.get("session")),
+        "operation": raw.get("operation", ""),
+        "state": raw.get("state", ""),
+        "last_status": raw.get("last_status", ""),
+        "ecm_mode": raw.get("ecm_mode", ""),
+        "data_rate": _int_or_none(raw.get("data_rate")),
+        "image_resolution": raw.get("image_resolution", ""),
+        "page_number": _int_or_none(raw.get("page_number")),
+        "file_name": raw.get("file_name", ""),
+        "tx_pages": _int_or_none(raw.get("tx_pages")),
+        "rx_pages": _int_or_none(raw.get("rx_pages")),
+    }
+
+def _find_job_for_tiff(tiff_path: str) -> Optional[Path]:
+    if not tiff_path:
+        return None
+    try:
+        p = Path(tiff_path)
+        if p.name != "doc.tif":
+            return None
+        jdir = p.parent
+        if jdir.parent != PROC:
+            return None
+        jp = jdir / "job.json"
+        return jp if jp.exists() else None
+    except Exception:
+        return None
+
+def _collect_asterisk_fax_live() -> Dict[str, Dict[str, Any]]:
+    channels = _active_sendfax_channels()
+    if not channels:
+        return {}
+
+    session_by_channel = _parse_fax_sessions(_run_asterisk_rx("fax show sessions", timeout=5))
+    out: Dict[str, Dict[str, Any]] = {}
+
+    for channel in channels:
+        tiff_path = _channel_sendfax_file(channel)
+        jp = _find_job_for_tiff(tiff_path)
+        if jp is None:
+            continue
+
+        jobid = jp.parent.name
+        session_id = session_by_channel.get(channel)
+        details: Dict[str, Any] = {}
+        if session_id is not None:
+            details = _parse_fax_session_details(_run_asterisk_rx(f"fax show session {session_id}", timeout=5))
+
+        detail_file = str(details.get("file_name") or "").strip()
+        if detail_file:
+            tiff_path = detail_file
+
+        out[jobid] = {
+            "active": True,
+            "updated_at": now_iso(),
+            "channel": str(details.get("channel") or channel),
+            "session": details.get("session") if details.get("session") is not None else session_id,
+            "operation": str(details.get("operation") or ""),
+            "state": str(details.get("state") or ""),
+            "last_status": str(details.get("last_status") or ""),
+            "ecm_mode": str(details.get("ecm_mode") or ""),
+            "data_rate": details.get("data_rate"),
+            "image_resolution": str(details.get("image_resolution") or ""),
+            "page_number": details.get("page_number"),
+            "tx_pages": details.get("tx_pages"),
+            "rx_pages": details.get("rx_pages"),
+            "file_name": tiff_path,
+            "total_pages": _tiff_page_count(tiff_path),
+        }
+
+    return out
+
+def step_update_asterisk_fax_live() -> None:
+    global _last_fax_live_ts
+    now = time.time()
+    if (now - _last_fax_live_ts) < FAX_LIVE_REFRESH_SEC:
+        return
+    _last_fax_live_ts = now
+
+    live_by_job = _collect_asterisk_fax_live()
+    if not live_by_job:
+        return
+
+    for jdir in list_jobdirs(PROC):
+        live = live_by_job.get(jdir.name)
+        if not live:
+            continue
+        jp = jdir / "job.json"
+        if not jp.exists():
+            continue
+        try:
+            job = read_json(jp)
+            st = _st_norm(job)
+            if st not in ("CALLING", "SENDING", "PROCESSING", "SUBMITTED", "CLAIMED"):
+                continue
+
+            root_live = job.setdefault("live", {})
+            prev = root_live.get("asterisk_fax") if isinstance(root_live.get("asterisk_fax"), dict) else {}
+            connected_at = str(prev.get("connected_at") or "")
+            if not connected_at:
+                connected_at = now_iso()
+            live["connected_at"] = connected_at
+            start = parse_iso_ts(connected_at)
+            if start:
+                live["elapsed_sec"] = int((datetime.now(timezone.utc) - start).total_seconds())
+
+            root_live["updated_at"] = live["updated_at"]
+            root_live["asterisk_fax"] = live
+            job["updated_at"] = live["updated_at"]
+            write_json(jp, job)
+        except Exception as e:
+            log(f"fax live: update failed for {jdir.name}: {e}")
 
 def add_header_pdf(pdf: Path) -> Path:
     if not PDF_HEADER_SCRIPT.exists():
@@ -1017,9 +1247,10 @@ def step_submit() -> None:
 def main() -> None:
     ensure_dirs()
     acquire_lock()
-    log("started (v1.3.11)")
+    log("started (v1.3.12)")
     try:
         while True:
+            step_update_asterisk_fax_live()
             step_cancel_processing()
             step_finalize_processing()
             step_submit()

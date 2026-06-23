@@ -2,11 +2,11 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.3.6
-# Stand:   2026-06-20
+# Version: 3.3.8
+# Stand:   2026-06-23
 # Autor:   Dr. Thomas Kienzle
 #
-# Modularer Installer (alles gehört dazu; Provider-spezifisch später).
+# Modularer Installer (alles gehört dazu; Provider per Template-Auswahl).
 # - Fragt interaktiv:
 #   * Optionen neu setzen? (ENV wiederverwenden möglich)
 #   * Hostname setzen (Maschine + Zertifikat CN+SAN)
@@ -19,7 +19,7 @@
 # - Fix: INI-Patching via Python (kein awk/mawk Problem)
 # - Webroot: kienzlefax.php + index redirect + self-signed SSL 50y
 # - Remote Module:
-#     extensions.sh, pjsip-1und1.sh, worker.sh, agi.sh, pdf_with_header.sh, scan_ocr.sh
+#     extensions.sh, pjsip-provider.sh, worker.sh, agi.sh, pdf_with_header.sh, scan_ocr.sh
 #
 # NEU in 3.2.1 (konservativ):
 # - /etc/default/kienzlefax-worker wird angelegt (KFX_AMI_PASS NICHT interaktiv; kommt aus ENV/Default).
@@ -107,6 +107,18 @@
 #
 # NEU in 3.3.6:
 # - Admin-Passwort kann am Anfang wahlweise manuell gesetzt oder sicher generiert werden.
+#
+# NEU in 3.3.7:
+# - Globale Begrenzung auf drei logische Faxverbindungen via Dialplan-Kapazitaetsguard.
+# - Asterisk-Module func_groupcount.so und func_lock.so werden in modules.conf dauerhaft geladen
+#   und vor dem Remote-Dialplan-Reload geprueft.
+#
+# NEU in 3.3.8:
+# - Anzahl Faxdrucker wird abgefragt (1-100, Default 5) und CUPS/Backend/sources.json folgen dynamisch.
+# - PDF-zu-Fax-Eingaenge werden abgefragt; Default bleibt ein unnummerierter Share `pdf-zu-fax`.
+# - Provider-Auswahl am Anfang: 1und1, Telekom, sipgate oder manuell; Provider-Template schreibt pjsip.conf.
+# - sources.json wird unter /srv/kienzlefax/config/sources.json erzeugt.
+# - SSH authorized_keys werden neben admin auch nach /root/.ssh/authorized_keys uebernommen.
 # ==============================================================================
 
 set -euo pipefail
@@ -115,7 +127,7 @@ set -euo pipefail
 # Remote Module URLs
 # ------------------------------------------------------------------------------
 URL_EXTENSIONS="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/extensions.sh"
-URL_PJSIP_1UND1="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/pjsip-1und1.sh"
+URL_PJSIP_PROVIDER="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/pjsip-provider.sh"
 URL_WORKER="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/worker.sh"
 URL_AGI="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/agi.sh"
 URL_PDF_WITH_HEADER="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/pdf_with_header.sh"
@@ -340,6 +352,24 @@ ask_default(){
   printf -v "$__var" "%s" "$__val"
 }
 
+ask_int_range(){
+  local __var="$1"; shift
+  local __prompt="$1"; shift
+  local __def="$1"; shift
+  local __min="$1"; shift
+  local __max="$1"; shift
+  local __val=""
+  while true; do
+    read -r -p "${__prompt} [${__def}]: " __val
+    __val="${__val:-$__def}"
+    if [[ "$__val" =~ ^[0-9]+$ ]] && (( __val >= __min && __val <= __max )); then
+      printf -v "$__var" "%s" "$__val"
+      return 0
+    fi
+    echo "Bitte eine Zahl von ${__min} bis ${__max} eingeben."
+  done
+}
+
 read_secret_twice(){
   local __var="$1"; shift
   local __prompt="$1"; shift
@@ -382,6 +412,28 @@ PY
 }
 
 sanitize_digits(){ echo "$1" | tr -cd '0-9'; }
+
+normalize_provider(){
+  local p
+  p="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
+  case "$p" in
+    1|1und1|und1|ionos) echo "1und1";;
+    2|telekom|deutschetelekom|tkom|t-online|tonline) echo "telekom";;
+    3|sipgate) echo "sipgate";;
+    4|manual|manuell|manuellkonfiguration) echo "manual";;
+    *) echo "";;
+  esac
+}
+
+provider_label(){
+  case "${1:-}" in
+    1und1) echo "1&1 Deutschland";;
+    telekom) echo "Deutsche Telekom";;
+    sipgate) echo "sipgate";;
+    manual) echo "Manuelle Konfiguration";;
+    *) echo "${1:-unbekannt}";;
+  esac
+}
 
 detect_current_user_candidate(){
   local cand=""
@@ -482,8 +534,8 @@ fi
 if [[ "$RESET_OPTS" == "n" ]]; then
   # shellcheck disable=SC1090
   source "$ENVFILE"
-  if [[ -z "${KFX_ADMIN_PASSWORD:-}" ]]; then
-    log "[INFO] Vorhandene Optionen sind aelter als 3.3.0; Eingaben werden neu gesammelt."
+  if [[ -z "${KFX_ADMIN_PASSWORD:-}" || -z "${KFX_PROVIDER:-}" || -z "${KFX_SIP_USER:-}" || -z "${KFX_FAX_PRINTER_COUNT:-}" || -z "${KFX_PDF_INPUT_COUNT:-}" ]]; then
+    log "[INFO] Vorhandene Optionen sind aelter als 3.3.8; Eingaben werden neu gesammelt."
     RESET_OPTS="y"
   else
     log "[OK] Verwende vorhandene Grundkonfiguration aus ${ENVFILE}"
@@ -507,21 +559,86 @@ else
 fi
 
 echo
-echo "Hinweis: Diese Provider-Konfiguration ist fuer 1&1 Deutschland vorbereitet."
-echo "Bei anderem Provider muessen vor allem PJSIP/Dialplan angepasst werden:"
-echo "  /etc/asterisk/pjsip.conf, /etc/asterisk/extensions.conf"
-echo "  installer-modular/pjsip-1und1.sh, installer-modular/extensions.sh"
+echo "Provider-Auswahl:"
+echo "  1 = 1&1 Deutschland (bisher getesteter Standard)"
+echo "  2 = Deutsche Telekom (Template; Felder bitte pruefen)"
+echo "  3 = sipgate (Template; Felder bitte pruefen)"
+echo "  4 = manuell (pjsip.conf wird nicht automatisch geschrieben)"
+while true; do
+  ask_default PROVIDER_IN "Provider" "1und1"
+  KFX_PROVIDER="$(normalize_provider "$PROVIDER_IN")"
+  if [[ -n "$KFX_PROVIDER" ]]; then
+    break
+  fi
+  echo "Bitte 1und1, telekom, sipgate oder manuell eingeben."
+done
+KFX_PROVIDER_LABEL="$(provider_label "$KFX_PROVIDER")"
+echo "[OK] Provider: ${KFX_PROVIDER_LABEL}"
+
 echo "DynDNS / Public FQDN ist optional, zur optimalen Stabilitaet aber unbedingt empfohlen."
 read -r -p "DynDNS / Public FQDN (Enter = leer lassen): " PUBLIC_FQDN
 
-read -r -p "SIP Nummer (gleich Username, nur Ziffern): " SIP_NUMBER_RAW
-SIP_NUMBER="$(sanitize_digits "${SIP_NUMBER_RAW}")"
-[[ -n "${SIP_NUMBER}" ]] || die "SIP Nummer ist leer/ungültig."
+echo
+echo "==== SIP Zugangsdaten ===="
+while true; do
+  ask_default SIP_USER "SIP Benutzername/Auth-ID" ""
+  [[ -n "$SIP_USER" ]] && break
+  echo "SIP Benutzername/Auth-ID darf nicht leer sein."
+done
+
+while true; do
+  read -r -p "SIP Rufnummer / CallerID (nur Ziffern; Enter = SIP Benutzername falls nur Ziffern): " SIP_NUMBER_RAW
+  if [[ -z "$SIP_NUMBER_RAW" ]]; then
+    SIP_NUMBER_RAW="$SIP_USER"
+  fi
+  SIP_NUMBER="$(sanitize_digits "${SIP_NUMBER_RAW}")"
+  if [[ -n "$SIP_NUMBER" ]]; then
+    break
+  fi
+  echo "Bitte eine Rufnummer/CallerID mit Ziffern eingeben."
+done
 unset SIP_NUMBER_RAW
 
 echo
 echo "==== SIP Passwort eingeben (sichtbar aus = nein) ===="
 read_secret_twice SIP_PASSWORD "SIP Passwort"
+
+case "$KFX_PROVIDER" in
+  1und1)
+    PROVIDER_DOMAIN_DEFAULT="sip.1und1.de"
+    PROVIDER_IDENTIFY_DEFAULT="212.227.0.0/16"
+    PROVIDER_EXPIRATION_DEFAULT="300"
+    ;;
+  telekom)
+    PROVIDER_DOMAIN_DEFAULT="tel.t-online.de"
+    PROVIDER_IDENTIFY_DEFAULT=""
+    PROVIDER_EXPIRATION_DEFAULT="300"
+    ;;
+  sipgate)
+    PROVIDER_DOMAIN_DEFAULT="sipgate.de"
+    PROVIDER_IDENTIFY_DEFAULT=""
+    PROVIDER_EXPIRATION_DEFAULT="600"
+    ;;
+  manual)
+    PROVIDER_DOMAIN_DEFAULT=""
+    PROVIDER_IDENTIFY_DEFAULT=""
+    PROVIDER_EXPIRATION_DEFAULT="300"
+    ;;
+esac
+
+if [[ "$KFX_PROVIDER" != "manual" ]]; then
+  ask_default KFX_SIP_DOMAIN "SIP Registrar/Domain fuer ${KFX_PROVIDER_LABEL}" "$PROVIDER_DOMAIN_DEFAULT"
+  [[ -n "$KFX_SIP_DOMAIN" ]] || die "SIP Registrar/Domain darf nicht leer sein."
+  ask_default KFX_SIP_OUTBOUND_PROXY "SIP Outbound Proxy (Enter = keiner)" ""
+  ask_default KFX_SIP_IDENTIFY_MATCH "PJSIP identify match (IP/Netz; Enter = keiner)" "$PROVIDER_IDENTIFY_DEFAULT"
+  ask_default KFX_SIP_EXPIRATION "SIP Registration Expiration Sekunden" "$PROVIDER_EXPIRATION_DEFAULT"
+  [[ "$KFX_SIP_EXPIRATION" =~ ^[0-9]+$ ]] || die "SIP Registration Expiration ungueltig."
+else
+  KFX_SIP_DOMAIN=""
+  KFX_SIP_OUTBOUND_PROXY=""
+  KFX_SIP_IDENTIFY_MATCH=""
+  KFX_SIP_EXPIRATION="$PROVIDER_EXPIRATION_DEFAULT"
+fi
 
 echo
 echo "==== Admin-Passwort (Linux admin + Samba admin) ===="
@@ -540,6 +657,9 @@ FAX_DID="$(sanitize_digits "${FAX_DID_IN:-$SIP_NUMBER}")"
 unset FAX_DID_IN
 
 ask_default KFX_PRACTICE_NAME "Praxis-Kopfzeile fuer ausgehende Faxe" "KienzleFax"
+
+ask_int_range FAX_PRINTER_COUNT "Anzahl Faxdrucker fax1..faxN" "5" "1" "100"
+ask_int_range PDF_INPUT_COUNT "Anzahl PDF-zu-Fax-Eingaenge" "1" "1" "100"
 
 ask_default SIP_BIND_PORT "SIP Bind Port (PJSIP extern; Provider-Config)" "${DEFAULT_SIP_BIND_PORT}"
 [[ "$SIP_BIND_PORT" =~ ^[0-9]+$ ]] || die "SIP_BIND_PORT ungültig"
@@ -561,6 +681,12 @@ collect_run_options
 
 KFX_HOSTNAME_ENV="$(quote_env_value "$KFX_HOSTNAME")"
 PUBLIC_FQDN_ENV="$(quote_env_value "$PUBLIC_FQDN")"
+KFX_PROVIDER_ENV="$(quote_env_value "$KFX_PROVIDER")"
+KFX_PROVIDER_LABEL_ENV="$(quote_env_value "$KFX_PROVIDER_LABEL")"
+SIP_USER_ENV="$(quote_env_value "$SIP_USER")"
+KFX_SIP_DOMAIN_ENV="$(quote_env_value "$KFX_SIP_DOMAIN")"
+KFX_SIP_OUTBOUND_PROXY_ENV="$(quote_env_value "$KFX_SIP_OUTBOUND_PROXY")"
+KFX_SIP_IDENTIFY_MATCH_ENV="$(quote_env_value "$KFX_SIP_IDENTIFY_MATCH")"
 SIP_PASSWORD_ENV="$(quote_env_value "$SIP_PASSWORD")"
 ADMIN_PASSWORD_ENV="$(quote_env_value "$ADMIN_PASSWORD")"
 KFX_PRACTICE_NAME_ENV="$(quote_env_value "$KFX_PRACTICE_NAME")"
@@ -578,6 +704,14 @@ cat >"$ENVFILE" <<EENV
 # generated by kienzlefax installer
 KFX_HOSTNAME=${KFX_HOSTNAME_ENV}
 KFX_PUBLIC_FQDN=${PUBLIC_FQDN_ENV}
+KFX_PROVIDER=${KFX_PROVIDER_ENV}
+KFX_PROVIDER_LABEL=${KFX_PROVIDER_LABEL_ENV}
+KFX_SIP_USER=${SIP_USER_ENV}
+KFX_SIP_DOMAIN=${KFX_SIP_DOMAIN_ENV}
+KFX_SIP_OUTBOUND_PROXY=${KFX_SIP_OUTBOUND_PROXY_ENV}
+KFX_SIP_IDENTIFY_MATCH=${KFX_SIP_IDENTIFY_MATCH_ENV}
+KFX_SIP_EXPIRATION=${KFX_SIP_EXPIRATION}
+KFX_PJSIP_ENDPOINT=kfx-provider-endpoint
 KFX_SIP_NUMBER=${SIP_NUMBER}
 KFX_SIP_PASSWORD=${SIP_PASSWORD_ENV}
 KFX_ADMIN_PASSWORD=${ADMIN_PASSWORD_ENV}
@@ -586,6 +720,8 @@ KFX_AMI_SECRET=${AMI_SECRET_ENV}
 KFX_SIP_BIND_PORT=${SIP_BIND_PORT}
 KFX_RTP_START=${RTP_START}
 KFX_RTP_END=${RTP_END}
+KFX_FAX_PRINTER_COUNT=${FAX_PRINTER_COUNT}
+KFX_PDF_INPUT_COUNT=${PDF_INPUT_COUNT}
 KFX_AST_REF=${AST_REF_ENV}
 KFX_REMOTE_REFRESH=${REMOTE_REFRESH}
 KFX_WEB_REFRESH=${WEB_REFRESH}
@@ -666,21 +802,113 @@ sep(){ echo; echo "=============================================================
 KZ_BASE="/srv/kienzlefax"
 SPOOL_TIFF_DIR="/var/spool/asterisk/fax1"
 SPOOL_PDF_DIR="/var/spool/asterisk/fax"
+ENVFILE="/etc/kienzlefax-installer.env"
+
+if [[ -f "$ENVFILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENVFILE"
+fi
+
+FAX_PRINTER_COUNT="${KFX_FAX_PRINTER_COUNT:-5}"
+PDF_INPUT_COUNT="${KFX_PDF_INPUT_COUNT:-1}"
+if ! [[ "$FAX_PRINTER_COUNT" =~ ^[0-9]+$ ]] || (( FAX_PRINTER_COUNT < 1 || FAX_PRINTER_COUNT > 100 )); then
+  FAX_PRINTER_COUNT=5
+fi
+if ! [[ "$PDF_INPUT_COUNT" =~ ^[0-9]+$ ]] || (( PDF_INPUT_COUNT < 1 || PDF_INPUT_COUNT > 100 )); then
+  PDF_INPUT_COUNT=1
+fi
 
 sep "Verzeichnisse + Rechte (kienzlefax)"
 mkdir -p "${KZ_BASE}"
-for i in 1 2 3 4 5; do mkdir -p "${KZ_BASE}/incoming/fax${i}"; done
-mkdir -p "${KZ_BASE}/pdf-zu-fax"
+for i in $(seq 1 "$FAX_PRINTER_COUNT"); do mkdir -p "${KZ_BASE}/incoming/fax${i}"; done
+if (( PDF_INPUT_COUNT <= 1 )); then
+  mkdir -p "${KZ_BASE}/pdf-zu-fax"
+else
+  for i in $(seq 1 "$PDF_INPUT_COUNT"); do mkdir -p "${KZ_BASE}/pdf-zu-fax${i}"; done
+fi
 mkdir -p "${KZ_BASE}/sendefehler/eingang" "${KZ_BASE}/sendefehler/berichte"
 mkdir -p "${KZ_BASE}/staging" "${KZ_BASE}/queue" "${KZ_BASE}/processing"
 mkdir -p "${KZ_BASE}/sendeberichte"
+mkdir -p "${KZ_BASE}/config"
 touch "${KZ_BASE}/phonebook.sqlite"
 
 mkdir -p "${SPOOL_TIFF_DIR}" "${SPOOL_PDF_DIR}"
 chmod 0777 "${SPOOL_TIFF_DIR}" "${SPOOL_PDF_DIR}" || true
 chmod 0777 "${KZ_BASE}" "${KZ_BASE}"/* || true
-for i in 1 2 3 4 5; do chmod 0777 "${KZ_BASE}/incoming/fax${i}" || true; done
+for i in $(seq 1 "$FAX_PRINTER_COUNT"); do chmod 0777 "${KZ_BASE}/incoming/fax${i}" || true; done
+if (( PDF_INPUT_COUNT <= 1 )); then
+  chmod 0777 "${KZ_BASE}/pdf-zu-fax" || true
+else
+  for i in $(seq 1 "$PDF_INPUT_COUNT"); do chmod 0777 "${KZ_BASE}/pdf-zu-fax${i}" || true; done
+fi
 chmod 0777 "${KZ_BASE}/sendefehler" "${KZ_BASE}/sendefehler"/* || true
+chmod 0755 "${KZ_BASE}/config" || true
+
+python3 - "$KZ_BASE" "$FAX_PRINTER_COUNT" "$PDF_INPUT_COUNT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+base = Path(sys.argv[1])
+fax_count = int(sys.argv[2])
+pdf_count = int(sys.argv[3])
+
+sources = []
+for i in range(1, fax_count + 1):
+    sources.append({
+        "id": f"fax{i}",
+        "label": f"Faxdrucker {i}",
+        "kind": "fax_printer",
+        "path": str(base / "incoming" / f"fax{i}"),
+        "enabled": True,
+        "sendable": True,
+        "order": i * 10,
+    })
+
+if pdf_count <= 1:
+    sources.append({
+        "id": "pdf-zu-fax",
+        "label": "PDF zu Fax",
+        "kind": "dropin",
+        "path": str(base / "pdf-zu-fax"),
+        "enabled": True,
+        "sendable": True,
+        "order": 1000,
+    })
+else:
+    for i in range(1, pdf_count + 1):
+        sources.append({
+            "id": f"pdf-zu-fax{i}",
+            "label": f"PDF zu Fax {i}",
+            "kind": "dropin",
+            "path": str(base / f"pdf-zu-fax{i}"),
+            "enabled": True,
+            "sendable": True,
+            "order": 1000 + i,
+        })
+
+sources.append({
+    "id": "sendefehler",
+    "label": "Sendefehler",
+    "kind": "failed_inbox",
+    "path": str(base / "sendefehler" / "eingang"),
+    "enabled": True,
+    "sendable": True,
+    "order": 9000,
+})
+
+out = base / "config" / "sources.json"
+tmp = out.with_suffix(".json.tmp")
+tmp.write_text(json.dumps({
+    "schema_version": 1,
+    "default_source": "fax1",
+    "sources": sources,
+}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+tmp.replace(out)
+PY
+
+chown root:www-data "${KZ_BASE}/config/sources.json" 2>/dev/null || chown root:root "${KZ_BASE}/config/sources.json" || true
+chmod 0644 "${KZ_BASE}/config/sources.json" || true
 
 log "[OK] Verzeichnisse/Rechte erstellt."
 EOF
@@ -742,6 +970,33 @@ copy_authorized_keys_to_admin(){
   log "[OK] SSH authorized_keys von '${src_user}' fuer admin uebernommen."
 }
 
+copy_authorized_keys_to_root(){
+  local src_user src_home src_keys dst_keys
+  src_user="$(detect_source_ssh_user || true)"
+  [[ -n "$src_user" ]] || return 0
+
+  src_home="$(getent passwd "$src_user" | cut -d: -f6 || true)"
+  [[ -n "$src_home" ]] || return 0
+
+  src_keys="${src_home}/.ssh/authorized_keys"
+  dst_keys="/root/.ssh/authorized_keys"
+  [[ -s "$src_keys" ]] || return 0
+
+  install -d -m 0700 -o root -g root /root/.ssh
+  touch "$dst_keys"
+  chmod 0600 "$dst_keys"
+  chown root:root "$dst_keys"
+
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    grep -Fxq "$key" "$dst_keys" 2>/dev/null || printf '%s\n' "$key" >>"$dst_keys"
+  done <"$src_keys"
+
+  chmod 0600 "$dst_keys"
+  chown root:root "$dst_keys"
+  log "[OK] SSH authorized_keys von '${src_user}' fuer root uebernommen."
+}
+
 sep "Admin-Account anlegen + sudo + Samba"
 if ! id admin >/dev/null 2>&1; then
   useradd -m -s /bin/bash admin
@@ -767,6 +1022,7 @@ else
 fi
 
 copy_authorized_keys_to_admin
+copy_authorized_keys_to_root
 
 log "[OK] admin: Passwort, sudo und Samba gesetzt."
 EOF
@@ -931,8 +1187,23 @@ sep(){ echo; echo "=============================================================
 
 KZ_BASE="/srv/kienzlefax"
 SPOOL_PDF_DIR="/var/spool/asterisk/fax"
+ENVFILE="/etc/kienzlefax-installer.env"
 
-sep "CUPS Backend + fax1..fax5 + Samba Shares"
+if [[ -f "$ENVFILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENVFILE"
+fi
+
+FAX_PRINTER_COUNT="${KFX_FAX_PRINTER_COUNT:-5}"
+PDF_INPUT_COUNT="${KFX_PDF_INPUT_COUNT:-1}"
+if ! [[ "$FAX_PRINTER_COUNT" =~ ^[0-9]+$ ]] || (( FAX_PRINTER_COUNT < 1 || FAX_PRINTER_COUNT > 100 )); then
+  FAX_PRINTER_COUNT=5
+fi
+if ! [[ "$PDF_INPUT_COUNT" =~ ^[0-9]+$ ]] || (( PDF_INPUT_COUNT < 1 || PDF_INPUT_COUNT > 100 )); then
+  PDF_INPUT_COUNT=1
+fi
+
+sep "CUPS Backend + fax1..fax${FAX_PRINTER_COUNT} + Samba Shares"
 
 if systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' | grep -qx "cups-browsed.service"; then
   systemctl stop cups-browsed || true
@@ -950,6 +1221,7 @@ cat > "$BACKEND" <<'BACKEND_EOF'
 #!/bin/bash
 set -u
 DESTBASE="/srv/kienzlefax/incoming"
+FAX_COUNT="__KFX_FAX_PRINTER_COUNT__"
 LOG="/var/log/kienzlefaxpdf-backend.log"
 TIMEOUT="/usr/bin/timeout"
 GS="/usr/bin/gs"
@@ -967,7 +1239,7 @@ if [[ -d "$CUPSTMP" && -w "$CUPSTMP" ]]; then TMPBASE="$CUPSTMP"; fi
 log() { echo "[$($DATE -Is)] $*" >> "$LOG"; }
 
 if [[ $# -eq 0 ]]; then
-  for i in 1 2 3 4 5; do
+  for i in $(seq 1 "$FAX_COUNT"); do
     echo "direct kienzlefaxpdf \"KienzleFax PDF Drop\" \"kienzlefaxpdf:/fax$i\""
   done
   exit 0
@@ -982,7 +1254,10 @@ PRN="${URI#kienzlefaxpdf:/}"
 PRN="${PRN%%/*}"
 log "START jobid=$JOBID user=$USER title=$TITLE file='${FILE:-}' uri='$URI' prn='$PRN' tmpbase='$TMPBASE'"
 [[ -n "$JOBID" ]] || { log "ERROR: missing jobid"; exit 1; }
-[[ "$PRN" =~ ^fax[1-5]$ ]] || { log "ERROR: invalid prn '$PRN'"; exit 1; }
+[[ "$PRN" =~ ^fax[0-9]+$ ]] || { log "ERROR: invalid prn '$PRN'"; exit 1; }
+PRN_NUM="${PRN#fax}"
+[[ "$PRN_NUM" =~ ^[0-9]+$ ]] || { log "ERROR: invalid prn number '$PRN'"; exit 1; }
+(( PRN_NUM >= 1 && PRN_NUM <= FAX_COUNT )) || { log "ERROR: prn '$PRN' outside configured range 1..$FAX_COUNT"; exit 1; }
 
 OUTDIR="$DESTBASE/$PRN"
 $MKDIR -p "$OUTDIR" || { log "ERROR: mkdir '$OUTDIR' failed"; exit 1; }
@@ -1025,15 +1300,25 @@ BACKEND_EOF
 
 chmod 0755 "$BACKEND"
 chown root:root "$BACKEND"
+sed -i "s/__KFX_FAX_PRINTER_COUNT__/${FAX_PRINTER_COUNT}/g" "$BACKEND"
 
 touch "$BACKEND_LOG"
 chown lp:lp "$BACKEND_LOG" || true
 chmod 0664 "$BACKEND_LOG"
 
-for i in 1 2 3 4 5; do
+for i in $(seq 1 "$FAX_PRINTER_COUNT"); do
   mkdir -p "${KZ_BASE}/incoming/fax${i}"
   chmod 0777 "${KZ_BASE}/incoming/fax${i}" || true
 done
+if (( PDF_INPUT_COUNT <= 1 )); then
+  mkdir -p "${KZ_BASE}/pdf-zu-fax"
+  chmod 0777 "${KZ_BASE}/pdf-zu-fax" || true
+else
+  for i in $(seq 1 "$PDF_INPUT_COUNT"); do
+    mkdir -p "${KZ_BASE}/pdf-zu-fax${i}"
+    chmod 0777 "${KZ_BASE}/pdf-zu-fax${i}" || true
+  done
+fi
 
 systemctl enable --now cups || true
 systemctl restart cups || true
@@ -1055,8 +1340,8 @@ if ! lpinfo -m 2>/dev/null | awk '{print $1}' | grep -qx "$MODEL"; then
   log "[WARN] CUPS generic.ppd nicht gefunden; verwende raw als Fallback."
 fi
 
-for i in 1 2 3 4 5; do lpadmin -x "fax$i" 2>/dev/null || true; done
-for i in 1 2 3 4 5; do
+for i in $(seq 1 100); do lpadmin -x "fax$i" 2>/dev/null || true; done
+for i in $(seq 1 "$FAX_PRINTER_COUNT"); do
   PRN="fax$i"
   lpadmin -p "$PRN" -E -v "kienzlefaxpdf:/$PRN" -m "$MODEL"
   lpadmin -p "$PRN" -o printer-is-shared=true
@@ -1097,9 +1382,15 @@ cat > /etc/samba/smb.conf <<EOFSMB
    guest ok = yes
    read only = yes
    create mask = 0700
+EOFSMB
 
-[pdf-zu-fax]
-   path = /srv/kienzlefax/pdf-zu-fax
+append_pdf_share(){
+  local share="$1"
+  local path="$2"
+  cat >> /etc/samba/smb.conf <<EOFSMB
+
+[${share}]
+   path = ${path}
    browseable = yes
    read only = no
    guest ok = yes
@@ -1107,6 +1398,18 @@ cat > /etc/samba/smb.conf <<EOFSMB
    force group = nogroup
    create mask = 0666
    directory mask = 2777
+EOFSMB
+}
+
+if (( PDF_INPUT_COUNT <= 1 )); then
+  append_pdf_share "pdf-zu-fax" "/srv/kienzlefax/pdf-zu-fax"
+else
+  for i in $(seq 1 "$PDF_INPUT_COUNT"); do
+    append_pdf_share "pdf-zu-fax${i}" "/srv/kienzlefax/pdf-zu-fax${i}"
+  done
+fi
+
+cat >> /etc/samba/smb.conf <<EOFSMB
 
 [sendefehler-eingang]
    path = /srv/kienzlefax/sendefehler/eingang
@@ -1310,7 +1613,7 @@ log "[OK] Asterisk installiert/gestartet."
 EOF
   chmod +x "${MOD_DIR}/60-asterisk-build.sh"
 
-  # 70-rtp-ami (unverändert)
+  # 70-rtp-ami
   cat >"${MOD_DIR}/70-rtp-ami.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1339,6 +1642,7 @@ source "$ENVFILE"
 
 RTP_CONF="/etc/asterisk/rtp.conf"
 MANAGER_CONF="/etc/asterisk/manager.conf"
+MODULES_CONF="/etc/asterisk/modules.conf"
 
 ini_set_kv_py(){
   local file="$1" section="$2" key="$3" value="$4"
@@ -1382,6 +1686,92 @@ ensure_line_in_file(){
   touch "$file"
   grep -Fxq "$line" "$file" || echo "$line" >>"$file"
 }
+
+ensure_capacity_modules_in_modules_conf(){
+  mkdir -p /etc/asterisk
+  if [[ -f "$MODULES_CONF" ]]; then
+    cp -a "$MODULES_CONF" "${MODULES_CONF}.old.kienzlefax.$(date +%Y%m%d-%H%M%S)" || true
+  fi
+  touch "$MODULES_CONF"
+
+  python3 - "$MODULES_CONF" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8") if path.exists() else ""
+lines = text.splitlines()
+wanted = ["func_groupcount.so", "func_lock.so"]
+section_re = re.compile(r"^\s*\[([^\]]+)\]\s*$")
+module_re = re.compile(r"^\s*(?:load|noload)\s*=>\s*(\S+)\s*$", re.I)
+
+modules_idx = None
+for i, line in enumerate(lines):
+    m = section_re.match(line)
+    if m and m.group(1).strip().lower() == "modules":
+        modules_idx = i
+        break
+
+if modules_idx is None:
+    if lines and lines[-1].strip():
+        lines.append("")
+    lines.extend(["[modules]"])
+    modules_idx = len(lines) - 1
+
+end = len(lines)
+for i in range(modules_idx + 1, len(lines)):
+    if section_re.match(lines[i]):
+        end = i
+        break
+
+kept = []
+seen = set()
+for line in lines[modules_idx + 1:end]:
+    m = module_re.match(line)
+    if m and m.group(1) in wanted:
+        mod = m.group(1)
+        if mod not in seen:
+            kept.append(f"load => {mod}")
+            seen.add(mod)
+        continue
+    kept.append(line)
+
+insert = [f"load => {mod}" for mod in wanted if mod not in seen]
+insert_at = 0
+for idx, line in enumerate(kept):
+    if re.match(r"^\s*autoload\s*=", line, re.I):
+        insert_at = idx + 1
+lines = (
+    lines[:modules_idx + 1]
+    + kept[:insert_at]
+    + insert
+    + kept[insert_at:]
+    + lines[end:]
+)
+path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+PY
+}
+
+ensure_capacity_modules_running(){
+  ensure_capacity_modules_in_modules_conf
+
+  wait_for_asterisk_cli 60 || die "Asterisk CLI ist nicht bereit; Kapazitaetsmodule koennen nicht geprueft werden."
+  asterisk -rx "module load func_groupcount.so" >/dev/null 2>&1 || true
+  asterisk -rx "module load func_lock.so" >/dev/null 2>&1 || true
+
+  local group_out lock_out
+  group_out="$(asterisk -rx "module show like func_groupcount" || true)"
+  lock_out="$(asterisk -rx "module show like func_lock" || true)"
+
+  [[ "$group_out" == *"func_groupcount.so"* && "$group_out" == *"Running"* ]] \
+    || die "func_groupcount.so ist nicht geladen."
+  [[ "$lock_out" == *"func_lock.so"* && "$lock_out" == *"Running"* ]] \
+    || die "func_lock.so ist nicht geladen."
+}
+
+sep "Asterisk: Kapazitaetsmodule dauerhaft laden"
+ensure_capacity_modules_running
 
 sep "Asterisk: RTP Range setzen"
 [[ -f "$RTP_CONF" ]] && cp -a "$RTP_CONF" "${RTP_CONF}.old.kienzlefax.$(date +%Y%m%d-%H%M%S)" || true
@@ -1560,12 +1950,15 @@ lines = [
     "- DynDNS/Public FQDN ist optional, zur optimalen Stabilitaet aber unbedingt empfohlen.",
     "",
     "Provider-Hinweis:",
-    "- Diese Konfiguration ist fuer 1&1 Deutschland vorbereitet.",
+    f"- Ausgewaehlter Provider: {e('KFX_PROVIDER_LABEL', e('KFX_PROVIDER', '1&1 Deutschland'))}",
+    f"- SIP Registrar/Domain: {e('KFX_SIP_DOMAIN', '-')}",
     "- Providerabhaengige Dateien: /etc/asterisk/pjsip.conf und /etc/asterisk/extensions.conf.",
-    "- Installer-Module dazu: installer-modular/pjsip-1und1.sh und installer-modular/extensions.sh.",
+    "- Installer-Module dazu: installer-modular/pjsip-provider.sh und installer-modular/extensions.sh.",
+    "- Bei Provider 'manuell' wird pjsip.conf nicht automatisch geschrieben.",
     "",
     "Zugangsdaten:",
-    f"- SIP Nummer / Username: {e('KFX_SIP_NUMBER')}",
+    f"- SIP Benutzer/Auth-ID: {e('KFX_SIP_USER', e('KFX_SIP_NUMBER'))}",
+    f"- SIP Nummer / CallerID: {e('KFX_SIP_NUMBER')}",
     f"- SIP Passwort: {e('KFX_SIP_PASSWORD')}",
     "- Linux Benutzer: admin",
     f"- Admin Passwort: {e('KFX_ADMIN_PASSWORD')}",
@@ -1588,9 +1981,11 @@ lines = [
     "- /usr/local/bin/kienzlefax-worker.py",
     "- /usr/local/bin/pdf_with_header.sh",
     "- /usr/local/bin/scan-ocr-watch.sh",
+    "- /srv/kienzlefax/config/sources.json",
     "",
     "Samba-Shares und Verzeichnisse:",
-    "- pdf-zu-fax -> /srv/kienzlefax/pdf-zu-fax",
+    f"- Faxdrucker: fax1..fax{e('KFX_FAX_PRINTER_COUNT', '5')} -> /srv/kienzlefax/incoming/fax1..faxN",
+    f"- PDF-zu-Fax-Eingaenge: {e('KFX_PDF_INPUT_COUNT', '1')} (Standard bei 1: pdf-zu-fax)",
     "- fax-eingang -> /var/spool/asterisk/fax",
     "- hierhin-scannen-fuer-ocr -> /srv/scan/eingang",
     "- scan-eingang -> /srv/scan/ocr",
@@ -1725,7 +2120,7 @@ source "$ENVFILE"
 
 sep "Remote Module holen/aktualisieren"
 maybe_fetch_one "extensions.sh"      "$URL_EXTENSIONS"      "${MOD_CACHE}/extensions.sh"
-maybe_fetch_one "pjsip-1und1.sh"     "$URL_PJSIP_1UND1"     "${MOD_CACHE}/pjsip-1und1.sh"
+maybe_fetch_one "pjsip-provider.sh"  "$URL_PJSIP_PROVIDER"  "${MOD_CACHE}/pjsip-provider.sh"
 maybe_fetch_one "worker.sh"          "$URL_WORKER"          "${MOD_CACHE}/worker.sh"
 maybe_fetch_one "agi.sh"             "$URL_AGI"             "${MOD_CACHE}/agi.sh"
 maybe_fetch_one "pdf_with_header.sh" "$URL_PDF_WITH_HEADER" "${MOD_CACHE}/pdf_with_header.sh"
@@ -1761,12 +2156,17 @@ source "$ENVFILE"
 # ------------------------------------------------------------------------------
 # Export variables for remote scripts (compatibility layer)
 # ------------------------------------------------------------------------------
-export KFX_HOSTNAME KFX_PUBLIC_FQDN KFX_SIP_NUMBER KFX_SIP_PASSWORD KFX_FAX_DID KFX_SIP_BIND_PORT
+export KFX_HOSTNAME KFX_PUBLIC_FQDN KFX_PROVIDER KFX_PROVIDER_LABEL
+export KFX_SIP_USER KFX_SIP_NUMBER KFX_SIP_PASSWORD KFX_SIP_DOMAIN KFX_SIP_OUTBOUND_PROXY KFX_SIP_IDENTIFY_MATCH KFX_SIP_EXPIRATION
+export KFX_FAX_DID KFX_SIP_BIND_PORT KFX_PJSIP_ENDPOINT
 export KFX_RTP_START KFX_RTP_END KFX_AST_REF KFX_AMI_SECRET
 
 # Common legacy names (remote scripts may still use these)
-export PJSIP_USER="${PJSIP_USER:-$KFX_SIP_NUMBER}"
+export PJSIP_USER="${PJSIP_USER:-${KFX_SIP_USER:-$KFX_SIP_NUMBER}}"
 export PJSIP_PASS="${PJSIP_PASS:-$KFX_SIP_PASSWORD}"
+export PJSIP_EXPIRATION="${PJSIP_EXPIRATION:-${KFX_SIP_EXPIRATION:-300}}"
+export PJSIP_OUTBOUND_PROXY="${PJSIP_OUTBOUND_PROXY:-${KFX_SIP_OUTBOUND_PROXY:-}}"
+export PJSIP_IDENTIFY_MATCH="${PJSIP_IDENTIFY_MATCH:-${KFX_SIP_IDENTIFY_MATCH:-}}"
 export SIP_BIND_PORT="${SIP_BIND_PORT:-$KFX_SIP_BIND_PORT}"
 export SIP_PORT="${SIP_PORT:-$KFX_SIP_BIND_PORT}"
 export FAX_DID="${FAX_DID:-$KFX_FAX_DID}"
@@ -1787,8 +2187,12 @@ export AMI_SECRET="${AMI_SECRET:-$KFX_AMI_PASS}"
 # Remote scripts execution
 # ------------------------------------------------------------------------------
 sep "Remote Provider-PJSIP (befüllt pjsip.conf)"
-run_remote_script "${MOD_CACHE}/pjsip-1und1.sh"
-asterisk_rx "pjsip reload"
+if [[ "${KFX_PROVIDER:-1und1}" == "manual" ]]; then
+  log "[INFO] Provider manuell gewaehlt; pjsip.conf wird nicht automatisch geschrieben."
+else
+  run_remote_script "${MOD_CACHE}/pjsip-provider.sh"
+  asterisk_rx "pjsip reload"
+fi
 
 sep "Remote Dialplan (befüllt extensions.conf)"
 run_remote_script "${MOD_CACHE}/extensions.sh"
@@ -1812,6 +2216,8 @@ run_module "${MOD_DIR}/96-remove-initial-user.sh"
 
 sep "Reloads + Status"
 asterisk_rx "core reload"
+asterisk_rx "module show like func_groupcount"
+asterisk_rx "module show like func_lock"
 asterisk_rx "pjsip reload"
 asterisk_rx "dialplan reload"
 
