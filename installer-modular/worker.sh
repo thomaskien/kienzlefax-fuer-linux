@@ -3,7 +3,7 @@ sudo tee /usr/local/bin/kienzlefax-worker.py >/dev/null <<'PY'
 # -*- coding: utf-8 -*-
 """
 kienzlefax-worker.py — Asterisk-Only Worker (SendFAX)
-Version: 1.3.15
+Version: 1.3.16
 Stand:  2026-06-23
 Autor:  Dr. Thomas Kienzle
 
@@ -77,6 +77,10 @@ Changelog (komplett):
       ausgelagert, sondern als FAILED in sendefehler/berichte abgelegt.
     - Verwaiste SENDING-Jobs ohne send_end werden als Fehlerbericht abgelegt, um
       unbemerkte Haenger und Doppelversand-Risiko zu vermeiden.
+- 1.3.16:
+  - Queue-Cancel wiederhergestellt:
+    Jobs, die im Webinterface in queue abgebrochen werden, werden sofort als
+    CANCELLED/cancelled in sendefehler/berichte abgelegt und aus queue entfernt.
 """
 
 import fcntl
@@ -549,6 +553,17 @@ def retry_due(job: Dict[str, Any]) -> bool:
 
 def _st_norm(job: Dict[str, Any]) -> str:
     return str(job.get("status") or "").strip().upper()
+
+def cancel_requested(job: Dict[str, Any]) -> bool:
+    c = job.get("cancel") or {}
+    return isinstance(c, dict) and bool(c.get("requested"))
+
+def mark_cancel_handled(job: Dict[str, Any]) -> None:
+    c = job.setdefault("cancel", {})
+    if not isinstance(c, dict):
+        c = {}
+        job["cancel"] = c
+    c["handled_at"] = now_iso()
 
 def count_inflight() -> int:
     n = 0
@@ -1061,6 +1076,53 @@ def requeue_retry(jobdir: Path, job: Dict[str, Any]) -> None:
     except Exception as e:
         log(f"retry move back to queue failed for {jobdir.name}: {e}")
 
+def finalize_cancelled_queue_job(jdir: Path) -> bool:
+    jp = jdir / "job.json"
+    if not jp.exists():
+        return False
+    try:
+        job = read_json(jp)
+    except Exception as e:
+        log(f"queue-cancel: cannot read {jdir.name}: {e}")
+        return False
+
+    if not cancel_requested(job):
+        return False
+
+    now = now_iso()
+    mark_cancel_handled(job)
+    job["job_id"] = str(job.get("job_id") or jdir.name)
+    job["status"] = "CANCELLED"
+    job["claimed_at"] = job.get("claimed_at") or now
+    job["submitted_at"] = job.get("submitted_at") or now
+    job["started_at"] = job.get("started_at") or now
+    job["end_time"] = job.get("end_time") or now
+    job["finalized_at"] = job.get("finalized_at") or job["end_time"]
+    job["updated_at"] = job["end_time"]
+    job.setdefault("result", {})
+    if not isinstance(job["result"], dict):
+        job["result"] = {}
+    job["result"]["reason"] = job["result"].get("reason") or "cancelled"
+
+    try:
+        write_json(jp, job)
+        finalize_failed(jdir, job)
+    except Exception as e:
+        log(f"queue-cancel: finalize failed {jdir.name}: {e}")
+        try:
+            write_json(jp, job)
+        except Exception:
+            pass
+        return False
+
+    shutil.rmtree(jdir, ignore_errors=True)
+    log(f"queue-cancel: finalized CANCELLED -> {jdir.name}")
+    return True
+
+def step_queue_cancels() -> None:
+    for jdir in list_jobdirs(QUEUE):
+        finalize_cancelled_queue_job(jdir)
+
 def mark_orphaned_call_for_retry(jdir: Path, job: Dict[str, Any]) -> bool:
     st = _st_norm(job)
     if st not in ("CALLING", "SENDING"):
@@ -1386,10 +1448,11 @@ def step_submit() -> None:
 def main() -> None:
     ensure_dirs()
     acquire_lock()
-    log("started (v1.3.15)")
+    log("started (v1.3.16)")
     try:
         while True:
             step_update_asterisk_fax_live()
+            step_queue_cancels()
             step_cancel_processing()
             step_finalize_processing()
             step_submit()
