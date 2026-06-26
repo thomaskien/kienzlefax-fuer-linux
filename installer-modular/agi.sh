@@ -25,7 +25,7 @@ cat >"$AGI" <<'PY'
 # -*- coding: utf-8 -*-
 """
 kfx_update_status.agi — kienzlefax
-Version: 1.3.6
+Version: 1.3.7
 Stand:  2026-02-17
 Autor:  Dr. Thomas Kienzle
 
@@ -52,6 +52,9 @@ Changelog (komplett):
   - Neue Reason-Klasse NOFAX:
     - Wenn ANSWER aber Fax scheitert/keine Seiten -> nur 3 Versuche (statt 30).
   - Atomare JSON-Schreibweise (tmp + replace), um kaputte job.json zu vermeiden.
+- 1.3.7:
+  - JSON-Schreibvorgaenge nutzen eindeutige Temp-Dateien plus fsync, damit parallele
+    AGI-/Worker-Schreiber keine job.json-Reste oder Temp-Datei-Kollisionen erzeugen.
 """
 
 import json
@@ -155,13 +158,21 @@ def read_json(p: Path) -> Dict[str, Any]:
         return json.load(f)
 
 def write_json_atomic(p: Path, obj: Dict[str, Any]) -> None:
-    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp = p.with_name(f"{p.name}.tmp.{os.getpid()}.{os.urandom(4).hex()}")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
         f.write("\n")
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, p)
+    try:
+        dfd = os.open(str(p.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except Exception:
+        pass
 
 def set_attempt_meta(job: Dict[str, Any], *, ended: bool, reason: Optional[str]=None, mx: Optional[int]=None) -> None:
     a = job.setdefault("attempt", {})

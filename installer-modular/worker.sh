@@ -3,7 +3,7 @@ sudo tee /usr/local/bin/kienzlefax-worker.py >/dev/null <<'PY'
 # -*- coding: utf-8 -*-
 """
 kienzlefax-worker.py — Asterisk-Only Worker (SendFAX)
-Version: 1.3.14
+Version: 1.3.15
 Stand:  2026-06-23
 Autor:  Dr. Thomas Kienzle
 
@@ -69,6 +69,14 @@ Changelog (komplett):
 - 1.3.14:
   - FIX: `fax show sessions` auf Asterisk listet die Session-ID als Spalte FAXID,
     nicht zwingend am Zeilenanfang. Parser erkennt dieses Tabellenformat jetzt.
+- 1.3.15:
+  - Robustheit nach Stromausfall/Abbruch:
+    - JSON-Schreibvorgaenge nutzen eindeutige Temp-Dateien plus fsync, damit parallele
+      Worker-/AGI-Schreiber keine job.json-Reste oder Temp-Datei-Kollisionen erzeugen.
+    - Kaputte oder fehlende job.json in processing wird nicht mehr ignoriert oder nur
+      ausgelagert, sondern als FAILED in sendefehler/berichte abgelegt.
+    - Verwaiste SENDING-Jobs ohne send_end werden als Fehlerbericht abgelegt, um
+      unbemerkte Haenger und Doppelversand-Risiko zu vermeiden.
 """
 
 import fcntl
@@ -147,11 +155,44 @@ def read_json(p: Path) -> Dict[str, Any]:
         return json.load(f)
 
 def write_json(p: Path, obj: Dict[str, Any]) -> None:
-    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp = p.with_name(f"{p.name}.tmp.{os.getpid()}.{time.time_ns()}")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, p)
+    try:
+        dfd = os.open(str(p.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except Exception:
+        pass
+
+def read_json_best_effort(p: Path) -> Tuple[Dict[str, Any], str]:
+    try:
+        return read_json(p), ""
+    except Exception as strict_error:
+        err = str(strict_error)
+
+    try:
+        raw = p.read_text(encoding="utf-8", errors="replace")
+    except Exception as read_error:
+        return {}, f"job.json unreadable: {read_error}"
+
+    try:
+        obj, end = json.JSONDecoder().raw_decode(raw.lstrip())
+        if isinstance(obj, dict):
+            tail = raw.lstrip()[end:].strip()
+            if tail:
+                return obj, f"job.json corrupt/trailing data after byte {end}: {err}"
+            return obj, err
+    except Exception:
+        pass
+
+    return {}, f"job.json invalid: {err}"
 
 def sanitize_basename(name: str) -> str:
     name = (name or "").strip()
@@ -937,13 +978,67 @@ def finalize_failed(jobdir: Path, job: Dict[str, Any]) -> None:
         pdf_for_archive = find_original_pdf_in_jobdir(jobdir) or (jobdir / "doc.pdf")
 
     build_report_pdf(job, report_pdf)
-    merge_report_and_doc(report_pdf, pdf_for_archive, merged_pdf)
+    if pdf_for_archive.exists():
+        merge_report_and_doc(report_pdf, pdf_for_archive, merged_pdf)
+    else:
+        shutil.move(str(report_pdf), str(merged_pdf))
 
     out_pdf = FAIL_OUT / f"{base}__{jobid}__FAILED.pdf"
     out_json = FAIL_OUT / f"{base}__{jobid}.json"
     shutil.move(str(merged_pdf), str(out_pdf))
     write_json(out_json, job)
     log(f"finalize FAILED -> {out_pdf.name}")
+
+def finalize_unreadable_processing_job(jdir: Path, reason: str) -> bool:
+    jobid = jdir.name
+    chans = _find_channels_for_job(jobid)
+    if chans:
+        log(f"broken processing job still has active channels jobid={jobid} chans={chans}; leaving in processing")
+        return False
+
+    jp = jdir / "job.json"
+    job: Dict[str, Any] = {}
+    salvage_note = ""
+    if jp.exists():
+        job, salvage_note = read_json_best_effort(jp)
+
+    if not isinstance(job, dict):
+        job = {}
+
+    now = now_iso()
+    job["job_id"] = str(job.get("job_id") or jobid)
+    job["status"] = "FAILED"
+    job["updated_at"] = now
+    job["end_time"] = job.get("end_time") or now
+    job["finalized_at"] = job.get("finalized_at") or job["end_time"]
+    job.setdefault("source", {})
+    if not isinstance(job["source"], dict):
+        job["source"] = {}
+    job["source"]["src"] = job["source"].get("src") or "processing"
+    job["source"]["filename_original"] = job["source"].get("filename_original") or f"{jobid}.pdf"
+    res = job.setdefault("result", {})
+    if not isinstance(res, dict):
+        res = {}
+        job["result"] = res
+    res["reason"] = "BROKEN_PROCESSING_JOB"
+    res["job_json_error"] = reason
+    if salvage_note:
+        res["job_json_salvage"] = salvage_note
+    res["note"] = "processing-Job konnte nach Neustart nicht sauber gelesen/finalisiert werden; als Fehlerbericht abgelegt"
+
+    try:
+        finalize_failed(jdir, job)
+    except Exception as e:
+        log(f"broken processing finalize failed jobid={jobid}: {e}")
+        try:
+            write_json(jp, job)
+        except Exception:
+            pass
+        return False
+
+    shutil.rmtree(jdir, ignore_errors=True)
+    log(f"broken processing job moved to Fehlerbericht jobid={jobid}")
+    return True
 
 def requeue_retry(jobdir: Path, job: Dict[str, Any]) -> None:
     job["status"] = "RETRY_WAIT"
@@ -991,14 +1086,14 @@ def mark_orphaned_call_for_retry(jdir: Path, job: Dict[str, Any]) -> bool:
     dial = str(res.get("dialstatus") or "").strip().upper()
     hcause = str(res.get("hangupcause") or "").strip()
     if dial == "ANSWER" and hcause in ("", "0", "16"):
-        reason = "OK_ASSUMED_NO_SEND_END"
-        job["status"] = "OK"
+        reason = "ORPHANED_SENT_NO_SEND_END"
+        job["status"] = "FAILED"
         res["reason"] = reason
-        res["faxstatus"] = res.get("faxstatus") or "ASSUMED_SUCCESS"
+        res["faxstatus"] = res.get("faxstatus") or "UNKNOWN"
         res["orphaned_call"] = True
         res["orphaned_call_age_sec"] = int(age)
-        res["assumed_success"] = True
-        res["note"] = "send_start und DIALSTATUS=ANSWER wurden erreicht, aber send_end fehlt; als erfolgreich archiviert, kein Retry"
+        res["assumed_success"] = False
+        res["note"] = "send_start und DIALSTATUS=ANSWER wurden erreicht, aber send_end fehlt; als Fehlerbericht abgelegt, kein automatischer Retry"
 
         a = job.setdefault("attempt", {})
         a["ended_at"] = now_iso()
@@ -1008,7 +1103,7 @@ def mark_orphaned_call_for_retry(jdir: Path, job: Dict[str, Any]) -> bool:
         job["finalized_at"] = job.get("finalized_at") or job["end_time"]
         job["updated_at"] = job["end_time"]
         write_json(jdir / "job.json", job)
-        log(f"orphaned sending job assumed OK jobid={jobid} dial={dial or 'n/a'} hcause={hcause or 'n/a'} age={int(age)}s")
+        log(f"orphaned sending job moved to failed flow jobid={jobid} dial={dial or 'n/a'} hcause={hcause or 'n/a'} age={int(age)}s")
         return True
 
     if st == "SENDING" or dial == "ANSWER":
@@ -1177,10 +1272,14 @@ def step_finalize_processing() -> None:
     for jdir in list_jobdirs(PROC):
         jp = jdir / "job.json"
         if not jp.exists():
+            if finalize_unreadable_processing_job(jdir, "job.json missing"):
+                _next_submit_ts = time.time() + POST_CALL_COOLDOWN_SEC
             continue
         try:
             job = read_json(jp)
-        except Exception:
+        except Exception as e:
+            if finalize_unreadable_processing_job(jdir, f"job.json unreadable: {e}"):
+                _next_submit_ts = time.time() + POST_CALL_COOLDOWN_SEC
             continue
 
         st = _st_norm(job)
@@ -1287,7 +1386,7 @@ def step_submit() -> None:
 def main() -> None:
     ensure_dirs()
     acquire_lock()
-    log("started (v1.3.14)")
+    log("started (v1.3.15)")
     try:
         while True:
             step_update_asterisk_fax_live()
