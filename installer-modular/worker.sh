@@ -3,7 +3,7 @@ sudo tee /usr/local/bin/kienzlefax-worker.py >/dev/null <<'PY'
 # -*- coding: utf-8 -*-
 """
 kienzlefax-worker.py — Asterisk-Only Worker (SendFAX)
-Version: 1.3.16
+Version: 1.3.17
 Stand:  2026-06-23
 Autor:  Dr. Thomas Kienzle
 
@@ -81,6 +81,11 @@ Changelog (komplett):
   - Queue-Cancel wiederhergestellt:
     Jobs, die im Webinterface in queue abgebrochen werden, werden sofort als
     CANCELLED/cancelled in sendefehler/berichte abgelegt und aus queue entfernt.
+- 1.3.17:
+  - Fehlerbericht-Fallback:
+    Wenn qpdf das Zusammenfuehren von Bericht und Original-PDF ablehnt, wird trotzdem
+    ein Fehlerbericht-PDF mit JSON geschrieben. Das Original liegt separat im
+    sendefehler/eingang, der Queue-Job wird nicht mehr blockiert.
 """
 
 import fcntl
@@ -713,7 +718,7 @@ def build_report_pdf(job: Dict[str, Any], out_pdf: Path) -> None:
             y -= 16
 
     c.setFont("Helvetica", 9)
-    c.drawString(50, 40, f"Erzeugt: {now_iso()}  |  kienzlefax-worker v1.3.6")
+    c.drawString(50, 40, f"Erzeugt: {now_iso()}  |  kienzlefax-worker v1.3.17")
     c.showPage()
     c.save()
 
@@ -994,7 +999,20 @@ def finalize_failed(jobdir: Path, job: Dict[str, Any]) -> None:
 
     build_report_pdf(job, report_pdf)
     if pdf_for_archive.exists():
-        merge_report_and_doc(report_pdf, pdf_for_archive, merged_pdf)
+        try:
+            merge_report_and_doc(report_pdf, pdf_for_archive, merged_pdf)
+        except Exception as e:
+            res = job.setdefault("result", {})
+            if isinstance(res, dict):
+                res["report_merge_error"] = str(e)
+                res["report_merge_fallback"] = "report_only_original_copied_to_sendefehler_eingang"
+            log(f"fail: qpdf merge failed for {jobdir.name}; storing report-only failure PDF: {e}")
+            try:
+                if merged_pdf.exists():
+                    merged_pdf.unlink()
+            except Exception:
+                pass
+            shutil.move(str(report_pdf), str(merged_pdf))
     else:
         shutil.move(str(report_pdf), str(merged_pdf))
 
@@ -1096,8 +1114,8 @@ def finalize_cancelled_queue_job(jdir: Path) -> bool:
     job["claimed_at"] = job.get("claimed_at") or now
     job["submitted_at"] = job.get("submitted_at") or now
     job["started_at"] = job.get("started_at") or now
-    job["end_time"] = job.get("end_time") or now
-    job["finalized_at"] = job.get("finalized_at") or job["end_time"]
+    job["end_time"] = now
+    job["finalized_at"] = now
     job["updated_at"] = job["end_time"]
     job.setdefault("result", {})
     if not isinstance(job["result"], dict):
@@ -1448,7 +1466,7 @@ def step_submit() -> None:
 def main() -> None:
     ensure_dirs()
     acquire_lock()
-    log("started (v1.3.16)")
+    log("started (v1.3.17)")
     try:
         while True:
             step_update_asterisk_fax_live()
