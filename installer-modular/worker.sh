@@ -3,8 +3,8 @@ sudo tee /usr/local/bin/kienzlefax-worker.py >/dev/null <<'PY'
 # -*- coding: utf-8 -*-
 """
 kienzlefax-worker.py — Asterisk-Only Worker (SendFAX)
-Version: 1.3.17
-Stand:  2026-06-23
+Version: 1.3.18
+Stand:  2026-06-27
 Autor:  Dr. Thomas Kienzle
 
 Changelog (komplett):
@@ -86,6 +86,12 @@ Changelog (komplett):
     Wenn qpdf das Zusammenfuehren von Bericht und Original-PDF ablehnt, wird trotzdem
     ein Fehlerbericht-PDF mit JSON geschrieben. Das Original liegt separat im
     sendefehler/eingang, der Queue-Job wird nicht mehr blockiert.
+- 1.3.18:
+  - Race-Fix fuer AGI- und Worker-Schreibzugriffe:
+    Das Asterisk-Liveupdate serialisiert seine job.json-Aktualisierung pro Job ueber
+    `.job.lock`, liest den Status innerhalb des Locks erneut und fuegt nur Live-Daten
+    in weiterhin aktive Jobs ein. Dadurch kann ein veralteter Live-Snapshot kein
+    bereits geschriebenes send_end-Ergebnis mehr ueberschreiben.
 """
 
 import fcntl
@@ -162,6 +168,23 @@ def safe_mkdir(p: Path) -> None:
 def read_json(p: Path) -> Dict[str, Any]:
     with p.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+def acquire_job_lock(jobdir: Path) -> int:
+    lock_path = jobdir / ".job.lock"
+    flags = os.O_RDONLY | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    fd = os.open(str(lock_path), flags, 0o666)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+def release_job_lock(fd: Optional[int]) -> None:
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 def write_json(p: Path, obj: Dict[str, Any]) -> None:
     tmp = p.with_name(f"{p.name}.tmp.{os.getpid()}.{time.time_ns()}")
@@ -455,7 +478,11 @@ def step_update_asterisk_fax_live() -> None:
         jp = jdir / "job.json"
         if not jp.exists():
             continue
+        lock_fd: Optional[int] = None
         try:
+            lock_fd = acquire_job_lock(jdir)
+            if not jp.exists():
+                continue
             job = read_json(jp)
             st = _st_norm(job)
             if st not in ("CALLING", "SENDING", "PROCESSING", "SUBMITTED", "CLAIMED"):
@@ -477,6 +504,8 @@ def step_update_asterisk_fax_live() -> None:
             write_json(jp, job)
         except Exception as e:
             log(f"fax live: update failed for {jdir.name}: {e}")
+        finally:
+            release_job_lock(lock_fd)
 
 def add_header_pdf(pdf: Path) -> Path:
     if not PDF_HEADER_SCRIPT.exists():
@@ -718,7 +747,7 @@ def build_report_pdf(job: Dict[str, Any], out_pdf: Path) -> None:
             y -= 16
 
     c.setFont("Helvetica", 9)
-    c.drawString(50, 40, f"Erzeugt: {now_iso()}  |  kienzlefax-worker v1.3.17")
+    c.drawString(50, 40, f"Erzeugt: {now_iso()}  |  kienzlefax-worker v1.3.18")
     c.showPage()
     c.save()
 
@@ -1466,7 +1495,7 @@ def step_submit() -> None:
 def main() -> None:
     ensure_dirs()
     acquire_lock()
-    log("started (v1.3.17)")
+    log("started (v1.3.18)")
     try:
         while True:
             step_update_asterisk_fax_live()

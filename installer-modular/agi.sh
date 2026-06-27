@@ -25,8 +25,8 @@ cat >"$AGI" <<'PY'
 # -*- coding: utf-8 -*-
 """
 kfx_update_status.agi — kienzlefax
-Version: 1.3.7
-Stand:  2026-02-17
+Version: 1.3.8
+Stand:  2026-06-27
 Autor:  Dr. Thomas Kienzle
 
 Changelog (komplett):
@@ -55,8 +55,17 @@ Changelog (komplett):
 - 1.3.7:
   - JSON-Schreibvorgaenge nutzen eindeutige Temp-Dateien plus fsync, damit parallele
     AGI-/Worker-Schreiber keine job.json-Reste oder Temp-Datei-Kollisionen erzeugen.
+- 1.3.8:
+  - Race-Fix fuer parallele Statusereignisse:
+    - Alle AGI-Lese-/Aenderungs-/Schreibfolgen werden pro Job ueber `.job.lock`
+      serialisiert.
+    - Bereits terminale Ergebnisse werden durch spaete oder doppelte dial_end-/
+      send_end-Ereignisse nicht mehr zurueckgestuft.
+    - Leere Felder eines spaeten Ereignisses ueberschreiben keine bereits vorhandenen
+      Fax-Ergebniswerte.
 """
 
+import fcntl
 import json
 import os
 import re
@@ -157,6 +166,23 @@ def read_json(p: Path) -> Dict[str, Any]:
     with p.open("r", encoding="utf-8") as f:
         return json.load(f)
 
+def acquire_job_lock(job_json: Path) -> int:
+    lock_path = job_json.parent / ".job.lock"
+    flags = os.O_RDONLY | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    fd = os.open(str(lock_path), flags, 0o666)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+def release_job_lock(fd: Optional[int]) -> None:
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
 def write_json_atomic(p: Path, obj: Dict[str, Any]) -> None:
     tmp = p.with_name(f"{p.name}.tmp.{os.getpid()}.{os.urandom(4).hex()}")
     with tmp.open("w", encoding="utf-8") as f:
@@ -201,7 +227,13 @@ def set_result_fields(job: Dict[str, Any], **kv: str) -> None:
     for k, v in kv.items():
         if v is None:
             continue
-        res[k] = v if isinstance(v, str) else to_str(v)
+        value = v if isinstance(v, str) else to_str(v)
+        if value == "" and to_str(res.get(k)).strip() != "":
+            continue
+        res[k] = value
+
+def status_is_terminal(job: Dict[str, Any]) -> bool:
+    return upper(job.get("status")) in ("OK", "FAILED", "CANCELLED")
 
 def normalize_cancel19(dialstatus: str, hangupcause: str) -> str:
     if dialstatus == "CANCEL" and hangupcause == "19":
@@ -259,16 +291,28 @@ def main() -> int:
         eprint(f"kfx_update_status.agi: job.json not found for jobid={jobid}")
         return 0
 
+    lock_fd: Optional[int] = None
     try:
+        lock_fd = acquire_job_lock(jp)
         job = read_json(jp)
     except Exception as e:
+        release_job_lock(lock_fd)
         eprint(f"kfx_update_status.agi: cannot read {jp}: {e}")
+        return 0
+
+    def finish() -> int:
+        nonlocal lock_fd
+        release_job_lock(lock_fd)
+        lock_fd = None
         return 0
 
     was_cancelled = bool((job.get("cancel") or {}).get("requested"))
     action = upper(args[1])
+    status_before = upper(job.get("status"))
 
     if action == "SEND_START":
+        if status_is_terminal(job):
+            return finish()
         job["status"] = "SENDING"
         job["updated_at"] = now_iso()
         a = job.setdefault("attempt", {})
@@ -284,13 +328,21 @@ def main() -> int:
             write_json_atomic(jp, job)
         except Exception as e:
             eprint(f"kfx_update_status.agi: write failed {jp}: {e}")
-        return 0
+        return finish()
 
     if action == "DIAL_END":
         dialstatus = upper(args[2]) if len(args) >= 3 else ""
         hangupcause = to_str(args[3]).strip() if len(args) >= 4 else ""
         dialstatus = normalize_cancel19(dialstatus, hangupcause)
         set_result_fields(job, dialstatus=dialstatus, hangupcause=hangupcause)
+
+        if status_is_terminal(job):
+            job["updated_at"] = now_iso()
+            try:
+                write_json_atomic(jp, job)
+            except Exception as e:
+                eprint(f"kfx_update_status.agi: write failed {jp}: {e}")
+            return finish()
 
         if was_cancelled:
             job["status"] = "FAILED"
@@ -303,7 +355,7 @@ def main() -> int:
                 write_json_atomic(jp, job)
             except Exception as e:
                 eprint(f"kfx_update_status.agi: write failed {jp}: {e}")
-            return 0
+            return finish()
 
         final_status, reason_key = decide_from_dial_end(dialstatus)
         if final_status is None:
@@ -312,7 +364,7 @@ def main() -> int:
                 write_json_atomic(jp, job)
             except Exception as e:
                 eprint(f"kfx_update_status.agi: write failed {jp}: {e}")
-            return 0
+            return finish()
 
         if final_status == "RETRY" and reason_key in RETRY_RULES:
             job["status"] = "RETRY"
@@ -336,7 +388,7 @@ def main() -> int:
             agi_send(f'SET VARIABLE KFX_JOB_STATUS "{job.get("status","")}"')
         except Exception:
             pass
-        return 0
+        return finish()
 
     if action == "SEND_END":
         faxstatus = upper(args[2]) if len(args) >= 3 else ""
@@ -365,6 +417,22 @@ def main() -> int:
             res["faxpages_sent"] = sent
         if total is not None:
             res["faxpages_total"] = total
+
+        preserve_terminal = (
+            status_before in ("OK", "CANCELLED")
+            or (status_before == "FAILED" and faxstatus != "SUCCESS")
+        )
+        if preserve_terminal:
+            job["updated_at"] = now_iso()
+            try:
+                write_json_atomic(jp, job)
+            except Exception as e:
+                eprint(f"kfx_update_status.agi: write failed {jp}: {e}")
+            try:
+                agi_send(f'SET VARIABLE KFX_JOB_STATUS "{job.get("status","")}"')
+            except Exception:
+                pass
+            return finish()
 
         if was_cancelled or dialstatus == "CANCEL":
             job["status"] = "FAILED"
@@ -400,7 +468,7 @@ def main() -> int:
             agi_send(f'SET VARIABLE KFX_JOB_STATUS "{job.get("status","")}"')
         except Exception:
             pass
-        return 0
+        return finish()
 
     # Legacy fallback:
     legacy = args[1:]
@@ -467,7 +535,7 @@ def main() -> int:
         agi_send(f'SET VARIABLE KFX_JOB_STATUS "{job.get("status","")}"')
     except Exception:
         pass
-    return 0
+    return finish()
 
 if __name__ == "__main__":
     try:
