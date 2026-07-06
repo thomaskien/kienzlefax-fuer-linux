@@ -2,8 +2,8 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.3.8
-# Stand:   2026-06-23
+# Version: 3.3.11
+# Stand:   2026-07-06
 # Autor:   Dr. Thomas Kienzle
 #
 # Modularer Installer (alles gehört dazu; Provider per Template-Auswahl).
@@ -19,7 +19,8 @@
 # - Fix: INI-Patching via Python (kein awk/mawk Problem)
 # - Webroot: kienzlefax.php + index redirect + self-signed SSL 50y
 # - Remote Module:
-#     extensions.sh, pjsip-provider.sh, worker.sh, agi.sh, pdf_with_header.sh, scan_ocr.sh
+#     extensions.sh, pjsip-provider.sh, telefonie-queue.sh, worker.sh, agi.sh,
+#     pdf_with_header.sh, scan_ocr.sh
 #
 # NEU in 3.2.1 (konservativ):
 # - /etc/default/kienzlefax-worker wird angelegt (KFX_AMI_PASS NICHT interaktiv; kommt aus ENV/Default).
@@ -119,6 +120,37 @@
 # - Provider-Auswahl am Anfang: 1und1, Telekom, sipgate oder manuell; Provider-Template schreibt pjsip.conf.
 # - sources.json wird unter /srv/kienzlefax/config/sources.json erzeugt.
 # - SSH authorized_keys werden neben admin auch nach /root/.ssh/authorized_keys uebernommen.
+#
+# NEU in 3.3.9:
+# - Optionale Asterisk-Telefoniewarteschlange mit dynamisch vielen lokalen PJSIP-Konten ab 201.
+# - Feste Empfangsprioritaet; alle 15 Sekunden kommt die naechste freie Nebenstelle hinzu.
+# - Interner SIP-Transport auf Port 5060 mit automatisch erkanntem LAN-Netz; keine Firewall-Aenderungen.
+# - Separate Provider-Templates fuer eingehende Telefonie und optional abweichende ausgehende Telefonie.
+# - Telefonie bevorzugt G.722 vor G.711 (`g722,alaw,ulaw`); Fax-Codecs bleiben unveraendert.
+# - Deutsches Asterisk-Sprachpaket, Klingelzeichen statt Wartemusik und Positionsansage alle 60 Sekunden.
+# - Telefonie-Zugangsdaten und erkannte Netzwerte werden in ENV und Installationsbericht dokumentiert.
+# - Remote-Dateien werden entsprechend der Projektvorgabe einzeln zum Aktualisieren angeboten.
+#
+# NEU in 3.3.10:
+# - Samba-Konfiguration und Dienststart werden verbindlich geprueft; Fehler werden nicht mehr verschluckt.
+# - Nach dem Asterisk-Build wird das Traversieren von /var/spool/asterisk fuer den Gastzugriff erneut
+#   sichergestellt, weil der Build die Elternrechte auf frischen Ubuntu-Systemen verschaerfen kann.
+# - Alle KienzleFax-Datenshares werden lokal per smbclient geoeffnet; auch der Admin-Share wird
+#   ohne Passwortausgabe ueber eine temporaere, geschuetzte Auth-Datei geprueft.
+#
+# NEU in 3.3.11:
+# - Das deutsche Asterisk-Sprachpaket wird nur noch heruntergeladen und seine Audiodateien werden
+#   extrahiert; dadurch kann APT keinen distributionsseitigen Asterisk samt fremder PJPROJECT-Bibliothek
+#   als Abhaengigkeit installieren.
+# - Der Source-Build erzwingt das gebuendelte PJPROJECT und startet Asterisk nach `make install`
+#   wirklich neu. Die native systemd-Unit priorisiert dabei die Source-Bibliotheken unter /usr/lib.
+# - Installer prueft res_pjproject, res_pjsip, die PJSIP-CLI und die vom Daemon geladene
+#   libasteriskpj; ein nur scheinbar gestarteter Asterisk wird nicht mehr akzeptiert.
+# - PJSIP nutzt kompakte SIP-Header und einen kurzen Servernamen, damit grosse 1&1-200-OK-Antworten
+#   mit Reserve unter der UDP-/MTU-Grenze bleiben und nicht fragmentiert werden.
+# - Die Queue ruft das erste Telefon ohne anfaengliche Positionsansage sofort an und spielt die
+#   deutsche Standard-Warteansage erstmals nach 60 Sekunden sowie danach minuetlich.
+# - Syntaxwarnung im Fax-Kapazitaetsguard durch ein Semikolon innerhalb von NoOp wurde behoben.
 # ==============================================================================
 
 set -euo pipefail
@@ -128,6 +160,8 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 URL_EXTENSIONS="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/extensions.sh"
 URL_PJSIP_PROVIDER="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/pjsip-provider.sh"
+URL_PJSIP_1UND1="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/pjsip-1und1.sh"
+URL_TELEFONIE_QUEUE="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/telefonie-queue.sh"
 URL_WORKER="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/worker.sh"
 URL_AGI="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/agi.sh"
 URL_PDF_WITH_HEADER="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/pdf_with_header.sh"
@@ -147,6 +181,7 @@ ENVFILE="/etc/kienzlefax-installer.env"
 
 # Defaults
 DEFAULT_SIP_BIND_PORT="5070"
+DEFAULT_PHONE_INTERNAL_PORT="5060"
 DEFAULT_RTP_START="12000"
 DEFAULT_RTP_END="12049"
 ASTERISK_GIT_REF_DEFAULT="20"
@@ -200,9 +235,8 @@ download_atomic(){
 }
 
 maybe_fetch_one(){
-  # usage: maybe_fetch_one "name" "url" "/path/to/cache.sh"
-  local name="$1" url="$2" path="$3"
-  local ans="${KFX_REMOTE_REFRESH:-y}"
+  # usage: maybe_fetch_one "name" "url" "/path/to/cache.sh" "y|n"
+  local name="$1" url="$2" path="$3" ans="${4:-n}"
   if [[ ! -s "$path" ]]; then ans="y"; fi
   if [[ "$ans" == "y" ]]; then
     log "[DL ] ${name} <- ${url}"
@@ -279,6 +313,38 @@ require_asterisk_cli(){
   log "[OK ] Asterisk CLI bereit."
 }
 
+require_asterisk_pjsip_runtime(){
+  local module_output transport_output daemon_pid pj_maps
+
+  module_output="$(asterisk -rx "module show like res_pjproject" 2>/dev/null || true)"
+  [[ "$module_output" == *"res_pjproject.so"* && "$module_output" == *"Running"* ]] \
+    || die "Asterisk laeuft, aber res_pjproject.so ist nicht geladen. PJPROJECT-/Paketkollision pruefen."
+
+  module_output="$(asterisk -rx "module show like res_pjsip.so" 2>/dev/null || true)"
+  [[ "$module_output" == *"res_pjsip.so"* && "$module_output" == *"Running"* ]] \
+    || die "Asterisk laeuft, aber res_pjsip.so ist nicht geladen."
+
+  transport_output="$(asterisk -rx "pjsip show transports" 2>&1 || true)"
+  [[ "$transport_output" != *"No such command"* && "$transport_output" != *"Unable to connect"* ]] \
+    || die "PJSIP-CLI ist nicht verfuegbar, obwohl der Asterisk-Core antwortet."
+
+  daemon_pid="$(systemctl show asterisk -p MainPID --value 2>/dev/null || true)"
+  if [[ "$daemon_pid" =~ ^[1-9][0-9]*$ && -r "/proc/${daemon_pid}/maps" && -e /usr/lib/libasteriskpj.so.2 ]]; then
+    pj_maps="$(awk '/libasteriskpj[.]so/ {print $0}' "/proc/${daemon_pid}/maps" 2>/dev/null || true)"
+    [[ "$pj_maps" == *"/usr/lib/libasteriskpj.so"* ]] \
+      || die "Asterisk nutzt nicht die Source-PJPROJECT-Bibliothek aus /usr/lib. Geladen: ${pj_maps:-unbekannt}"
+  fi
+
+  log "[OK ] Asterisk-PJSIP-Laufzeit und PJPROJECT-Bibliothek geprueft."
+}
+
+active_channel_count(){
+  local output
+  command -v asterisk >/dev/null 2>&1 || { printf '0\n'; return 0; }
+  output="$(asterisk -rx "core show channels concise" 2>/dev/null || true)"
+  awk 'NF {count++} END {print count+0}' <<<"$output"
+}
+
 asterisk_rx(){
   local cmd="$1"
   if wait_for_asterisk_cli 30; then
@@ -289,7 +355,10 @@ asterisk_rx(){
 }
 
 install_native_asterisk_unit(){
-  cat >/etc/systemd/system/asterisk.service <<'UNIT'
+  local unit="/etc/systemd/system/asterisk.service"
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp" <<'UNIT'
 [Unit]
 Description=Asterisk PBX
 After=network-online.target
@@ -297,6 +366,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=LD_LIBRARY_PATH=/usr/lib
 ExecStart=/usr/sbin/asterisk -f -C /etc/asterisk/asterisk.conf
 ExecReload=/usr/sbin/asterisk -rx "core reload"
 ExecStop=/usr/sbin/asterisk -rx "core stop now"
@@ -307,8 +377,13 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 UNIT
-  chmod 0644 /etc/systemd/system/asterisk.service
-  systemctl daemon-reload
+  ASTERISK_UNIT_CHANGED="n"
+  if [[ ! -f "$unit" ]] || ! cmp -s "$tmp" "$unit"; then
+    install -m 0644 "$tmp" "$unit"
+    ASTERISK_UNIT_CHANGED="y"
+    systemctl daemon-reload
+  fi
+  rm -f "$tmp"
 }
 
 # ------------------------------------------------------------------------------
@@ -407,7 +482,7 @@ PY
     pw="$(openssl rand -base64 64 2>/dev/null | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 28 || true)"
   fi
 
-  [[ ${#pw} -ge 24 ]] || die "Konnte kein sicheres Admin-Passwort generieren."
+  [[ ${#pw} -ge 24 ]] || die "Konnte kein sicheres Passwort generieren."
   printf '%s' "$pw"
 }
 
@@ -433,6 +508,242 @@ provider_label(){
     manual) echo "Manuelle Konfiguration";;
     *) echo "${1:-unbekannt}";;
   esac
+}
+
+provider_defaults(){
+  # usage: provider_defaults PROVIDER DOMAIN_VAR IDENTIFY_VAR EXPIRATION_VAR
+  local provider="$1" domain_var="$2" identify_var="$3" expiration_var="$4"
+  local domain="" identify="" expiration="300"
+  case "$provider" in
+    1und1)
+      domain="sip.1und1.de"
+      identify="212.227.0.0/16"
+      ;;
+    telekom)
+      domain="tel.t-online.de"
+      ;;
+    sipgate)
+      domain="sipgate.de"
+      expiration="600"
+      ;;
+    manual)
+      ;;
+  esac
+  printf -v "$domain_var" '%s' "$domain"
+  printf -v "$identify_var" '%s' "$identify"
+  printf -v "$expiration_var" '%s' "$expiration"
+}
+
+collect_phone_provider_config(){
+  # usage: collect_phone_provider_config PREFIX "Beschreibung"
+  local prefix="$1" description="$2"
+  local provider_in="" provider="" label=""
+  local user="" number_raw="" number="" password=""
+  local domain_default="" identify_default="" expiration_default=""
+  local domain="" outbound_proxy="" identify_match="" expiration=""
+
+  echo
+  echo "Provider-Auswahl fuer ${description}:"
+  echo "  1 = 1&1 Deutschland (bisher getesteter Standard)"
+  echo "  2 = Deutsche Telekom (Template; Felder bitte pruefen)"
+  echo "  3 = sipgate (Template; Felder bitte pruefen)"
+  echo "  4 = manuell (Provider-Trunk wird nicht automatisch geschrieben)"
+  while true; do
+    ask_default provider_in "Provider fuer ${description}" "1und1"
+    provider="$(normalize_provider "$provider_in")"
+    [[ -n "$provider" ]] && break
+    echo "Bitte 1und1, telekom, sipgate oder manuell eingeben."
+  done
+  label="$(provider_label "$provider")"
+
+  while true; do
+    ask_default user "SIP Benutzername/Auth-ID fuer ${description}" ""
+    [[ -n "$user" ]] && break
+    echo "SIP Benutzername/Auth-ID darf nicht leer sein."
+  done
+
+  while true; do
+    read -r -p "SIP Rufnummer / CallerID fuer ${description} (nur Ziffern; Enter = Benutzername falls nur Ziffern): " number_raw
+    [[ -n "$number_raw" ]] || number_raw="$user"
+    number="$(sanitize_digits "$number_raw")"
+    [[ -n "$number" ]] && break
+    echo "Bitte eine Rufnummer/CallerID mit Ziffern eingeben."
+  done
+
+  echo "SIP Passwort fuer ${description} eingeben (sichtbar aus = nein)."
+  read_secret_twice password "SIP Passwort"
+
+  provider_defaults "$provider" domain_default identify_default expiration_default
+  if [[ "$provider" != "manual" ]]; then
+    ask_default domain "SIP Registrar/Domain fuer ${description} (${label})" "$domain_default"
+    [[ -n "$domain" ]] || die "SIP Registrar/Domain darf nicht leer sein."
+    ask_default outbound_proxy "SIP Outbound Proxy fuer ${description} (Enter = keiner)" ""
+    ask_default identify_match "PJSIP identify match fuer ${description} (IP/Netz; Enter = keiner)" "$identify_default"
+    ask_default expiration "SIP Registration Expiration Sekunden fuer ${description}" "$expiration_default"
+    [[ "$expiration" =~ ^[0-9]+$ ]] || die "SIP Registration Expiration ungueltig."
+  else
+    domain=""
+    outbound_proxy=""
+    identify_match=""
+    expiration="$expiration_default"
+  fi
+
+  printf -v "${prefix}_PROVIDER" '%s' "$provider"
+  printf -v "${prefix}_PROVIDER_LABEL" '%s' "$label"
+  printf -v "${prefix}_SIP_USER" '%s' "$user"
+  printf -v "${prefix}_SIP_NUMBER" '%s' "$number"
+  printf -v "${prefix}_SIP_PASSWORD" '%s' "$password"
+  printf -v "${prefix}_SIP_DOMAIN" '%s' "$domain"
+  printf -v "${prefix}_SIP_OUTBOUND_PROXY" '%s' "$outbound_proxy"
+  printf -v "${prefix}_SIP_IDENTIFY_MATCH" '%s' "$identify_match"
+  printf -v "${prefix}_SIP_EXPIRATION" '%s' "$expiration"
+}
+
+copy_phone_provider_config(){
+  # usage: copy_phone_provider_config SOURCE_PREFIX TARGET_PREFIX
+  local source_prefix="$1" target_prefix="$2" suffix="" source_var=""
+  for suffix in PROVIDER PROVIDER_LABEL SIP_USER SIP_NUMBER SIP_PASSWORD SIP_DOMAIN SIP_OUTBOUND_PROXY SIP_IDENTIFY_MATCH SIP_EXPIRATION; do
+    source_var="${source_prefix}_${suffix}"
+    printf -v "${target_prefix}_${suffix}" '%s' "${!source_var-}"
+  done
+}
+
+detect_default_ipv4_network(){
+  command -v ip >/dev/null 2>&1 || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+
+  local route="" iface="" source_ip="" address_cidr=""
+  route="$(ip -o -4 route get 1.1.1.1 2>/dev/null | sed -n '1p')"
+  [[ -n "$route" ]] || return 1
+  iface="$(awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' <<<"$route")"
+  source_ip="$(awk '{for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}' <<<"$route")"
+  [[ -n "$iface" && -n "$source_ip" ]] || return 1
+  address_cidr="$(ip -o -4 addr show dev "$iface" scope global 2>/dev/null | awk -v ip="$source_ip" '{split($4, a, "/"); if (a[1] == ip) {print $4; exit}}')"
+  [[ -n "$address_cidr" ]] || return 1
+
+  python3 - "$iface" "$address_cidr" <<'PY'
+import ipaddress
+import sys
+
+iface = sys.argv[1]
+address = ipaddress.ip_interface(sys.argv[2])
+print(f"{iface}|{address.ip}|{address.network}")
+PY
+}
+
+validate_phone_network(){
+  local bind_ip="$1" cidr="$2"
+  python3 - "$bind_ip" "$cidr" <<'PY'
+import ipaddress
+import sys
+
+address = ipaddress.ip_address(sys.argv[1])
+network = ipaddress.ip_network(sys.argv[2], strict=False)
+if address.version != 4 or network.version != 4 or address not in network:
+    raise SystemExit(1)
+PY
+}
+
+collect_phone_options(){
+  PHONE_QUEUE_ENABLED="n"
+  PHONE_COUNT="0"
+  PHONE_FIRST_EXTENSION="201"
+  PHONE_INTERNAL_PORT="${DEFAULT_PHONE_INTERNAL_PORT:-5060}"
+  PHONE_BIND_IFACE=""
+  PHONE_BIND_IP=""
+  PHONE_LOCAL_CIDR=""
+  PHONE_SEPARATE_OUTBOUND="n"
+
+  ask_yes_no PHONE_QUEUE_ENABLED "Warteschlange fuer Telefonie erstellen?" "n"
+  if [[ "$PHONE_QUEUE_ENABLED" != "y" ]]; then
+    copy_phone_provider_config EMPTY PHONE_IN
+    copy_phone_provider_config EMPTY PHONE_OUT
+    return 0
+  fi
+
+  ask_int_range PHONE_COUNT "Zahl der Telefone in der Warteschlange" "2" "1" "100"
+
+  local detected="" detected_iface="" detected_ip="" detected_cidr=""
+  detected="$(detect_default_ipv4_network || true)"
+  if [[ -n "$detected" ]]; then
+    IFS='|' read -r detected_iface detected_ip detected_cidr <<<"$detected"
+    PHONE_BIND_IFACE="$detected_iface"
+    PHONE_BIND_IP="$detected_ip"
+    PHONE_LOCAL_CIDR="$detected_cidr"
+    echo
+    echo "Interne Telefonie automatisch erkannt:"
+    echo "  Schnittstelle: ${PHONE_BIND_IFACE}"
+    echo "  Bind-Adresse:  ${PHONE_BIND_IP}:${PHONE_INTERNAL_PORT}"
+    echo "  Internes Netz: ${PHONE_LOCAL_CIDR}"
+  else
+    echo "[WARN] Internes IPv4-Netz konnte nicht automatisch erkannt werden."
+    ask_default PHONE_BIND_IP "Interne IPv4-Adresse dieses Asterisk-Systems" ""
+    ask_default PHONE_LOCAL_CIDR "Internes IPv4-Netz in CIDR-Schreibweise" ""
+    ask_default PHONE_BIND_IFACE "Interne Netzwerkschnittstelle (nur Dokumentation)" "manuell"
+  fi
+  validate_phone_network "$PHONE_BIND_IP" "$PHONE_LOCAL_CIDR" \
+    || die "Interne Telefonie-IP '${PHONE_BIND_IP}' liegt nicht im Netz '${PHONE_LOCAL_CIDR}'."
+  [[ "$PHONE_INTERNAL_PORT" != "${SIP_BIND_PORT:-${KFX_SIP_BIND_PORT:-5070}}" ]] \
+    || die "Interner Telefonie-Port und externer Provider-Port duerfen nicht identisch sein."
+
+  collect_phone_provider_config PHONE_IN "die eingehende Telefonieleitung"
+  local fax_did="${FAX_DID:-${KFX_FAX_DID:-}}"
+  [[ "${PHONE_IN_SIP_NUMBER}" != "$fax_did" ]] \
+    || die "Telefonie-DID und Fax-DID muessen verschieden sein, damit eingehende Anrufe eindeutig geroutet werden."
+
+  ask_yes_no PHONE_SEPARATE_OUTBOUND "Fuer ausgehende Telefonate eine andere SIP-Leitung verwenden?" "n"
+  if [[ "$PHONE_SEPARATE_OUTBOUND" == "y" ]]; then
+    collect_phone_provider_config PHONE_OUT "die ausgehende Telefonieleitung"
+  else
+    copy_phone_provider_config PHONE_IN PHONE_OUT
+  fi
+
+  local index ext password_var
+  for (( index=0; index<PHONE_COUNT; index++ )); do
+    ext=$((PHONE_FIRST_EXTENSION + index))
+    password_var="PHONE_ENDPOINT_${ext}_PASSWORD"
+    printf -v "$password_var" '%s' "$(generate_secure_password)"
+  done
+  echo "[OK] ${PHONE_COUNT} lokale PJSIP-Passwoerter wurden sicher generiert; Ausgabe nur in ENV/Installationsbericht."
+}
+
+write_phone_options_to_env(){
+  local file="${1:-$ENVFILE}" index ext password_var password prefix suffix source_var
+  python3 - "$file" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+path.write_text("\n".join(line for line in lines if not line.startswith("KFX_PHONE_")) + "\n", encoding="utf-8")
+PY
+  {
+    printf '\n# optionale Telefoniewarteschlange\n'
+    printf 'KFX_PHONE_QUEUE_ENABLED=%s\n' "${PHONE_QUEUE_ENABLED:-n}"
+    printf 'KFX_PHONE_COUNT=%s\n' "${PHONE_COUNT:-0}"
+    printf 'KFX_PHONE_FIRST_EXTENSION=%s\n' "${PHONE_FIRST_EXTENSION:-201}"
+    printf 'KFX_PHONE_INTERNAL_PORT=%s\n' "${PHONE_INTERNAL_PORT:-5060}"
+    printf 'KFX_PHONE_BIND_IFACE=%s\n' "$(quote_env_value "${PHONE_BIND_IFACE:-}")"
+    printf 'KFX_PHONE_BIND_IP=%s\n' "$(quote_env_value "${PHONE_BIND_IP:-}")"
+    printf 'KFX_PHONE_LOCAL_CIDR=%s\n' "$(quote_env_value "${PHONE_LOCAL_CIDR:-}")"
+    printf 'KFX_PHONE_SEPARATE_OUTBOUND=%s\n' "${PHONE_SEPARATE_OUTBOUND:-n}"
+    for prefix in PHONE_IN PHONE_OUT; do
+      for suffix in PROVIDER PROVIDER_LABEL SIP_USER SIP_NUMBER SIP_PASSWORD SIP_DOMAIN SIP_OUTBOUND_PROXY SIP_IDENTIFY_MATCH SIP_EXPIRATION; do
+        source_var="${prefix}_${suffix}"
+        printf 'KFX_%s_%s=%s\n' "$prefix" "$suffix" "$(quote_env_value "${!source_var-}")"
+      done
+    done
+    if [[ "${PHONE_QUEUE_ENABLED:-n}" == "y" ]]; then
+      for (( index=0; index<PHONE_COUNT; index++ )); do
+        ext=$((PHONE_FIRST_EXTENSION + index))
+        password_var="PHONE_ENDPOINT_${ext}_PASSWORD"
+        password="${!password_var-}"
+        [[ -n "$password" ]] || die "Generiertes Passwort fuer Nebenstelle ${ext} fehlt."
+        printf 'KFX_PHONE_ENDPOINT_%s_PASSWORD=%s\n' "$ext" "$(quote_env_value "$password")"
+      done
+    fi
+  } >>"$file"
+  chmod 0600 "$file"
 }
 
 detect_current_user_candidate(){
@@ -468,8 +779,26 @@ upsert_env_line(){
 }
 
 collect_run_options(){
-  ask_yes_no REMOTE_REFRESH "Remote-Module aus GitHub holen/aktualisieren?" "y"
-  ask_yes_no WEB_REFRESH "Weboberflaeche neu herunterladen/aktualisieren?" "y"
+  local cache_dir="/usr/local/lib/kienzlefax-installer/cache" default=""
+  default="n"; [[ -s "${cache_dir}/extensions.sh" ]] || default="y"
+  ask_yes_no REMOTE_REFRESH_EXTENSIONS "Remote-Datei extensions.sh holen/aktualisieren?" "$default"
+  default="n"; [[ -s "${cache_dir}/pjsip-provider.sh" ]] || default="y"
+  ask_yes_no REMOTE_REFRESH_PJSIP_PROVIDER "Remote-Datei pjsip-provider.sh holen/aktualisieren?" "$default"
+  default="n"; [[ -s "${cache_dir}/pjsip-1und1.sh" ]] || default="y"
+  ask_yes_no REMOTE_REFRESH_PJSIP_1UND1 "Remote-Datei pjsip-1und1.sh holen/aktualisieren?" "$default"
+  default="n"; [[ -s "${cache_dir}/telefonie-queue.sh" ]] || default="y"
+  ask_yes_no REMOTE_REFRESH_TELEFONIE_QUEUE "Remote-Datei telefonie-queue.sh holen/aktualisieren?" "$default"
+  default="n"; [[ -s "${cache_dir}/worker.sh" ]] || default="y"
+  ask_yes_no REMOTE_REFRESH_WORKER "Remote-Datei worker.sh holen/aktualisieren?" "$default"
+  default="n"; [[ -s "${cache_dir}/agi.sh" ]] || default="y"
+  ask_yes_no REMOTE_REFRESH_AGI "Remote-Datei agi.sh holen/aktualisieren?" "$default"
+  default="n"; [[ -s "${cache_dir}/pdf_with_header.sh" ]] || default="y"
+  ask_yes_no REMOTE_REFRESH_PDF_WITH_HEADER "Remote-Datei pdf_with_header.sh holen/aktualisieren?" "$default"
+  default="n"; [[ -s "${cache_dir}/scan_ocr.sh" ]] || default="y"
+  ask_yes_no REMOTE_REFRESH_SCAN_OCR "Remote-Datei scan_ocr.sh holen/aktualisieren?" "$default"
+
+  default="n"; [[ -s /var/www/html/kienzlefax.php ]] || default="y"
+  ask_yes_no WEB_REFRESH "Weboberflaeche neu herunterladen/aktualisieren?" "$default"
   ask_yes_no AST_MANUAL_MENUSELECT "Asterisk-Modulauswahl manuell zur Pruefung oeffnen? Beenden mit X" "n"
 
   if command -v asterisk >/dev/null 2>&1; then
@@ -496,7 +825,15 @@ collect_run_options(){
 write_run_options_to_env(){
   local remove_user_name_env
   remove_user_name_env="$(quote_env_value "${REMOVE_USER_NAME:-}")"
-  upsert_env_line KFX_REMOTE_REFRESH "${REMOTE_REFRESH:-y}"
+  upsert_env_line KFX_REMOTE_REFRESH "per-file"
+  upsert_env_line KFX_REMOTE_REFRESH_EXTENSIONS "${REMOTE_REFRESH_EXTENSIONS:-n}"
+  upsert_env_line KFX_REMOTE_REFRESH_PJSIP_PROVIDER "${REMOTE_REFRESH_PJSIP_PROVIDER:-n}"
+  upsert_env_line KFX_REMOTE_REFRESH_PJSIP_1UND1 "${REMOTE_REFRESH_PJSIP_1UND1:-n}"
+  upsert_env_line KFX_REMOTE_REFRESH_TELEFONIE_QUEUE "${REMOTE_REFRESH_TELEFONIE_QUEUE:-n}"
+  upsert_env_line KFX_REMOTE_REFRESH_WORKER "${REMOTE_REFRESH_WORKER:-n}"
+  upsert_env_line KFX_REMOTE_REFRESH_AGI "${REMOTE_REFRESH_AGI:-n}"
+  upsert_env_line KFX_REMOTE_REFRESH_PDF_WITH_HEADER "${REMOTE_REFRESH_PDF_WITH_HEADER:-n}"
+  upsert_env_line KFX_REMOTE_REFRESH_SCAN_OCR "${REMOTE_REFRESH_SCAN_OCR:-n}"
   upsert_env_line KFX_WEB_REFRESH "${WEB_REFRESH:-y}"
   upsert_env_line KFX_ASTERISK_MANUAL_MENUSELECT "${AST_MANUAL_MENUSELECT:-n}"
   upsert_env_line KFX_REBUILD_ASTERISK "${AST_REBUILD:-y}"
@@ -518,6 +855,7 @@ backup_file_ts(){
 ENVFILE="/etc/kienzlefax-installer.env"
 
 DEFAULT_SIP_BIND_PORT="${DEFAULT_SIP_BIND_PORT:-5070}"
+DEFAULT_PHONE_INTERNAL_PORT="${DEFAULT_PHONE_INTERNAL_PORT:-5060}"
 DEFAULT_RTP_START="${DEFAULT_RTP_START:-12000}"
 DEFAULT_RTP_END="${DEFAULT_RTP_END:-12049}"
 ASTERISK_GIT_REF_DEFAULT="${ASTERISK_GIT_REF_DEFAULT:-20}"
@@ -539,6 +877,14 @@ if [[ "$RESET_OPTS" == "n" ]]; then
     RESET_OPTS="y"
   else
     log "[OK] Verwende vorhandene Grundkonfiguration aus ${ENVFILE}"
+    if [[ -z "${KFX_PHONE_QUEUE_ENABLED+x}" ]]; then
+      sep "Neue Grundoption: optionale Telefoniewarteschlange"
+      collect_phone_options
+      write_phone_options_to_env "$ENVFILE"
+      # shellcheck disable=SC1090
+      source "$ENVFILE"
+      log "[OK] Telefonie-Grundoptionen in ${ENVFILE} ergaenzt."
+    fi
     sep "Laufoptionen fuer diese Installation"
     collect_run_options
     write_run_options_to_env
@@ -671,6 +1017,10 @@ ask_default RTP_END   "RTP End-Port"   "${DEFAULT_RTP_END}"
 [ "$RTP_START" -lt "$RTP_END" ] || die "RTP_START muss < RTP_END sein"
 
 echo
+sep "Optionale Telefoniewarteschlange"
+collect_phone_options
+
+echo
 echo "Hinweis Portweiterleitung nur fuer Fax-Kommunikation:"
 echo "  UDP ${SIP_BIND_PORT} -> dieses System (SIP)"
 echo "  UDP ${RTP_START}-${RTP_END} -> dieses System (RTP)"
@@ -723,7 +1073,15 @@ KFX_RTP_END=${RTP_END}
 KFX_FAX_PRINTER_COUNT=${FAX_PRINTER_COUNT}
 KFX_PDF_INPUT_COUNT=${PDF_INPUT_COUNT}
 KFX_AST_REF=${AST_REF_ENV}
-KFX_REMOTE_REFRESH=${REMOTE_REFRESH}
+KFX_REMOTE_REFRESH=per-file
+KFX_REMOTE_REFRESH_EXTENSIONS=${REMOTE_REFRESH_EXTENSIONS}
+KFX_REMOTE_REFRESH_PJSIP_PROVIDER=${REMOTE_REFRESH_PJSIP_PROVIDER}
+KFX_REMOTE_REFRESH_PJSIP_1UND1=${REMOTE_REFRESH_PJSIP_1UND1}
+KFX_REMOTE_REFRESH_TELEFONIE_QUEUE=${REMOTE_REFRESH_TELEFONIE_QUEUE}
+KFX_REMOTE_REFRESH_WORKER=${REMOTE_REFRESH_WORKER}
+KFX_REMOTE_REFRESH_AGI=${REMOTE_REFRESH_AGI}
+KFX_REMOTE_REFRESH_PDF_WITH_HEADER=${REMOTE_REFRESH_PDF_WITH_HEADER}
+KFX_REMOTE_REFRESH_SCAN_OCR=${REMOTE_REFRESH_SCAN_OCR}
 KFX_WEB_REFRESH=${WEB_REFRESH}
 KFX_ASTERISK_MANUAL_MENUSELECT=${AST_MANUAL_MENUSELECT}
 KFX_REBUILD_ASTERISK=${AST_REBUILD}
@@ -737,6 +1095,7 @@ KFX_CALLERID_NAME=${KFX_CALLERID_NAME_ENV}
 # PDF header used by /usr/local/bin/pdf_with_header.sh
 KFX_PRACTICE_NAME=${KFX_PRACTICE_NAME_ENV}
 EENV
+write_phone_options_to_env "$ENVFILE"
 chmod 0600 "$ENVFILE"
 
 log "[OK] Optionen neu gesetzt in ${ENVFILE}"
@@ -753,9 +1112,20 @@ sep(){ echo; echo "=============================================================
 
 export DEBIAN_FRONTEND=noninteractive
 
+ENVFILE="/etc/kienzlefax-installer.env"
+if [[ -f "$ENVFILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENVFILE"
+fi
+
 sep "APT: Update/Upgrade + Pakete"
 apt-get update
 apt-get -y upgrade
+
+NCURSES_DEV_PACKAGE="libncurses5-dev"
+if ! apt-cache show "$NCURSES_DEV_PACKAGE" >/dev/null 2>&1; then
+  NCURSES_DEV_PACKAGE="libncurses-dev"
+fi
 
 apt-get install -y --no-install-recommends \
   ca-certificates curl wget jq \
@@ -771,12 +1141,45 @@ apt-get install -y --no-install-recommends \
   python3 python3-venv python3-pip python3-reportlab \
   sox lame \
   build-essential git pkg-config autoconf automake libtool \
-  libxml2-dev libncurses5-dev libedit-dev uuid-dev \
+  libxml2-dev "$NCURSES_DEV_PACKAGE" libedit-dev uuid-dev \
   libssl-dev libsqlite3-dev \
   libsrtp2-dev \
   libtiff-dev \
   libjansson-dev \
   libspandsp-dev
+
+install_german_asterisk_prompts(){
+  local target="/usr/share/asterisk/sounds/de"
+  local tmp source
+  local -a packages
+
+  if [[ -s "${target}/queue-thankyou.gsm" ]]; then
+    log "[OK] Deutsche Asterisk-Ansagen bereits vorhanden."
+    return 0
+  fi
+
+  tmp="$(mktemp -d)"
+  if ! (
+    cd "$tmp"
+    apt-get download asterisk-prompt-de
+    mapfile -t packages < <(find "$tmp" -maxdepth 1 -type f -name 'asterisk-prompt-de_*.deb' -print)
+    (( ${#packages[@]} == 1 )) || exit 1
+    dpkg-deb -x "${packages[0]}" "$tmp/extracted"
+    source="${tmp}/extracted/usr/share/asterisk/sounds/de"
+    [[ -s "${source}/queue-thankyou.gsm" ]] || exit 1
+    install -d -m 0755 "$target"
+    cp -a "${source}/." "${target}/"
+  ); then
+    rm -rf "$tmp"
+    die "Deutsche Asterisk-Ansagen konnten nicht ohne Installation des Paket-Asterisk extrahiert werden."
+  fi
+  rm -rf "$tmp"
+  log "[OK] Deutsche Asterisk-Ansagen ohne Paket-Asterisk extrahiert."
+}
+
+if [[ "${KFX_PHONE_QUEUE_ENABLED:-n}" == "y" ]]; then
+  install_german_asterisk_prompts
+fi
 
 set +e
 apt-get install -y --no-install-recommends python3-pypdf >/dev/null 2>&1
@@ -1181,7 +1584,9 @@ EOF
   # 50-cups-samba (Bonjour/DNS-SD Freigabe)
   cat >"${MOD_DIR}/50-cups-samba.sh" <<'EOF'
 #!/usr/bin/env bash
+# IMMER verwenden wenn CUPS-Drucker und Samba-Shares eingerichtet oder erneuert werden.
 set -euo pipefail
+die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "[$(date -Is)] $*"; }
 sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
 
@@ -1453,8 +1858,10 @@ cat >> /etc/samba/smb.conf <<EOFSMB
    force group = nogroup
 EOFSMB
 
-systemctl enable --now smbd nmbd || true
-systemctl restart smbd nmbd || true
+testparm -s >/dev/null 2>&1 || die "Samba-Konfiguration ist ungueltig: /etc/samba/smb.conf"
+systemctl enable --now smbd nmbd
+systemctl restart smbd nmbd
+smbclient -L localhost -N >/dev/null 2>&1 || die "Samba antwortet lokal nicht auf eine Share-Liste."
 
 log "[OK] CUPS+Samba bereit."
 EOF
@@ -1491,6 +1898,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=LD_LIBRARY_PATH=/usr/lib
 ExecStart=/usr/sbin/asterisk -f -C /etc/asterisk/asterisk.conf
 ExecReload=/usr/sbin/asterisk -rx "core reload"
 ExecStop=/usr/sbin/asterisk -rx "core stop now"
@@ -1503,6 +1911,13 @@ WantedBy=multi-user.target
 UNIT
   chmod 0644 /etc/systemd/system/asterisk.service
   systemctl daemon-reload
+}
+
+active_channel_count(){
+  local output
+  command -v asterisk >/dev/null 2>&1 || { printf '0\n'; return 0; }
+  output="$(asterisk -rx "core show channels concise" 2>/dev/null || true)"
+  awk 'NF {count++} END {print count+0}' <<<"$output"
 }
 
 asterisk_build_jobs(){
@@ -1536,10 +1951,15 @@ make_asterisk_with_retry(){
 configure_asterisk_modules(){
   local ms="./menuselect/menuselect"
   local failed=0
+  local required_modules=(res_fax res_fax_spandsp)
   make menuselect.makeopts
   [[ -x "$ms" ]] || die "menuselect CLI fehlt: $ms"
 
-  for mod in res_fax res_fax_spandsp; do
+  if [[ "${KFX_PHONE_QUEUE_ENABLED:-n}" == "y" ]]; then
+    required_modules+=(app_queue res_musiconhold)
+  fi
+
+  for mod in "${required_modules[@]}"; do
     if ! "$ms" --enable "$mod" menuselect.makeopts; then
       log "[WARN] Asterisk-Pflichtmodul konnte nicht automatisch aktiviert werden: $mod"
       failed=1
@@ -1566,7 +1986,7 @@ configure_asterisk_modules(){
   fi
 
   if [[ "$failed" != "0" ]]; then
-    die "Asterisk-Fax-Module konnten nicht automatisch aktiviert werden. Installer erneut starten und manuelle Asterisk-Modulpruefung mit y waehlen."
+    die "Asterisk-Pflichtmodule konnten nicht automatisch aktiviert werden. Installer erneut starten und manuelle Asterisk-Modulpruefung mit y waehlen."
   fi
 }
 
@@ -1590,7 +2010,7 @@ git fetch --all --tags
 git checkout -f "$KFX_AST_REF"
 
 make distclean >/dev/null 2>&1 || true
-./configure
+./configure --with-pjproject-bundled
 
 configure_asterisk_modules
 
@@ -1606,10 +2026,16 @@ fi
 install_asterisk_systemd_unit
 ldconfig
 
+ACTIVE_CHANNELS="$(active_channel_count)"
+[[ "$ACTIVE_CHANNELS" =~ ^[0-9]+$ ]] || ACTIVE_CHANNELS=0
+(( ACTIVE_CHANNELS == 0 )) \
+  || die "Asterisk muss nach dem Source-Build neu gestartet werden, aber ${ACTIVE_CHANNELS} Kanaele sind aktiv. Spaeter erneut ausfuehren."
+
 systemctl reset-failed asterisk || true
-systemctl enable --now asterisk
+systemctl enable asterisk
+systemctl restart asterisk
 wait_for_asterisk_cli 90 || die "Asterisk wurde gestartet, aber die CLI/der Control-Socket ist nicht bereit."
-log "[OK] Asterisk installiert/gestartet."
+log "[OK] Asterisk installiert und mit dem neuen Source-Build neu gestartet."
 EOF
   chmod +x "${MOD_DIR}/60-asterisk-build.sh"
 
@@ -1814,6 +2240,72 @@ log "[OK] RTP+AMI konfiguriert."
 EOF
   chmod +x "${MOD_DIR}/70-rtp-ami.sh"
 
+  # 80-samba-access-check (nach Asterisk-Build ausfuehren)
+  cat >"${MOD_DIR}/80-samba-access-check.sh" <<'EOF'
+#!/usr/bin/env bash
+# IMMER verwenden wenn Asterisk installiert oder neu gebaut wurde und die Samba-Shares danach erreichbar bleiben muessen.
+set -euo pipefail
+die(){ echo "ERROR: $*" >&2; exit 1; }
+log(){ echo "[$(date -Is)] $*"; }
+sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
+
+ENVFILE="/etc/kienzlefax-installer.env"
+[[ -f "$ENVFILE" ]] || die "ENV fehlt: $ENVFILE"
+# shellcheck disable=SC1090
+source "$ENVFILE"
+
+sep "Samba-Zugriff nach Asterisk-Build absichern und pruefen"
+
+install -d -m 0777 /var/spool/asterisk/fax
+chmod o+x /var/spool/asterisk
+chmod 0777 /var/spool/asterisk/fax
+
+testparm -s >/dev/null 2>&1 || die "Samba-Konfiguration ist ungueltig: /etc/samba/smb.conf"
+systemctl enable --now smbd nmbd
+systemctl restart smbd nmbd
+
+guest_shares=(
+  sendefehler-eingang
+  sendefehler-berichte
+  hierhin-scannen-fuer-ocr
+  scan-eingang
+  fax-eingang
+)
+
+pdf_count="${KFX_PDF_INPUT_COUNT:-1}"
+if ! [[ "$pdf_count" =~ ^[0-9]+$ ]] || (( pdf_count < 1 || pdf_count > 100 )); then
+  pdf_count=1
+fi
+if (( pdf_count <= 1 )); then
+  guest_shares+=(pdf-zu-fax)
+else
+  for i in $(seq 1 "$pdf_count"); do
+    guest_shares+=("pdf-zu-fax${i}")
+  done
+fi
+
+for share in "${guest_shares[@]}"; do
+  smbclient "//localhost/${share}" -N -c 'ls' >/dev/null 2>&1 \
+    || die "Samba-Gastshare ist lokal nicht erreichbar: ${share}"
+done
+
+[[ -n "${KFX_ADMIN_PASSWORD:-}" ]] || die "KFX_ADMIN_PASSWORD fehlt; Admin-Share kann nicht geprueft werden."
+AUTHFILE="$(mktemp)"
+cleanup(){ rm -f "$AUTHFILE"; }
+trap cleanup EXIT
+chmod 0600 "$AUTHFILE"
+{
+  printf 'username = admin\n'
+  printf 'password = %s\n' "$KFX_ADMIN_PASSWORD"
+} >"$AUTHFILE"
+
+smbclient //localhost/sendeberichte -A "$AUTHFILE" -c 'ls' >/dev/null 2>&1 \
+  || die "Samba-Adminshare ist lokal nicht erreichbar: sendeberichte"
+
+log "[OK] Alle KienzleFax-Samba-Shares sind lokal erreichbar."
+EOF
+  chmod +x "${MOD_DIR}/80-samba-access-check.sh"
+
   # 90-worker-unit (NEU)
   cat >"${MOD_DIR}/90-worker-unit.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -1936,6 +2428,49 @@ generated = datetime.now().astimezone().replace(microsecond=0).isoformat()
 hostname = env.get("HOST", "")
 ips = env.get("IPS", "")
 
+phone_lines = []
+if e("KFX_PHONE_QUEUE_ENABLED", "n") == "y":
+    first = int(e("KFX_PHONE_FIRST_EXTENSION", "201"))
+    count = int(e("KFX_PHONE_COUNT", "0"))
+    last = first + count - 1
+    phone_lines = [
+        "Telefoniewarteschlange:",
+        f"- Nebenstellen: {first} bis {last} ({count} Telefone)",
+        f"- Interne SIP-Adresse/Registrar: {e('KFX_PHONE_BIND_IP')}:{e('KFX_PHONE_INTERNAL_PORT', '5060')}",
+        f"- Erkannte Schnittstelle: {e('KFX_PHONE_BIND_IFACE', '-')}",
+        f"- Erkanntes internes Netz: {e('KFX_PHONE_LOCAL_CIDR', '-')}",
+        "- Keine Firewallregeln wurden eingerichtet; Routing und Firewall bleiben Aufgabe des Betreibers.",
+        "- Lokale Telefonkonten sind per PJSIP-ACL auf das erkannte interne Netz beschraenkt.",
+        "- Alle belegtrelevanten ein-, aus- und internen Telefonate muessen ueber Asterisk laufen.",
+        "- Direkte FRITZ!Box-Gespraeche sind fuer den Queue-Belegtstatus nicht sichtbar.",
+        "- Wartesignal: Klingelzeichen; neutrale deutsche Warteansage erstmals nach 60 Sekunden und danach minuetlich.",
+        f"- Eingangsprovider: {e('KFX_PHONE_IN_PROVIDER_LABEL', e('KFX_PHONE_IN_PROVIDER', '-'))}",
+        f"- Eingangs-SIP-Benutzer/Auth-ID: {e('KFX_PHONE_IN_SIP_USER')}",
+        f"- Eingangs-SIP-Nummer: {e('KFX_PHONE_IN_SIP_NUMBER')}",
+        f"- Eingangs-SIP-Passwort: {e('KFX_PHONE_IN_SIP_PASSWORD')}",
+        f"- Eingangs-SIP-Registrar: {e('KFX_PHONE_IN_SIP_DOMAIN', '-')}",
+    ]
+    if e("KFX_PHONE_SEPARATE_OUTBOUND", "n") == "y":
+        phone_lines.extend([
+            f"- Ausgangsprovider: {e('KFX_PHONE_OUT_PROVIDER_LABEL', e('KFX_PHONE_OUT_PROVIDER', '-'))}",
+            f"- Ausgangs-SIP-Benutzer/Auth-ID: {e('KFX_PHONE_OUT_SIP_USER')}",
+            f"- Ausgangs-SIP-Nummer: {e('KFX_PHONE_OUT_SIP_NUMBER')}",
+            f"- Ausgangs-SIP-Passwort: {e('KFX_PHONE_OUT_SIP_PASSWORD')}",
+            f"- Ausgangs-SIP-Registrar: {e('KFX_PHONE_OUT_SIP_DOMAIN', '-')}",
+        ])
+    else:
+        phone_lines.append("- Ausgehende Telefonate verwenden dieselbe SIP-Leitung wie eingehende Telefonate.")
+    phone_lines.append("Lokale PJSIP-Konten fuer die FRITZ!Box:")
+    for index, extension in enumerate(range(first, last + 1), start=1):
+        phone_lines.append(
+            f"- Empfang {index}: Benutzer {extension}, Passwort {e(f'KFX_PHONE_ENDPOINT_{extension}_PASSWORD')}"
+        )
+    phone_lines.extend([
+        "- Jede lokale Rufnummer in der FRITZ!Box genau einem Empfangstelefon zuordnen.",
+        "- Alte Asterisk-Systeme und direkte Provider-Registrierungen derselben Rufnummern deaktivieren; sonst stellt der Provider Anrufe parallel oder am falschen System zu.",
+        "",
+    ])
+
 lines = [
     "KienzleFax Installationsbericht",
     "BITTE LOESCHEN: Dieses Dokument enthaelt Passwoerter im Klartext.",
@@ -1965,6 +2500,7 @@ lines = [
     "- Samba Benutzer: admin",
     "- Samba Passwort: identisch mit Admin Passwort",
     "",
+    *phone_lines,
     "Fax-Portweiterleitungen im Router, nur fuer Fax-Kommunikation:",
     f"- UDP {e('KFX_SIP_BIND_PORT', '5070')} -> KienzleFax-System (SIP/PJSIP)",
     f"- UDP {e('KFX_RTP_START', '12000')}-{e('KFX_RTP_END', '12049')} -> KienzleFax-System (RTP)",
@@ -1973,7 +2509,11 @@ lines = [
     "Wichtige Dateien:",
     "- /etc/kienzlefax-installer.env",
     "- /etc/asterisk/pjsip.conf",
+    "- /etc/asterisk/pjsip-kfx-telefonie.conf",
     "- /etc/asterisk/extensions.conf",
+    "- /etc/asterisk/extensions-kfx-telefonie.conf",
+    "- /etc/asterisk/queues-kfx.conf",
+    "- /etc/asterisk/queuerules-kfx.conf",
     "- /etc/asterisk/manager.conf",
     "- /etc/default/kienzlefax-worker",
     "- /etc/samba/smb.conf",
@@ -2119,12 +2659,14 @@ run_module "${MOD_DIR}/00-base.sh"
 source "$ENVFILE"
 
 sep "Remote Module holen/aktualisieren"
-maybe_fetch_one "extensions.sh"      "$URL_EXTENSIONS"      "${MOD_CACHE}/extensions.sh"
-maybe_fetch_one "pjsip-provider.sh"  "$URL_PJSIP_PROVIDER"  "${MOD_CACHE}/pjsip-provider.sh"
-maybe_fetch_one "worker.sh"          "$URL_WORKER"          "${MOD_CACHE}/worker.sh"
-maybe_fetch_one "agi.sh"             "$URL_AGI"             "${MOD_CACHE}/agi.sh"
-maybe_fetch_one "pdf_with_header.sh" "$URL_PDF_WITH_HEADER" "${MOD_CACHE}/pdf_with_header.sh"
-maybe_fetch_one "scan_ocr.sh"        "$URL_SCAN_OCR"        "${MOD_CACHE}/scan_ocr.sh"
+maybe_fetch_one "extensions.sh"       "$URL_EXTENSIONS"       "${MOD_CACHE}/extensions.sh"       "${KFX_REMOTE_REFRESH_EXTENSIONS:-n}"
+maybe_fetch_one "pjsip-provider.sh"   "$URL_PJSIP_PROVIDER"   "${MOD_CACHE}/pjsip-provider.sh"   "${KFX_REMOTE_REFRESH_PJSIP_PROVIDER:-n}"
+maybe_fetch_one "pjsip-1und1.sh"      "$URL_PJSIP_1UND1"      "${MOD_CACHE}/pjsip-1und1.sh"      "${KFX_REMOTE_REFRESH_PJSIP_1UND1:-n}"
+maybe_fetch_one "telefonie-queue.sh"  "$URL_TELEFONIE_QUEUE"  "${MOD_CACHE}/telefonie-queue.sh"  "${KFX_REMOTE_REFRESH_TELEFONIE_QUEUE:-n}"
+maybe_fetch_one "worker.sh"           "$URL_WORKER"           "${MOD_CACHE}/worker.sh"           "${KFX_REMOTE_REFRESH_WORKER:-n}"
+maybe_fetch_one "agi.sh"              "$URL_AGI"              "${MOD_CACHE}/agi.sh"              "${KFX_REMOTE_REFRESH_AGI:-n}"
+maybe_fetch_one "pdf_with_header.sh"  "$URL_PDF_WITH_HEADER"  "${MOD_CACHE}/pdf_with_header.sh"  "${KFX_REMOTE_REFRESH_PDF_WITH_HEADER:-n}"
+maybe_fetch_one "scan_ocr.sh"         "$URL_SCAN_OCR"         "${MOD_CACHE}/scan_ocr.sh"         "${KFX_REMOTE_REFRESH_SCAN_OCR:-n}"
 
 sep "Module ausführen (feste Reihenfolge)"
 run_module "${MOD_DIR}/10-packages.sh"
@@ -2143,10 +2685,21 @@ else
   sep "Asterisk Build übersprungen (bestehende Installation wird genutzt)"
   install_native_asterisk_unit
   systemctl reset-failed asterisk || true
-  systemctl enable --now asterisk || true
+  systemctl enable asterisk
+  if [[ "${ASTERISK_UNIT_CHANGED:-n}" == "y" ]]; then
+    ACTIVE_CHANNELS="$(active_channel_count)"
+    [[ "$ACTIVE_CHANNELS" =~ ^[0-9]+$ ]] || ACTIVE_CHANNELS=0
+    (( ACTIVE_CHANNELS == 0 )) \
+      || die "Die Asterisk-systemd-Unit wurde korrigiert und braucht einen Neustart, aber ${ACTIVE_CHANNELS} Kanaele sind aktiv. Spaeter erneut ausfuehren."
+    systemctl restart asterisk
+  else
+    systemctl start asterisk
+  fi
 fi
 
 require_asterisk_cli 90
+require_asterisk_pjsip_runtime
+run_module "${MOD_DIR}/80-samba-access-check.sh"
 run_module "${MOD_DIR}/70-rtp-ami.sh"
 
 # Load ENV
@@ -2160,6 +2713,12 @@ export KFX_HOSTNAME KFX_PUBLIC_FQDN KFX_PROVIDER KFX_PROVIDER_LABEL
 export KFX_SIP_USER KFX_SIP_NUMBER KFX_SIP_PASSWORD KFX_SIP_DOMAIN KFX_SIP_OUTBOUND_PROXY KFX_SIP_IDENTIFY_MATCH KFX_SIP_EXPIRATION
 export KFX_FAX_DID KFX_SIP_BIND_PORT KFX_PJSIP_ENDPOINT
 export KFX_RTP_START KFX_RTP_END KFX_AST_REF KFX_AMI_SECRET
+export KFX_PHONE_QUEUE_ENABLED KFX_PHONE_COUNT KFX_PHONE_FIRST_EXTENSION KFX_PHONE_INTERNAL_PORT
+export KFX_PHONE_BIND_IFACE KFX_PHONE_BIND_IP KFX_PHONE_LOCAL_CIDR KFX_PHONE_SEPARATE_OUTBOUND
+export KFX_PHONE_IN_PROVIDER KFX_PHONE_IN_PROVIDER_LABEL KFX_PHONE_IN_SIP_USER KFX_PHONE_IN_SIP_NUMBER
+export KFX_PHONE_IN_SIP_PASSWORD KFX_PHONE_IN_SIP_DOMAIN KFX_PHONE_IN_SIP_OUTBOUND_PROXY KFX_PHONE_IN_SIP_IDENTIFY_MATCH KFX_PHONE_IN_SIP_EXPIRATION
+export KFX_PHONE_OUT_PROVIDER KFX_PHONE_OUT_PROVIDER_LABEL KFX_PHONE_OUT_SIP_USER KFX_PHONE_OUT_SIP_NUMBER
+export KFX_PHONE_OUT_SIP_PASSWORD KFX_PHONE_OUT_SIP_DOMAIN KFX_PHONE_OUT_SIP_OUTBOUND_PROXY KFX_PHONE_OUT_SIP_IDENTIFY_MATCH KFX_PHONE_OUT_SIP_EXPIRATION
 
 # Common legacy names (remote scripts may still use these)
 export PJSIP_USER="${PJSIP_USER:-${KFX_SIP_USER:-$KFX_SIP_NUMBER}}"
@@ -2187,16 +2746,15 @@ export AMI_SECRET="${AMI_SECRET:-$KFX_AMI_PASS}"
 # Remote scripts execution
 # ------------------------------------------------------------------------------
 sep "Remote Provider-PJSIP (befüllt pjsip.conf)"
-if [[ "${KFX_PROVIDER:-1und1}" == "manual" ]]; then
-  log "[INFO] Provider manuell gewaehlt; pjsip.conf wird nicht automatisch geschrieben."
-else
-  run_remote_script "${MOD_CACHE}/pjsip-provider.sh"
-  asterisk_rx "pjsip reload"
-fi
+run_remote_script "${MOD_CACHE}/pjsip-provider.sh"
+asterisk_rx "pjsip reload"
 
 sep "Remote Dialplan (befüllt extensions.conf)"
 run_remote_script "${MOD_CACHE}/extensions.sh"
 asterisk_rx "dialplan reload"
+
+sep "Remote Telefoniewarteschlange installieren/aktualisieren"
+run_remote_script "${MOD_CACHE}/telefonie-queue.sh"
 
 sep "Remote AGI installieren"
 run_remote_script "${MOD_CACHE}/agi.sh"
@@ -2220,6 +2778,16 @@ asterisk_rx "module show like func_groupcount"
 asterisk_rx "module show like func_lock"
 asterisk_rx "pjsip reload"
 asterisk_rx "dialplan reload"
+asterisk_rx "module show like app_queue"
+asterisk_rx "module show like res_musiconhold"
+asterisk_rx "module show like res_pjproject"
+asterisk_rx "module show like res_pjsip.so"
+asterisk_rx "pjsip show transports"
+asterisk_rx "pjsip show registrations"
+asterisk_rx "queue show"
+if [[ "${KFX_PHONE_QUEUE_ENABLED:-n}" == "y" ]]; then
+  asterisk_rx "pjsip show transport transport-kfx-phone"
+fi
 
 systemctl status apache2 --no-pager -l || true
 systemctl status cups --no-pager -l || true
@@ -2235,6 +2803,17 @@ echo "Web: http://$(hostname)/ -> /kienzlefax.php"
 echo "Web SSL (self-signed 50y): https://$(hostname)/"
 echo "SIP Bind Port (Provider): ${KFX_SIP_BIND_PORT}"
 echo "RTP: ${KFX_RTP_START}-${KFX_RTP_END}"
+if [[ "${KFX_PHONE_QUEUE_ENABLED:-n}" == "y" ]]; then
+  echo "Telefoniewarteschlange: aktiv"
+  echo "Interner SIP-Registrar: ${KFX_PHONE_BIND_IP}:${KFX_PHONE_INTERNAL_PORT}"
+  echo "Internes SIP-Netz: ${KFX_PHONE_LOCAL_CIDR}"
+  echo "Nebenstellen: ${KFX_PHONE_FIRST_EXTENSION}-$((KFX_PHONE_FIRST_EXTENSION + KFX_PHONE_COUNT - 1))"
+  echo "Externe Registrierung der lokalen Endpunkte: per PJSIP-Netzbeschraenkung gesperrt"
+  echo "Firewall: unveraendert (keine Regeln durch Installer)"
+  echo "WICHTIG: Alte Asterisk-Systeme und direkte Provider-Registrierungen derselben Rufnummern muessen deaktiviert sein."
+else
+  echo "Telefoniewarteschlange: deaktiviert"
+fi
 echo "AMI: 127.0.0.1:5038 user=kfx (secret in /etc/default/kienzlefax-worker)"
 if [[ "${KFX_INSTALL_REPORT_WITH_PASSWORDS:-y}" == "y" ]]; then
   echo "Installationsbericht: /var/spool/asterisk/fax/installationsbericht_kienzlefax_*_bitte_loeschen_mit_passwoertern.pdf"

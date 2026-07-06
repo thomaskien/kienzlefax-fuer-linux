@@ -218,7 +218,7 @@ exten => s,1,NoOp(kfx_fax_capacity | chan=${CHANNEL(name)})
  same => n,Set(KFX_CAPACITY_UNLOCK=${UNLOCK(kfx_fax_capacity_lock)})
  same => n,Return()
 
- same => n(lock_failed),NoOp(kfx_fax_capacity: mutex acquisition failed; fail closed)
+ same => n(lock_failed),NoOp(kfx_fax_capacity: mutex acquisition failed - fail closed)
  same => n,Set(KFX_CAPACITY_OK=0)
  same => n,Return()
 

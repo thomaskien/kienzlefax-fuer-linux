@@ -198,7 +198,7 @@ type=endpoint
 transport=transport-udp
 context=kfx-provider-in
 disallow=all
-allow=alaw,ulaw
+allow=g722,alaw,ulaw
 outbound_auth=${object_prefix}-auth
 aors=${object_prefix}-aor
 direct_media=no
@@ -241,8 +241,7 @@ copy_german_prompts(){
 
   local required
   for required in \
-    queue-youarenext.gsm queue-thereare.gsm queue-callswaiting.gsm \
-    queue-thankyou.gsm digits/0.gsm digits/1.gsm digits/2.gsm digits/3.gsm; do
+    queue-thankyou.gsm; do
     [[ -s "${target_dir}/${required}" ]] || die "Erforderliche deutsche Queue-Ansage fehlt: ${target_dir}/${required}"
   done
   log "[OK] Deutsche Queue-Ansagen geprueft: ${target_dir}"
@@ -292,7 +291,7 @@ type=endpoint
 transport=transport-kfx-phone
 context=kfx-phone-local
 disallow=all
-allow=alaw,ulaw
+allow=g722,alaw,ulaw
 auth=${ext}-auth
 aors=${ext}
 callerid=Empfang $((index + 1)) <${ext}>
@@ -372,11 +371,12 @@ leavewhenempty=no
 timeout=14
 retry=1
 defaultrule=kfx-phone-progressive
-announce-position=yes
-announce-to-first-user=yes
-announce-frequency=60
-min-announce-frequency=60
+announce-position=no
+announce-to-first-user=no
 announce-holdtime=no
+periodic-announce=queue-thankyou
+periodic-announce-frequency=60
+periodic-announce-startdelay=60
 EOF
 
   for (( index=0; index<PHONE_COUNT; index++ )); do
@@ -464,7 +464,7 @@ if [[ "$PHONE_ENABLED" == "y" ]]; then
   echo "[INFO] Interner SIP-Registrar: ${PHONE_BIND_IP}:${PHONE_PORT}"
   echo "[INFO] Zulaessiges internes SIP-Netz: ${PHONE_LOCAL_CIDR}"
   echo "[INFO] Nebenstellen: ${FIRST_EXTENSION}-$((FIRST_EXTENSION + PHONE_COUNT - 1))"
-  echo "[INFO] Wartesignal: Klingelzeichen; deutsche Positionsansage alle 60 Sekunden."
+  echo "[INFO] Wartesignal: Klingelzeichen; neutrale deutsche Warteansage erstmals nach 60 Sekunden und danach minuetlich."
   echo "[INFO] Keine Firewallregeln wurden eingerichtet."
   asterisk -rx "queue show praxis" || true
 else
