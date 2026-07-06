@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# IMMER verwenden wenn der ausgewaehlte Fax-Provider als PJSIP-Trunk eingerichtet oder aktualisiert wird.
 set -euo pipefail
 
 ENVFILE="/etc/kienzlefax-installer.env"
@@ -11,6 +12,11 @@ KFX_PROVIDER="${KFX_PROVIDER:-1und1}"
 if [[ "$KFX_PROVIDER" == "manual" ]]; then
   echo "[INFO] Provider steht auf manuell; pjsip.conf wird nicht automatisch geschrieben."
   echo "[INFO] Bitte /etc/asterisk/pjsip.conf selbst anlegen/anpassen und Endpoint '${KFX_PJSIP_ENDPOINT:-kfx-provider-endpoint}' verwenden."
+  if [[ -f /etc/asterisk/pjsip.conf ]] \
+    && ! grep -Fxq '#tryinclude "/etc/asterisk/pjsip-kfx-telefonie.conf"' /etc/asterisk/pjsip.conf; then
+    cp -a /etc/asterisk/pjsip.conf "/etc/asterisk/pjsip.conf.old.kienzlefax.$(date +%Y%m%d-%H%M%S)"
+    printf '\n#tryinclude "/etc/asterisk/pjsip-kfx-telefonie.conf"\n' >>/etc/asterisk/pjsip.conf
+  fi
   exit 0
 fi
 
@@ -197,7 +203,7 @@ contact=sip:${PROVIDER_DOMAIN}
 [${ENDPOINT_NAME}]
 type=endpoint
 transport=transport-udp
-context=fax-in
+context=kfx-provider-in
 disallow=all
 allow=alaw,ulaw
 outbound_auth=${AUTH_NAME}
@@ -224,6 +230,8 @@ ${OUTBOUND_PROXY_LINE}
 
 ${IDENTIFY_BLOCK}
 EOF
+
+printf '\n#tryinclude "/etc/asterisk/pjsip-kfx-telefonie.conf"\n' >>"$PJSIP"
 
 chmod 0640 "$PJSIP" || true
 chown root:asterisk "$PJSIP" 2>/dev/null || true

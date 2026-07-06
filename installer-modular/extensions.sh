@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# IMMER verwenden wenn der KienzleFax-Dialplan fuer Fax und den gemeinsamen Provider-Eingang geschrieben wird.
 set -euo pipefail
 
 ENVFILE="/etc/kienzlefax-installer.env"
@@ -15,6 +16,8 @@ KFX_FAX_DID="${KFX_FAX_DID:-}"
 KFX_CALLERID_NUM="${KFX_CALLERID_NUM:-}"
 KFX_CALLERID_NAME="${KFX_CALLERID_NAME:-Fax}"
 KFX_PJSIP_ENDPOINT="${KFX_PJSIP_ENDPOINT:-kfx-provider-endpoint}"
+KFX_PHONE_QUEUE_ENABLED="${KFX_PHONE_QUEUE_ENABLED:-n}"
+KFX_PHONE_IN_DID="${KFX_PHONE_IN_SIP_NUMBER:-}"
 
 # Default: CallerID uses the SIP number (same as username)
 if [ -z "${KFX_CALLERID_NUM}" ]; then
@@ -246,6 +249,15 @@ exten => s,1,NoOp(kfx_sendfax_hangup | jobid=${ARG1} chan=${CHANNEL(name)} FAXST
  same => n,Return()
 
 ; =============================================================================
+; GEMEINSAMER PROVIDER-EINGANG
+; - Provider-Endpunkte landen hier, damit mehrere Leitungen desselben Providers
+;   trotz identischer identify-Netze sicher anhand ihrer DID verteilt werden.
+; =============================================================================
+[kfx-provider-in]
+exten => __KFX_FAX_DID__,1,Goto(fax-in,__KFX_FAX_DID__,1)
+__KFX_PHONE_ROUTE__
+
+; =============================================================================
 ; FAX-IN
 ; =============================================================================
 [fax-in]
@@ -310,5 +322,30 @@ fi
 
 sed -i "s/__KFX_CALLERID_NAME__/${KFX_CALLERID_NAME}/g" "$EXT"
 sed -i "s/__KFX_PJSIP_ENDPOINT__/${KFX_PJSIP_ENDPOINT}/g" "$EXT"
+
+if [[ "$KFX_PHONE_QUEUE_ENABLED" == "y" ]]; then
+  [[ "$KFX_PHONE_IN_DID" =~ ^[0-9]+$ ]] || {
+    echo "ERROR: KFX_PHONE_IN_SIP_NUMBER fehlt oder ist ungueltig." >&2
+    exit 1
+  }
+  [[ "$KFX_PHONE_IN_DID" != "$KFX_FAX_DID" ]] || {
+    echo "ERROR: Telefonie-DID und Fax-DID muessen verschieden sein." >&2
+    exit 1
+  }
+  python3 - "$EXT" "$KFX_PHONE_IN_DID" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+did = sys.argv[2]
+text = path.read_text(encoding="utf-8")
+text = text.replace("__KFX_PHONE_ROUTE__", f"exten => {did},1,Goto(kfx-phone-in,s,1)")
+path.write_text(text, encoding="utf-8")
+PY
+else
+  sed -i 's/__KFX_PHONE_ROUTE__/; Telefoniewarteschlange deaktiviert./g' "$EXT"
+fi
+
+printf '\n#tryinclude "/etc/asterisk/extensions-kfx-telefonie.conf"\n' >>"$EXT"
 
 asterisk -rx "dialplan reload" || true
