@@ -2,7 +2,7 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.3.13
+# Version: 3.3.14
 # Stand:   2026-07-07
 # Autor:   Dr. Thomas Kienzle
 #
@@ -167,6 +167,10 @@
 # NEU in 3.3.13:
 # - Queue-Regression behoben: Die echte deutsche Warteposition wird sofort beim Eintritt
 #   und danach hoechstens einmal pro Minute angesagt; die doppelte allgemeine Minutenansage entfaellt.
+#
+# NEU in 3.3.14:
+# - Angenommene Queue-Anrufe werden nach allen Provider-/Queue-Busy-Pruefungen, aber vor
+#   der Positionsansage beantwortet. Dadurch ist die Ansage nicht von SIP-Early-Media abhaengig.
 # ==============================================================================
 
 set -euo pipefail
