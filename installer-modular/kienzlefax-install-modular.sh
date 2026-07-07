@@ -1383,6 +1383,7 @@ install_german_asterisk_prompts(){
   local tmp source
   local -a packages
   local fallback_url="https://deb.debian.org/debian/pool/main/a/asterisk-prompt-de/asterisk-prompt-de_2.0-1.3_all.deb"
+  local fallback_sha256="08ba6e284c2fd325b04adff884a269851b9d914ba6f8d671886e92432b8d292d"
 
   if [[ -s "${target}/queue-thankyou.gsm" && -s "${target}/queue-youarenext.gsm" && -s "${target}/queue-thereare.gsm" && -s "${target}/queue-callswaiting.gsm" ]]; then
     log "[OK] Deutsche Asterisk-Ansagen bereits vorhanden."
@@ -1396,6 +1397,7 @@ install_german_asterisk_prompts(){
       log "[WARN] asterisk-prompt-de ist ueber APT nicht verfuegbar; nutze offizielles Debian-Paketarchiv."
       rm -f asterisk-prompt-de_*.deb
       curl -fsSL "$fallback_url" -o "asterisk-prompt-de_2.0-1.3_all.deb"
+      printf '%s  %s\n' "$fallback_sha256" "asterisk-prompt-de_2.0-1.3_all.deb" | sha256sum -c -
     fi
     mapfile -t packages < <(find "$tmp" -maxdepth 1 -type f -name 'asterisk-prompt-de_*.deb' -print)
     (( ${#packages[@]} == 1 )) || exit 1
