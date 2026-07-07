@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# IMMER verwenden wenn das robuste AGI fuer Faxstatus, Versuchsbeginn und Kapazitaetsrueckstellung installiert wird.
 set -euo pipefail
 
 ENVFILE="/etc/kienzlefax-installer.env"
@@ -25,8 +26,8 @@ cat >"$AGI" <<'PY'
 # -*- coding: utf-8 -*-
 """
 kfx_update_status.agi — kienzlefax
-Version: 1.3.8
-Stand:  2026-06-27
+Version: 1.3.9
+Stand:  2026-07-07
 Autor:  Dr. Thomas Kienzle
 
 Changelog (komplett):
@@ -63,6 +64,11 @@ Changelog (komplett):
       send_end-Ereignisse nicht mehr zurueckgestuft.
     - Leere Felder eines spaeten Ereignisses ueberschreiben keine bereits vorhandenen
       Fax-Ergebniswerte.
+- 1.3.9:
+  - Neues Ereignis dial_start erhoeht den Versuch erst nach erfolgreicher Reservierung
+    der externen Providerkapazitaet.
+  - Neues Ereignis capacity_deferred markiert volle Providerkapazitaet ohne einen
+    Fax-Sendeversuch zu verbrauchen; der Worker stellt den Auftrag zeitversetzt zurueck.
 """
 
 import fcntl
@@ -309,6 +315,52 @@ def main() -> int:
     was_cancelled = bool((job.get("cancel") or {}).get("requested"))
     action = upper(args[1])
     status_before = upper(job.get("status"))
+
+    if action == "DIAL_START":
+        if status_is_terminal(job):
+            return finish()
+        stamp = now_iso()
+        uid = agi_env.get("agi_uniqueid", "")
+        ast = job.setdefault("asterisk", {})
+        if not uid or to_str(ast.get("dial_start_uniqueid")) != uid:
+            attempt = job.setdefault("attempt", {})
+            attempt["current"] = int(attempt.get("current") or 0) + 1
+            attempt["started_at"] = stamp
+            attempt.pop("ended_at", None)
+            if uid:
+                ast["dial_start_uniqueid"] = uid
+        result = job.setdefault("result", {})
+        if upper(result.get("reason")) == "EXTERNAL_CAPACITY_FULL":
+            result.pop("reason", None)
+        job["status"] = "CALLING"
+        job["updated_at"] = stamp
+        try:
+            write_json_atomic(jp, job)
+        except Exception as e:
+            eprint(f"kfx_update_status.agi: write failed {jp}: {e}")
+        return finish()
+
+    if action == "CAPACITY_DEFERRED":
+        if status_is_terminal(job):
+            return finish()
+        stamp = now_iso()
+        job["status"] = "DEFERRED"
+        job["updated_at"] = stamp
+        result = job.setdefault("result", {})
+        result["reason"] = "EXTERNAL_CAPACITY_FULL"
+        capacity = job.setdefault("capacity", {})
+        capacity["last_deferred_at"] = stamp
+        uid = agi_env.get("agi_uniqueid", "")
+        ast = job.setdefault("asterisk", {})
+        if not uid or to_str(ast.get("capacity_deferred_uniqueid")) != uid:
+            capacity["deferred_count"] = int(capacity.get("deferred_count") or 0) + 1
+            if uid:
+                ast["capacity_deferred_uniqueid"] = uid
+        try:
+            write_json_atomic(jp, job)
+        except Exception as e:
+            eprint(f"kfx_update_status.agi: write failed {jp}: {e}")
+        return finish()
 
     if action == "SEND_START":
         if status_is_terminal(job):

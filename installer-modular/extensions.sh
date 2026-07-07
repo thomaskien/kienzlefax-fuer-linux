@@ -18,6 +18,25 @@ KFX_CALLERID_NAME="${KFX_CALLERID_NAME:-Fax}"
 KFX_PJSIP_ENDPOINT="${KFX_PJSIP_ENDPOINT:-kfx-provider-endpoint}"
 KFX_PHONE_QUEUE_ENABLED="${KFX_PHONE_QUEUE_ENABLED:-n}"
 KFX_PHONE_IN_DID="${KFX_PHONE_IN_SIP_NUMBER:-}"
+KFX_PROVIDER_CHANNEL_LIMIT="${KFX_PROVIDER_CHANNEL_LIMIT:-4}"
+KFX_PROVIDER_PHONE_LIMIT="${KFX_PROVIDER_PHONE_LIMIT:-3}"
+KFX_PROVIDER_FAX_LIMIT="${KFX_PROVIDER_FAX_LIMIT:-3}"
+KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT="${KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT:-2}"
+
+for value in KFX_PROVIDER_CHANNEL_LIMIT KFX_PROVIDER_PHONE_LIMIT KFX_PROVIDER_FAX_LIMIT KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT; do
+  [[ "${!value}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ERROR: ${value} muss eine positive Ganzzahl sein." >&2
+    exit 1
+  }
+done
+(( KFX_PROVIDER_PHONE_LIMIT <= KFX_PROVIDER_CHANNEL_LIMIT )) || {
+  echo "ERROR: KFX_PROVIDER_PHONE_LIMIT darf die Gesamtgrenze nicht ueberschreiten." >&2
+  exit 1
+}
+(( KFX_PROVIDER_FAX_LIMIT <= KFX_PROVIDER_CHANNEL_LIMIT )) || {
+  echo "ERROR: KFX_PROVIDER_FAX_LIMIT darf die Gesamtgrenze nicht ueberschreiten." >&2
+  exit 1
+}
 
 # Default: CallerID uses the SIP number (same as username)
 if [ -z "${KFX_CALLERID_NUM}" ]; then
@@ -143,8 +162,9 @@ exten => kfx_missing_file,1,NoOp(FAX OUT ERROR: missing KFX_FILE | jobid=${KFX_J
  same => n,Hangup()
 
 exten => h,1,NoOp(fax-out h-extension | jobid=${KFX_JOBID} DIALSTATUS=${DIALSTATUS} HANGUPCAUSE=${HANGUPCAUSE})
+ same => n,GotoIf($["${KFX_CAPACITY_DEFERRED}"="1"]?done)
  same => n,AGI(kfx_update_status.agi,${KFX_JOBID},dial_end,${DIALSTATUS},${HANGUPCAUSE})
- same => n,Hangup()
+ same => n(done),Hangup()
 
 exten => _49X.,1,NoOp(FAX OUT normalize 49... -> national | jobid=${KFX_JOBID} file=${KFX_FILE})
  same => n,Set(JITTERBUFFER(adaptive)=default)
@@ -152,12 +172,13 @@ exten => _49X.,1,NoOp(FAX OUT normalize 49... -> national | jobid=${KFX_JOBID} f
  same => n,NoOp(NORMALIZED=${NORM})
  same => n,GotoIf($[ "${KFX_FILE}" = "" ]?kfx_missing_file,1)
 
- same => n(kfx_capacity_wait),Gosub(kfx_fax_capacity,s,1)
+ same => n,Gosub(kfx_external_capacity,primary-fax,1)
  same => n,GotoIf($["${KFX_CAPACITY_OK}"="1"]?kfx_capacity_ok)
- same => n,NoOp(FAX OUT waiting: global fax capacity full (limit ${KFX_CAPACITY_LIMIT}))
- same => n,Wait(2)
- same => n,Goto(kfx_capacity_wait)
- same => n(kfx_capacity_ok),NoOp(FAX OUT capacity reserved: ${KFX_CAPACITY_COUNT_BEFORE}+1/${KFX_CAPACITY_LIMIT})
+ same => n,Set(KFX_CAPACITY_DEFERRED=1)
+ same => n,NoOp(FAX OUT deferred: provider or fax capacity full)
+ same => n,AGI(kfx_update_status.agi,${KFX_JOBID},capacity_deferred)
+ same => n,Hangup(17)
+ same => n(kfx_capacity_ok),AGI(kfx_update_status.agi,${KFX_JOBID},dial_start)
 
  same => n,Set(CHANNEL(accountcode)=${KFX_JOBID})
  same => n,Set(CDR(userfield)=kfx:${KFX_JOBID})
@@ -175,12 +196,13 @@ exten => _0X.,1,NoOp(FAX OUT national | jobid=${KFX_JOBID} file=${KFX_FILE})
  same => n,Set(JITTERBUFFER(adaptive)=default)
  same => n,GotoIf($[ "${KFX_FILE}" = "" ]?kfx_missing_file,1)
 
- same => n(kfx_capacity_wait),Gosub(kfx_fax_capacity,s,1)
+ same => n,Gosub(kfx_external_capacity,primary-fax,1)
  same => n,GotoIf($["${KFX_CAPACITY_OK}"="1"]?kfx_capacity_ok)
- same => n,NoOp(FAX OUT waiting: global fax capacity full (limit ${KFX_CAPACITY_LIMIT}))
- same => n,Wait(2)
- same => n,Goto(kfx_capacity_wait)
- same => n(kfx_capacity_ok),NoOp(FAX OUT capacity reserved: ${KFX_CAPACITY_COUNT_BEFORE}+1/${KFX_CAPACITY_LIMIT})
+ same => n,Set(KFX_CAPACITY_DEFERRED=1)
+ same => n,NoOp(FAX OUT deferred: provider or fax capacity full)
+ same => n,AGI(kfx_update_status.agi,${KFX_JOBID},capacity_deferred)
+ same => n,Hangup(17)
+ same => n(kfx_capacity_ok),AGI(kfx_update_status.agi,${KFX_JOBID},dial_start)
 
  same => n,Set(CHANNEL(accountcode)=${KFX_JOBID})
  same => n,Set(CDR(userfield)=kfx:${KFX_JOBID})
@@ -195,31 +217,75 @@ exten => _0X.,1,NoOp(FAX OUT national | jobid=${KFX_JOBID} file=${KFX_FILE})
  same => n,Hangup()
 
 ; =============================================================================
-; GLOBAL FAX CAPACITY GUARD
-; - Counts logical fax connections, not Asterisk channel legs.
-; - Outbound: GROUP is set on the Local channel in [fax-out].
-; - Inbound: GROUP is set on the inbound PJSIP channel before Answer().
-; - Group membership ends automatically when the channel hangs up.
+; SHARED EXTERNAL CAPACITY GUARD
+; - One lock makes check-and-reserve atomic across phone and fax calls.
+; - Groups live on exactly one logical channel and disappear at hangup.
 ; =============================================================================
-[kfx_fax_capacity]
-exten => s,1,NoOp(kfx_fax_capacity | chan=${CHANNEL(name)})
- same => n,Set(KFX_CAPACITY_LIMIT=3)
- same => n,Set(KFX_CAPACITY_LOCK=${LOCK(kfx_fax_capacity_lock)})
- same => n,GotoIf($["${KFX_CAPACITY_LOCK}"="1"]?locked:lock_failed)
-
- same => n(locked),Set(KFX_CAPACITY_COUNT_BEFORE=${GROUP_COUNT(active@kfx_fax_capacity)})
- same => n,GotoIf($[${KFX_CAPACITY_COUNT_BEFORE} >= ${KFX_CAPACITY_LIMIT}]?full)
- same => n,Set(GROUP(kfx_fax_capacity)=active)
- same => n,Set(KFX_CAPACITY_OK=1)
- same => n,Set(KFX_CAPACITY_UNLOCK=${UNLOCK(kfx_fax_capacity_lock)})
- same => n,Return()
-
- same => n(full),Set(KFX_CAPACITY_OK=0)
- same => n,Set(KFX_CAPACITY_UNLOCK=${UNLOCK(kfx_fax_capacity_lock)})
- same => n,Return()
-
- same => n(lock_failed),NoOp(kfx_fax_capacity: mutex acquisition failed - fail closed)
+[kfx_external_capacity]
+exten => primary-phone,1,NoOp(KFX CAPACITY request=primary-phone chan=${CHANNEL(name)})
  same => n,Set(KFX_CAPACITY_OK=0)
+ same => n,GotoIf($["${GROUP(kfx_primary_total)}"="active" & "${GROUP(kfx_primary_phone)}"="active"]?already_reserved)
+ same => n,Set(KFX_CAPACITY_LOCK=${LOCK(kfx_external_capacity_lock)})
+ same => n,GotoIf($["${KFX_CAPACITY_LOCK}"="1"]?locked:lock_failed)
+ same => n(locked),Set(KFX_PRIMARY_TOTAL_COUNT=${GROUP_COUNT(active@kfx_primary_total)})
+ same => n,Set(KFX_PRIMARY_PHONE_COUNT=${GROUP_COUNT(active@kfx_primary_phone)})
+ same => n,GotoIf($[${KFX_PRIMARY_TOTAL_COUNT} >= __KFX_PROVIDER_CHANNEL_LIMIT__]?full)
+ same => n,GotoIf($[${KFX_PRIMARY_PHONE_COUNT} >= __KFX_PROVIDER_PHONE_LIMIT__]?full)
+ same => n,Set(GROUP(kfx_primary_total)=active)
+ same => n,Set(GROUP(kfx_primary_phone)=active)
+ same => n,Set(KFX_CAPACITY_OK=1)
+ same => n,Set(KFX_CAPACITY_UNLOCK=${UNLOCK(kfx_external_capacity_lock)})
+ same => n,NoOp(KFX CAPACITY reserved primary-phone total=${KFX_PRIMARY_TOTAL_COUNT}+1/__KFX_PROVIDER_CHANNEL_LIMIT__ phone=${KFX_PRIMARY_PHONE_COUNT}+1/__KFX_PROVIDER_PHONE_LIMIT__)
+ same => n,Return()
+ same => n(full),Set(KFX_CAPACITY_UNLOCK=${UNLOCK(kfx_external_capacity_lock)})
+ same => n,NoOp(KFX CAPACITY full primary-phone total=${KFX_PRIMARY_TOTAL_COUNT}/__KFX_PROVIDER_CHANNEL_LIMIT__ phone=${KFX_PRIMARY_PHONE_COUNT}/__KFX_PROVIDER_PHONE_LIMIT__)
+ same => n,Return()
+ same => n(already_reserved),Set(KFX_CAPACITY_OK=1)
+ same => n,Return()
+ same => n(lock_failed),NoOp(KFX CAPACITY lock failed primary-phone - fail closed)
+ same => n,Return()
+
+exten => primary-fax,1,NoOp(KFX CAPACITY request=primary-fax chan=${CHANNEL(name)})
+ same => n,Set(KFX_CAPACITY_OK=0)
+ same => n,GotoIf($["${GROUP(kfx_primary_total)}"="active" & "${GROUP(kfx_primary_fax)}"="active"]?already_reserved)
+ same => n,Set(KFX_CAPACITY_LOCK=${LOCK(kfx_external_capacity_lock)})
+ same => n,GotoIf($["${KFX_CAPACITY_LOCK}"="1"]?locked:lock_failed)
+ same => n(locked),Set(KFX_PRIMARY_TOTAL_COUNT=${GROUP_COUNT(active@kfx_primary_total)})
+ same => n,Set(KFX_PRIMARY_FAX_COUNT=${GROUP_COUNT(active@kfx_primary_fax)})
+ same => n,GotoIf($[${KFX_PRIMARY_TOTAL_COUNT} >= __KFX_PROVIDER_CHANNEL_LIMIT__]?full)
+ same => n,GotoIf($[${KFX_PRIMARY_FAX_COUNT} >= __KFX_PROVIDER_FAX_LIMIT__]?full)
+ same => n,Set(GROUP(kfx_primary_total)=active)
+ same => n,Set(GROUP(kfx_primary_fax)=active)
+ same => n,Set(KFX_CAPACITY_OK=1)
+ same => n,Set(KFX_CAPACITY_UNLOCK=${UNLOCK(kfx_external_capacity_lock)})
+ same => n,NoOp(KFX CAPACITY reserved primary-fax total=${KFX_PRIMARY_TOTAL_COUNT}+1/__KFX_PROVIDER_CHANNEL_LIMIT__ fax=${KFX_PRIMARY_FAX_COUNT}+1/__KFX_PROVIDER_FAX_LIMIT__)
+ same => n,Return()
+ same => n(full),Set(KFX_CAPACITY_UNLOCK=${UNLOCK(kfx_external_capacity_lock)})
+ same => n,NoOp(KFX CAPACITY full primary-fax total=${KFX_PRIMARY_TOTAL_COUNT}/__KFX_PROVIDER_CHANNEL_LIMIT__ fax=${KFX_PRIMARY_FAX_COUNT}/__KFX_PROVIDER_FAX_LIMIT__)
+ same => n,Return()
+ same => n(already_reserved),Set(KFX_CAPACITY_OK=1)
+ same => n,Return()
+ same => n(lock_failed),NoOp(KFX CAPACITY lock failed primary-fax - fail closed)
+ same => n,Return()
+
+exten => sipgate-phone,1,NoOp(KFX CAPACITY request=sipgate-phone chan=${CHANNEL(name)})
+ same => n,Set(KFX_CAPACITY_OK=0)
+ same => n,GotoIf($["${GROUP(kfx_sipgate_overflow)}"="active"]?already_reserved)
+ same => n,Set(KFX_CAPACITY_LOCK=${LOCK(kfx_external_capacity_lock)})
+ same => n,GotoIf($["${KFX_CAPACITY_LOCK}"="1"]?locked:lock_failed)
+ same => n(locked),Set(KFX_SIPGATE_COUNT=${GROUP_COUNT(active@kfx_sipgate_overflow)})
+ same => n,GotoIf($[${KFX_SIPGATE_COUNT} >= __KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT__]?full)
+ same => n,Set(GROUP(kfx_sipgate_overflow)=active)
+ same => n,Set(KFX_CAPACITY_OK=1)
+ same => n,Set(KFX_CAPACITY_UNLOCK=${UNLOCK(kfx_external_capacity_lock)})
+ same => n,NoOp(KFX CAPACITY reserved sipgate-phone count=${KFX_SIPGATE_COUNT}+1/__KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT__)
+ same => n,Return()
+ same => n(full),Set(KFX_CAPACITY_UNLOCK=${UNLOCK(kfx_external_capacity_lock)})
+ same => n,NoOp(KFX CAPACITY full sipgate-phone count=${KFX_SIPGATE_COUNT}/__KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT__)
+ same => n,Return()
+ same => n(already_reserved),Set(KFX_CAPACITY_OK=1)
+ same => n,Return()
+ same => n(lock_failed),NoOp(KFX CAPACITY lock failed sipgate-phone - fail closed)
  same => n,Return()
 
 ; =============================================================================
@@ -262,11 +328,11 @@ __KFX_PHONE_ROUTE__
 ; =============================================================================
 [fax-in]
 exten => __KFX_FAX_DID__,1,NoOp(Inbound Fax)
- same => n,Gosub(kfx_fax_capacity,s,1)
+ same => n,Gosub(kfx_external_capacity,primary-fax,1)
  same => n,GotoIf($["${KFX_CAPACITY_OK}"="1"]?kfx_capacity_ok)
- same => n,NoOp(Inbound Fax rejected: global fax capacity full (limit ${KFX_CAPACITY_LIMIT}))
+ same => n,NoOp(Inbound Fax rejected: provider or fax capacity full)
  same => n,Hangup(17)
- same => n(kfx_capacity_ok),NoOp(Inbound Fax capacity reserved: ${KFX_CAPACITY_COUNT_BEFORE}+1/${KFX_CAPACITY_LIMIT})
+ same => n(kfx_capacity_ok),NoOp(Inbound Fax capacity reserved)
  same => n,Answer()
  same => n,Set(FAXOPT(ecm)=yes)
  same => n,Set(FAXOPT(maxrate)=9600)
@@ -322,6 +388,10 @@ fi
 
 sed -i "s/__KFX_CALLERID_NAME__/${KFX_CALLERID_NAME}/g" "$EXT"
 sed -i "s/__KFX_PJSIP_ENDPOINT__/${KFX_PJSIP_ENDPOINT}/g" "$EXT"
+sed -i "s/__KFX_PROVIDER_CHANNEL_LIMIT__/${KFX_PROVIDER_CHANNEL_LIMIT}/g" "$EXT"
+sed -i "s/__KFX_PROVIDER_PHONE_LIMIT__/${KFX_PROVIDER_PHONE_LIMIT}/g" "$EXT"
+sed -i "s/__KFX_PROVIDER_FAX_LIMIT__/${KFX_PROVIDER_FAX_LIMIT}/g" "$EXT"
+sed -i "s/__KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT__/${KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT}/g" "$EXT"
 
 if [[ "$KFX_PHONE_QUEUE_ENABLED" == "y" ]]; then
   [[ "$KFX_PHONE_IN_DID" =~ ^[0-9]+$ ]] || {

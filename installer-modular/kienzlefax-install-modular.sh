@@ -2,8 +2,8 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.3.11
-# Stand:   2026-07-06
+# Version: 3.3.12
+# Stand:   2026-07-07
 # Autor:   Dr. Thomas Kienzle
 #
 # Modularer Installer (alles gehört dazu; Provider per Template-Auswahl).
@@ -150,7 +150,19 @@
 #   mit Reserve unter der UDP-/MTU-Grenze bleiben und nicht fragmentiert werden.
 # - Die Queue ruft das erste Telefon ohne anfaengliche Positionsansage sofort an und spielt die
 #   deutsche Standard-Warteansage erstmals nach 60 Sekunden sowie danach minuetlich.
+# - Der Telefonie-Modulabschluss prueft nicht nur das PJSIP-Transportobjekt, sondern auch den
+#   tatsaechlich von Asterisk geoeffneten UDP-Socket auf der internen IP und Port 5060.
+# - Die Asterisk-systemd-Unit wartet beim Boot ausdruecklich auf die konfigurierte interne IPv4-Adresse,
+#   damit der an eine feste LAN-IP gebundene Telefonie-Transport nicht vor Abschluss von DHCP startet.
 # - Syntaxwarnung im Fax-Kapazitaetsguard durch ein Semikolon innerhalb von NoOp wurde behoben.
+#
+# NEU in 3.3.12:
+# - Gemeinsame, atomare Provider-Kanalbegrenzung mit getrennten Teilgrenzen fuer Telefonie und Fax.
+# - Maximale Zahl wartender Anrufer wird abgefragt; Ueberlast wird vor Annahme mit SIP Busy abgewiesen.
+# - Optionaler additiver sipgate-trunking-Ueberlauf ueber sipconnect.sipgate.de mit eigener Kanalgrenze.
+# - Ausgehende Telefonate ueber eine separate SIP-Leitung koennen auf Wunsch zur Hauptgrenze zaehlen.
+# - Abweichungen von den Stabilitaetsdefaults muessen nach einer erneuten deutlichen Warnung bestaetigt werden.
+# - Ausgehende Faxe warten bei voller Providerkapazitaet im Worker, ohne einen Sendeversuch zu verbrauchen.
 # ==============================================================================
 
 set -euo pipefail
@@ -345,6 +357,37 @@ active_channel_count(){
   awk 'NF {count++} END {print count+0}' <<<"$output"
 }
 
+install_asterisk_network_wait_helper(){
+  install -d -m 0755 /usr/local/sbin
+  cat >/usr/local/sbin/kienzlefax-wait-asterisk-network <<'SCRIPT'
+#!/usr/bin/env bash
+set -u
+
+ENVFILE="/etc/kienzlefax-installer.env"
+[[ -r "$ENVFILE" ]] || exit 0
+# shellcheck disable=SC1090
+source "$ENVFILE"
+
+[[ "${KFX_PHONE_QUEUE_ENABLED:-n}" == "y" ]] || exit 0
+BIND_IP="${KFX_PHONE_BIND_IP:-}"
+[[ -n "$BIND_IP" ]] || exit 0
+
+for (( waited=0; waited<90; waited++ )); do
+  while IFS= read -r line; do
+    case "$line" in
+      *" ${BIND_IP}/"*) exit 0 ;;
+    esac
+  done < <(ip -o -4 addr show 2>/dev/null || true)
+  sleep 1
+done
+
+echo "KienzleFax: interne Asterisk-Bind-Adresse ${BIND_IP} nach 90 Sekunden nicht vorhanden." >&2
+exit 1
+SCRIPT
+  chmod 0755 /usr/local/sbin/kienzlefax-wait-asterisk-network
+  chown root:root /usr/local/sbin/kienzlefax-wait-asterisk-network
+}
+
 asterisk_rx(){
   local cmd="$1"
   if wait_for_asterisk_cli 30; then
@@ -357,6 +400,7 @@ asterisk_rx(){
 install_native_asterisk_unit(){
   local unit="/etc/systemd/system/asterisk.service"
   local tmp
+  install_asterisk_network_wait_helper
   tmp="$(mktemp)"
   cat >"$tmp" <<'UNIT'
 [Unit]
@@ -367,6 +411,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=LD_LIBRARY_PATH=/usr/lib
+ExecStartPre=/usr/local/sbin/kienzlefax-wait-asterisk-network
 ExecStart=/usr/sbin/asterisk -f -C /etc/asterisk/asterisk.conf
 ExecReload=/usr/sbin/asterisk -rx "core reload"
 ExecStop=/usr/sbin/asterisk -rx "core stop now"
@@ -653,58 +698,123 @@ collect_phone_options(){
   PHONE_BIND_IP=""
   PHONE_LOCAL_CIDR=""
   PHONE_SEPARATE_OUTBOUND="n"
+  PHONE_OUT_COUNTS_PROVIDER_LIMIT="y"
+  PROVIDER_CHANNEL_LIMIT="4"
+  PROVIDER_PHONE_LIMIT="3"
+  PROVIDER_FAX_LIMIT="3"
+  QUEUE_MAX_WAITING="5"
+  SIPGATE_OVERFLOW_ENABLED="n"
+  SIPGATE_OVERFLOW_CHANNEL_LIMIT="2"
+  SIPGATE_OVERFLOW_SIP_ID=""
+  SIPGATE_OVERFLOW_SIP_PASSWORD=""
+  SIPGATE_OVERFLOW_DID=""
+  SIPGATE_OVERFLOW_DOMAIN="sipconnect.sipgate.de"
+  SIPGATE_OVERFLOW_IDENTIFY_MATCH="217.10.68.150"
 
   ask_yes_no PHONE_QUEUE_ENABLED "Warteschlange fuer Telefonie erstellen?" "n"
+
+  echo
+  echo "ACHTUNG – Stabilitaetsrelevante Kanalgrenzen"
+  echo "Zu hohe Werte koennen massive Probleme durch Providerlimits, Bandbreite, RTP und Faxlast verursachen."
+  echo "Empfohlene und erprobte Defaults fuer 1&1: insgesamt 4, Telefonie 3, Fax 3, Wartende 5."
+  echo "Telefonie- und Faxgrenze sind Teilgrenzen; zusaetzlich gilt immer die Gesamtgrenze."
+  ask_int_range PROVIDER_CHANNEL_LIMIT "Maximale gleichzeitige Kanaele der Haupt-SIP-Leitung" "4" "1" "100"
+  ask_int_range PROVIDER_PHONE_LIMIT "Davon maximal fuer Telefonie" "3" "1" "$PROVIDER_CHANNEL_LIMIT"
+  ask_int_range PROVIDER_FAX_LIMIT "Davon maximal fuer Fax (eingehend und ausgehend)" "3" "1" "$PROVIDER_CHANNEL_LIMIT"
+  ask_int_range QUEUE_MAX_WAITING "Maximale Zahl wartender Anrufer in der Warteschlange" "5" "1" "100"
+
   if [[ "$PHONE_QUEUE_ENABLED" != "y" ]]; then
     copy_phone_provider_config EMPTY PHONE_IN
     copy_phone_provider_config EMPTY PHONE_OUT
-    return 0
-  fi
+  else
+    ask_int_range PHONE_COUNT "Zahl der Telefone in der Warteschlange" "2" "1" "100"
 
-  ask_int_range PHONE_COUNT "Zahl der Telefone in der Warteschlange" "2" "1" "100"
+    local detected="" detected_iface="" detected_ip="" detected_cidr=""
+    detected="$(detect_default_ipv4_network || true)"
+    if [[ -n "$detected" ]]; then
+      IFS='|' read -r detected_iface detected_ip detected_cidr <<<"$detected"
+      PHONE_BIND_IFACE="$detected_iface"
+      PHONE_BIND_IP="$detected_ip"
+      PHONE_LOCAL_CIDR="$detected_cidr"
+      echo
+      echo "Interne Telefonie automatisch erkannt:"
+      echo "  Schnittstelle: ${PHONE_BIND_IFACE}"
+      echo "  Bind-Adresse:  ${PHONE_BIND_IP}:${PHONE_INTERNAL_PORT}"
+      echo "  Internes Netz: ${PHONE_LOCAL_CIDR}"
+    else
+      echo "[WARN] Internes IPv4-Netz konnte nicht automatisch erkannt werden."
+      ask_default PHONE_BIND_IP "Interne IPv4-Adresse dieses Asterisk-Systems" ""
+      ask_default PHONE_LOCAL_CIDR "Internes IPv4-Netz in CIDR-Schreibweise" ""
+      ask_default PHONE_BIND_IFACE "Interne Netzwerkschnittstelle (nur Dokumentation)" "manuell"
+    fi
+    validate_phone_network "$PHONE_BIND_IP" "$PHONE_LOCAL_CIDR" \
+      || die "Interne Telefonie-IP '${PHONE_BIND_IP}' liegt nicht im Netz '${PHONE_LOCAL_CIDR}'."
+    [[ "$PHONE_INTERNAL_PORT" != "${SIP_BIND_PORT:-${KFX_SIP_BIND_PORT:-5070}}" ]] \
+      || die "Interner Telefonie-Port und externer Provider-Port duerfen nicht identisch sein."
 
-  local detected="" detected_iface="" detected_ip="" detected_cidr=""
-  detected="$(detect_default_ipv4_network || true)"
-  if [[ -n "$detected" ]]; then
-    IFS='|' read -r detected_iface detected_ip detected_cidr <<<"$detected"
-    PHONE_BIND_IFACE="$detected_iface"
-    PHONE_BIND_IP="$detected_ip"
-    PHONE_LOCAL_CIDR="$detected_cidr"
+    collect_phone_provider_config PHONE_IN "die eingehende Telefonieleitung"
+    local fax_did="${FAX_DID:-${KFX_FAX_DID:-}}"
+    [[ "${PHONE_IN_SIP_NUMBER}" != "$fax_did" ]] \
+      || die "Telefonie-DID und Fax-DID muessen verschieden sein, damit eingehende Anrufe eindeutig geroutet werden."
+
+    ask_yes_no PHONE_SEPARATE_OUTBOUND "Fuer ausgehende Telefonate eine andere SIP-Leitung verwenden?" "n"
+    if [[ "$PHONE_SEPARATE_OUTBOUND" == "y" ]]; then
+      collect_phone_provider_config PHONE_OUT "die ausgehende Telefonieleitung"
+      ask_yes_no PHONE_OUT_COUNTS_PROVIDER_LIMIT \
+        "Ausgehende Telefonate dieser Leitung zur Haupt-Kanalgrenze zaehlen? (empfohlen)" "y"
+    else
+      copy_phone_provider_config PHONE_IN PHONE_OUT
+      PHONE_OUT_COUNTS_PROVIDER_LIMIT="y"
+    fi
+
     echo
-    echo "Interne Telefonie automatisch erkannt:"
-    echo "  Schnittstelle: ${PHONE_BIND_IFACE}"
-    echo "  Bind-Adresse:  ${PHONE_BIND_IP}:${PHONE_INTERNAL_PORT}"
-    echo "  Internes Netz: ${PHONE_LOCAL_CIDR}"
-  else
-    echo "[WARN] Internes IPv4-Netz konnte nicht automatisch erkannt werden."
-    ask_default PHONE_BIND_IP "Interne IPv4-Adresse dieses Asterisk-Systems" ""
-    ask_default PHONE_LOCAL_CIDR "Internes IPv4-Netz in CIDR-Schreibweise" ""
-    ask_default PHONE_BIND_IFACE "Interne Netzwerkschnittstelle (nur Dokumentation)" "manuell"
-  fi
-  validate_phone_network "$PHONE_BIND_IP" "$PHONE_LOCAL_CIDR" \
-    || die "Interne Telefonie-IP '${PHONE_BIND_IP}' liegt nicht im Netz '${PHONE_LOCAL_CIDR}'."
-  [[ "$PHONE_INTERNAL_PORT" != "${SIP_BIND_PORT:-${KFX_SIP_BIND_PORT:-5070}}" ]] \
-    || die "Interner Telefonie-Port und externer Provider-Port duerfen nicht identisch sein."
+    echo "Optional kann sipgate trunking als zusaetzlicher Eingangsweg fuer Ueberlauf-Anrufe eingerichtet werden."
+    ask_yes_no SIPGATE_OVERFLOW_ENABLED "Sipgate-Ueberlauf ueber sipconnect.sipgate.de einrichten?" "n"
+    if [[ "$SIPGATE_OVERFLOW_ENABLED" == "y" ]]; then
+      while [[ ! "$SIPGATE_OVERFLOW_SIP_ID" =~ ^[A-Za-z0-9._-]+$ ]]; do
+        ask_default SIPGATE_OVERFLOW_SIP_ID "Sipgate trunking SIP-ID" ""
+        [[ "$SIPGATE_OVERFLOW_SIP_ID" =~ ^[A-Za-z0-9._-]+$ ]] || echo "Bitte nur Buchstaben, Ziffern, Punkt, Unterstrich oder Bindestrich verwenden."
+      done
+      read_secret_twice SIPGATE_OVERFLOW_SIP_PASSWORD "Sipgate trunking SIP-Passwort"
+      while [[ -z "$SIPGATE_OVERFLOW_DID" ]]; do
+        ask_default SIPGATE_OVERFLOW_DID "Sipgate-Ueberlauf-DID im internationalen Format (nur Ziffern)" ""
+        SIPGATE_OVERFLOW_DID="$(sanitize_digits "$SIPGATE_OVERFLOW_DID")"
+      done
+      ask_int_range SIPGATE_OVERFLOW_CHANNEL_LIMIT "Maximale gleichzeitige Sipgate-Ueberlaufkanaele" "2" "1" "100"
+    fi
 
-  collect_phone_provider_config PHONE_IN "die eingehende Telefonieleitung"
-  local fax_did="${FAX_DID:-${KFX_FAX_DID:-}}"
-  [[ "${PHONE_IN_SIP_NUMBER}" != "$fax_did" ]] \
-    || die "Telefonie-DID und Fax-DID muessen verschieden sein, damit eingehende Anrufe eindeutig geroutet werden."
-
-  ask_yes_no PHONE_SEPARATE_OUTBOUND "Fuer ausgehende Telefonate eine andere SIP-Leitung verwenden?" "n"
-  if [[ "$PHONE_SEPARATE_OUTBOUND" == "y" ]]; then
-    collect_phone_provider_config PHONE_OUT "die ausgehende Telefonieleitung"
-  else
-    copy_phone_provider_config PHONE_IN PHONE_OUT
+    local index ext password_var
+    for (( index=0; index<PHONE_COUNT; index++ )); do
+      ext=$((PHONE_FIRST_EXTENSION + index))
+      password_var="PHONE_ENDPOINT_${ext}_PASSWORD"
+      printf -v "$password_var" '%s' "$(generate_secure_password)"
+    done
+    echo "[OK] ${PHONE_COUNT} lokale PJSIP-Passwoerter wurden sicher generiert; Ausgabe nur in ENV/Installationsbericht."
   fi
 
-  local index ext password_var
-  for (( index=0; index<PHONE_COUNT; index++ )); do
-    ext=$((PHONE_FIRST_EXTENSION + index))
-    password_var="PHONE_ENDPOINT_${ext}_PASSWORD"
-    printf -v "$password_var" '%s' "$(generate_secure_password)"
-  done
-  echo "[OK] ${PHONE_COUNT} lokale PJSIP-Passwoerter wurden sicher generiert; Ausgabe nur in ENV/Installationsbericht."
+  local capacity_deviation="n" capacity_confirm="n" reachable_phone_capacity="$PROVIDER_PHONE_LIMIT"
+  [[ "$PROVIDER_CHANNEL_LIMIT" == "4" ]] || capacity_deviation="y"
+  [[ "$PROVIDER_PHONE_LIMIT" == "3" ]] || capacity_deviation="y"
+  [[ "$PROVIDER_FAX_LIMIT" == "3" ]] || capacity_deviation="y"
+  [[ "$QUEUE_MAX_WAITING" == "5" ]] || capacity_deviation="y"
+  [[ "$PHONE_OUT_COUNTS_PROVIDER_LIMIT" == "y" ]] || capacity_deviation="y"
+  if [[ "$SIPGATE_OVERFLOW_ENABLED" == "y" ]]; then
+    reachable_phone_capacity=$((reachable_phone_capacity + SIPGATE_OVERFLOW_CHANNEL_LIMIT))
+    [[ "$SIPGATE_OVERFLOW_CHANNEL_LIMIT" == "2" ]] || capacity_deviation="y"
+  fi
+  if (( QUEUE_MAX_WAITING > reachable_phone_capacity )); then
+    echo "[WARN] Die Warteschlange (${QUEUE_MAX_WAITING}) ist groesser als die gleichzeitig erreichbare externe Telefonkapazitaet (${reachable_phone_capacity})."
+  fi
+  if [[ "$capacity_deviation" == "y" ]]; then
+    echo
+    echo "ACHTUNG: Mindestens eine Kanalgrenze weicht von den empfohlenen Vorgaben ab."
+    echo "Das kann massive Stabilitaetsprobleme, Faxabbrueche, RTP-Probleme oder Provider-Ablehnungen verursachen."
+    ask_yes_no capacity_confirm "Abweichende Werte trotzdem verbindlich uebernehmen?" "n"
+    [[ "$capacity_confirm" == "y" ]] || die "Installation wegen nicht bestaetigter Kanalgrenzen abgebrochen."
+  fi
+
+  echo "Hinweis: Bei Busy kann eine providerseitige Umleitung z.B. mit #67*Zielrufnummer# eingerichtet werden."
+  echo "Der genaue Steuercode ist provider-/anschlussabhaengig und vor Verwendung zu pruefen."
 }
 
 write_phone_options_to_env(){
@@ -715,7 +825,15 @@ import sys
 
 path = Path(sys.argv[1])
 lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-path.write_text("\n".join(line for line in lines if not line.startswith("KFX_PHONE_")) + "\n", encoding="utf-8")
+prefixes = (
+    "KFX_PHONE_",
+    "KFX_PROVIDER_CHANNEL_LIMIT=",
+    "KFX_PROVIDER_PHONE_LIMIT=",
+    "KFX_PROVIDER_FAX_LIMIT=",
+    "KFX_QUEUE_MAX_WAITING=",
+    "KFX_SIPGATE_OVERFLOW_",
+)
+path.write_text("\n".join(line for line in lines if not line.startswith(prefixes)) + "\n", encoding="utf-8")
 PY
   {
     printf '\n# optionale Telefoniewarteschlange\n'
@@ -727,6 +845,18 @@ PY
     printf 'KFX_PHONE_BIND_IP=%s\n' "$(quote_env_value "${PHONE_BIND_IP:-}")"
     printf 'KFX_PHONE_LOCAL_CIDR=%s\n' "$(quote_env_value "${PHONE_LOCAL_CIDR:-}")"
     printf 'KFX_PHONE_SEPARATE_OUTBOUND=%s\n' "${PHONE_SEPARATE_OUTBOUND:-n}"
+    printf 'KFX_PHONE_OUT_COUNTS_PROVIDER_LIMIT=%s\n' "${PHONE_OUT_COUNTS_PROVIDER_LIMIT:-y}"
+    printf 'KFX_PROVIDER_CHANNEL_LIMIT=%s\n' "${PROVIDER_CHANNEL_LIMIT:-4}"
+    printf 'KFX_PROVIDER_PHONE_LIMIT=%s\n' "${PROVIDER_PHONE_LIMIT:-3}"
+    printf 'KFX_PROVIDER_FAX_LIMIT=%s\n' "${PROVIDER_FAX_LIMIT:-3}"
+    printf 'KFX_QUEUE_MAX_WAITING=%s\n' "${QUEUE_MAX_WAITING:-5}"
+    printf 'KFX_SIPGATE_OVERFLOW_ENABLED=%s\n' "${SIPGATE_OVERFLOW_ENABLED:-n}"
+    printf 'KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT=%s\n' "${SIPGATE_OVERFLOW_CHANNEL_LIMIT:-2}"
+    printf 'KFX_SIPGATE_OVERFLOW_SIP_ID=%s\n' "$(quote_env_value "${SIPGATE_OVERFLOW_SIP_ID:-}")"
+    printf 'KFX_SIPGATE_OVERFLOW_SIP_PASSWORD=%s\n' "$(quote_env_value "${SIPGATE_OVERFLOW_SIP_PASSWORD:-}")"
+    printf 'KFX_SIPGATE_OVERFLOW_DID=%s\n' "$(quote_env_value "${SIPGATE_OVERFLOW_DID:-}")"
+    printf 'KFX_SIPGATE_OVERFLOW_DOMAIN=%s\n' "$(quote_env_value "${SIPGATE_OVERFLOW_DOMAIN:-sipconnect.sipgate.de}")"
+    printf 'KFX_SIPGATE_OVERFLOW_IDENTIFY_MATCH=%s\n' "$(quote_env_value "${SIPGATE_OVERFLOW_IDENTIFY_MATCH:-217.10.68.150}")"
     for prefix in PHONE_IN PHONE_OUT; do
       for suffix in PROVIDER PROVIDER_LABEL SIP_USER SIP_NUMBER SIP_PASSWORD SIP_DOMAIN SIP_OUTBOUND_PROXY SIP_IDENTIFY_MATCH SIP_EXPIRATION; do
         source_var="${prefix}_${suffix}"
@@ -877,8 +1007,8 @@ if [[ "$RESET_OPTS" == "n" ]]; then
     RESET_OPTS="y"
   else
     log "[OK] Verwende vorhandene Grundkonfiguration aus ${ENVFILE}"
-    if [[ -z "${KFX_PHONE_QUEUE_ENABLED+x}" ]]; then
-      sep "Neue Grundoption: optionale Telefoniewarteschlange"
+    if [[ -z "${KFX_PHONE_QUEUE_ENABLED+x}" || -z "${KFX_PROVIDER_CHANNEL_LIMIT+x}" || -z "${KFX_PROVIDER_PHONE_LIMIT+x}" || -z "${KFX_PROVIDER_FAX_LIMIT+x}" || -z "${KFX_QUEUE_MAX_WAITING+x}" || -z "${KFX_PHONE_OUT_COUNTS_PROVIDER_LIMIT+x}" || -z "${KFX_SIPGATE_OVERFLOW_ENABLED+x}" ]]; then
+      sep "Neue Grundoptionen: Telefoniewarteschlange und Kanalgrenzen"
       collect_phone_options
       write_phone_options_to_env "$ENVFILE"
       # shellcheck disable=SC1090
@@ -1890,6 +2020,35 @@ wait_for_asterisk_cli(){
 }
 
 install_asterisk_systemd_unit(){
+  install -d -m 0755 /usr/local/sbin
+  cat >/usr/local/sbin/kienzlefax-wait-asterisk-network <<'SCRIPT'
+#!/usr/bin/env bash
+set -u
+
+ENVFILE="/etc/kienzlefax-installer.env"
+[[ -r "$ENVFILE" ]] || exit 0
+# shellcheck disable=SC1090
+source "$ENVFILE"
+
+[[ "${KFX_PHONE_QUEUE_ENABLED:-n}" == "y" ]] || exit 0
+BIND_IP="${KFX_PHONE_BIND_IP:-}"
+[[ -n "$BIND_IP" ]] || exit 0
+
+for (( waited=0; waited<90; waited++ )); do
+  while IFS= read -r line; do
+    case "$line" in
+      *" ${BIND_IP}/"*) exit 0 ;;
+    esac
+  done < <(ip -o -4 addr show 2>/dev/null || true)
+  sleep 1
+done
+
+echo "KienzleFax: interne Asterisk-Bind-Adresse ${BIND_IP} nach 90 Sekunden nicht vorhanden." >&2
+exit 1
+SCRIPT
+  chmod 0755 /usr/local/sbin/kienzlefax-wait-asterisk-network
+  chown root:root /usr/local/sbin/kienzlefax-wait-asterisk-network
+
   cat >/etc/systemd/system/asterisk.service <<'UNIT'
 [Unit]
 Description=Asterisk PBX
@@ -1899,6 +2058,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=LD_LIBRARY_PATH=/usr/lib
+ExecStartPre=/usr/local/sbin/kienzlefax-wait-asterisk-network
 ExecStart=/usr/sbin/asterisk -f -C /etc/asterisk/asterisk.conf
 ExecReload=/usr/sbin/asterisk -rx "core reload"
 ExecStop=/usr/sbin/asterisk -rx "core stop now"
@@ -2428,6 +2588,18 @@ generated = datetime.now().astimezone().replace(microsecond=0).isoformat()
 hostname = env.get("HOST", "")
 ips = env.get("IPS", "")
 
+capacity_lines = [
+    "Kanalbegrenzung Haupt-SIP-Leitung:",
+    f"- Gesamt: maximal {e('KFX_PROVIDER_CHANNEL_LIMIT', '4')} gleichzeitige externe Kanaele",
+    f"- Telefonie: maximal {e('KFX_PROVIDER_PHONE_LIMIT', '3')} gleichzeitige Kanaele",
+    f"- Fax: maximal {e('KFX_PROVIDER_FAX_LIMIT', '3')} gleichzeitig, eingehend und ausgehend",
+    "- Gesamt- und jeweilige Teilgrenze gelten gleichzeitig.",
+    "- Interne Telefonate zaehlen nicht.",
+    "- Ausgehende Faxe warten bei voller Kapazitaet ohne Verbrauch eines Sendeversuchs.",
+    "- Zu hohe oder abweichende Werte koennen massive Stabilitaets-, RTP-, Fax- und Providerprobleme verursachen.",
+    "",
+]
+
 phone_lines = []
 if e("KFX_PHONE_QUEUE_ENABLED", "n") == "y":
     first = int(e("KFX_PHONE_FIRST_EXTENSION", "201"))
@@ -2436,12 +2608,17 @@ if e("KFX_PHONE_QUEUE_ENABLED", "n") == "y":
     phone_lines = [
         "Telefoniewarteschlange:",
         f"- Nebenstellen: {first} bis {last} ({count} Telefone)",
+        f"- Haupt-SIP-Leitung: maximal {e('KFX_PROVIDER_CHANNEL_LIMIT', '4')} Kanaele insgesamt",
+        f"- Haupt-SIP-Leitung: maximal {e('KFX_PROVIDER_PHONE_LIMIT', '3')} Telefoniekanaele",
+        f"- Haupt-SIP-Leitung: maximal {e('KFX_PROVIDER_FAX_LIMIT', '3')} Faxkanaele (ein- und ausgehend)",
+        f"- Warteschlange: maximal {e('KFX_QUEUE_MAX_WAITING', '5')} wartende Anrufer",
         f"- Interne SIP-Adresse/Registrar: {e('KFX_PHONE_BIND_IP')}:{e('KFX_PHONE_INTERNAL_PORT', '5060')}",
         f"- Erkannte Schnittstelle: {e('KFX_PHONE_BIND_IFACE', '-')}",
         f"- Erkanntes internes Netz: {e('KFX_PHONE_LOCAL_CIDR', '-')}",
         "- Keine Firewallregeln wurden eingerichtet; Routing und Firewall bleiben Aufgabe des Betreibers.",
         "- Lokale Telefonkonten sind per PJSIP-ACL auf das erkannte interne Netz beschraenkt.",
-        "- Alle belegtrelevanten ein-, aus- und internen Telefonate muessen ueber Asterisk laufen.",
+        "- Alle externen ein- und ausgehenden Telefonate muessen fuer verlaessliche Grenzen ueber Asterisk laufen.",
+        "- Interne Telefonate zwischen lokalen Nebenstellen zaehlen nicht zur Providergrenze.",
         "- Direkte FRITZ!Box-Gespraeche sind fuer den Queue-Belegtstatus nicht sichtbar.",
         "- Wartesignal: Klingelzeichen; neutrale deutsche Warteansage erstmals nach 60 Sekunden und danach minuetlich.",
         f"- Eingangsprovider: {e('KFX_PHONE_IN_PROVIDER_LABEL', e('KFX_PHONE_IN_PROVIDER', '-'))}",
@@ -2457,9 +2634,19 @@ if e("KFX_PHONE_QUEUE_ENABLED", "n") == "y":
             f"- Ausgangs-SIP-Nummer: {e('KFX_PHONE_OUT_SIP_NUMBER')}",
             f"- Ausgangs-SIP-Passwort: {e('KFX_PHONE_OUT_SIP_PASSWORD')}",
             f"- Ausgangs-SIP-Registrar: {e('KFX_PHONE_OUT_SIP_DOMAIN', '-')}",
+            f"- Ausgangsleitung zaehlt zur Haupt-Kanalgrenze: {'ja' if e('KFX_PHONE_OUT_COUNTS_PROVIDER_LIMIT', 'y') == 'y' else 'nein'}",
         ])
     else:
         phone_lines.append("- Ausgehende Telefonate verwenden dieselbe SIP-Leitung wie eingehende Telefonate.")
+    if e("KFX_SIPGATE_OVERFLOW_ENABLED", "n") == "y":
+        phone_lines.extend([
+            "Sipgate-Ueberlauf:",
+            f"- Registrar: {e('KFX_SIPGATE_OVERFLOW_DOMAIN', 'sipconnect.sipgate.de')}",
+            f"- SIP-ID: {e('KFX_SIPGATE_OVERFLOW_SIP_ID')}",
+            f"- SIP-Passwort: {e('KFX_SIPGATE_OVERFLOW_SIP_PASSWORD')}",
+            f"- Ueberlauf-DID: {e('KFX_SIPGATE_OVERFLOW_DID')}",
+            f"- Separate additive Kanalgrenze: {e('KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT', '2')}",
+        ])
     phone_lines.append("Lokale PJSIP-Konten fuer die FRITZ!Box:")
     for index, extension in enumerate(range(first, last + 1), start=1):
         phone_lines.append(
@@ -2468,6 +2655,9 @@ if e("KFX_PHONE_QUEUE_ENABLED", "n") == "y":
     phone_lines.extend([
         "- Jede lokale Rufnummer in der FRITZ!Box genau einem Empfangstelefon zuordnen.",
         "- Alte Asterisk-Systeme und direkte Provider-Registrierungen derselben Rufnummern deaktivieren; sonst stellt der Provider Anrufe parallel oder am falschen System zu.",
+        "- Volle Telefonkapazitaet wird vor Annahme mit SIP Busy abgewiesen.",
+        "- Providerseitige Busy-Umleitung z.B. mit #67*Zielrufnummer# einrichten; Steuercode provider-/anschlussabhaengig pruefen.",
+        "- Abweichende oder zu hohe Kanalwerte koennen massive Stabilitaets-, RTP-, Fax- und Providerprobleme verursachen.",
         "",
     ])
 
@@ -2500,6 +2690,7 @@ lines = [
     "- Samba Benutzer: admin",
     "- Samba Passwort: identisch mit Admin Passwort",
     "",
+    *capacity_lines,
     *phone_lines,
     "Fax-Portweiterleitungen im Router, nur fuer Fax-Kommunikation:",
     f"- UDP {e('KFX_SIP_BIND_PORT', '5070')} -> KienzleFax-System (SIP/PJSIP)",
@@ -2715,6 +2906,9 @@ export KFX_FAX_DID KFX_SIP_BIND_PORT KFX_PJSIP_ENDPOINT
 export KFX_RTP_START KFX_RTP_END KFX_AST_REF KFX_AMI_SECRET
 export KFX_PHONE_QUEUE_ENABLED KFX_PHONE_COUNT KFX_PHONE_FIRST_EXTENSION KFX_PHONE_INTERNAL_PORT
 export KFX_PHONE_BIND_IFACE KFX_PHONE_BIND_IP KFX_PHONE_LOCAL_CIDR KFX_PHONE_SEPARATE_OUTBOUND
+export KFX_PHONE_OUT_COUNTS_PROVIDER_LIMIT KFX_PROVIDER_CHANNEL_LIMIT KFX_PROVIDER_PHONE_LIMIT KFX_PROVIDER_FAX_LIMIT KFX_QUEUE_MAX_WAITING
+export KFX_SIPGATE_OVERFLOW_ENABLED KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT KFX_SIPGATE_OVERFLOW_SIP_ID
+export KFX_SIPGATE_OVERFLOW_SIP_PASSWORD KFX_SIPGATE_OVERFLOW_DID KFX_SIPGATE_OVERFLOW_DOMAIN KFX_SIPGATE_OVERFLOW_IDENTIFY_MATCH
 export KFX_PHONE_IN_PROVIDER KFX_PHONE_IN_PROVIDER_LABEL KFX_PHONE_IN_SIP_USER KFX_PHONE_IN_SIP_NUMBER
 export KFX_PHONE_IN_SIP_PASSWORD KFX_PHONE_IN_SIP_DOMAIN KFX_PHONE_IN_SIP_OUTBOUND_PROXY KFX_PHONE_IN_SIP_IDENTIFY_MATCH KFX_PHONE_IN_SIP_EXPIRATION
 export KFX_PHONE_OUT_PROVIDER KFX_PHONE_OUT_PROVIDER_LABEL KFX_PHONE_OUT_SIP_USER KFX_PHONE_OUT_SIP_NUMBER
@@ -2745,6 +2939,19 @@ export AMI_SECRET="${AMI_SECRET:-$KFX_AMI_PASS}"
 # ------------------------------------------------------------------------------
 # Remote scripts execution
 # ------------------------------------------------------------------------------
+KFX_RESTART_WORKER_ON_EXIT="n"
+restart_worker_after_failed_update(){
+  if [[ "$KFX_RESTART_WORKER_ON_EXIT" == "y" ]]; then
+    systemctl start kienzlefax-worker >/dev/null 2>&1 || true
+  fi
+}
+trap restart_worker_after_failed_update EXIT
+if systemctl is-active --quiet kienzlefax-worker 2>/dev/null; then
+  KFX_RESTART_WORKER_ON_EXIT="y"
+  log "[INFO] Stoppe kienzlefax-worker kurz fuer die atomare AGI-/Dialplan-/Worker-Aktualisierung."
+  systemctl stop kienzlefax-worker
+fi
+
 sep "Remote Provider-PJSIP (befüllt pjsip.conf)"
 run_remote_script "${MOD_CACHE}/pjsip-provider.sh"
 asterisk_rx "pjsip reload"
@@ -2764,6 +2971,8 @@ run_remote_script "${MOD_CACHE}/worker.sh"
 
 sep "Worker: /etc/default + systemd Unit (EnvironmentFile)"
 run_module "${MOD_DIR}/90-worker-unit.sh"
+KFX_RESTART_WORKER_ON_EXIT="n"
+trap - EXIT
 
 sep "Remote pdf_with_header.sh installieren"
 run_remote_script "${MOD_CACHE}/pdf_with_header.sh"
@@ -2785,6 +2994,7 @@ asterisk_rx "module show like res_pjsip.so"
 asterisk_rx "pjsip show transports"
 asterisk_rx "pjsip show registrations"
 asterisk_rx "queue show"
+asterisk_rx "group show channels"
 if [[ "${KFX_PHONE_QUEUE_ENABLED:-n}" == "y" ]]; then
   asterisk_rx "pjsip show transport transport-kfx-phone"
 fi
@@ -2808,6 +3018,12 @@ if [[ "${KFX_PHONE_QUEUE_ENABLED:-n}" == "y" ]]; then
   echo "Interner SIP-Registrar: ${KFX_PHONE_BIND_IP}:${KFX_PHONE_INTERNAL_PORT}"
   echo "Internes SIP-Netz: ${KFX_PHONE_LOCAL_CIDR}"
   echo "Nebenstellen: ${KFX_PHONE_FIRST_EXTENSION}-$((KFX_PHONE_FIRST_EXTENSION + KFX_PHONE_COUNT - 1))"
+  echo "Hauptleitung: max. ${KFX_PROVIDER_CHANNEL_LIMIT} insgesamt / ${KFX_PROVIDER_PHONE_LIMIT} Telefonie / ${KFX_PROVIDER_FAX_LIMIT} Fax"
+  echo "Warteschlange: max. ${KFX_QUEUE_MAX_WAITING} wartende Anrufer"
+  if [[ "${KFX_SIPGATE_OVERFLOW_ENABLED:-n}" == "y" ]]; then
+    echo "Sipgate-Ueberlauf: aktiv, separate additive Grenze ${KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT}"
+  fi
+  echo "Busy-Umleitung netzseitig z.B. #67*Zielrufnummer#; Steuercode beim Provider pruefen"
   echo "Externe Registrierung der lokalen Endpunkte: per PJSIP-Netzbeschraenkung gesperrt"
   echo "Firewall: unveraendert (keine Regeln durch Installer)"
   echo "WICHTIG: Alte Asterisk-Systeme und direkte Provider-Registrierungen derselben Rufnummern muessen deaktiviert sein."

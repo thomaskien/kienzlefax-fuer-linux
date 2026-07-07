@@ -1,10 +1,14 @@
+#!/usr/bin/env bash
+# IMMER verwenden wenn der KienzleFax-Worker fuer AMI-Faxversand, Retry und Kapazitaetsrueckstellung installiert wird.
+set -euo pipefail
+
 sudo tee /usr/local/bin/kienzlefax-worker.py >/dev/null <<'PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 kienzlefax-worker.py — Asterisk-Only Worker (SendFAX)
-Version: 1.3.18
-Stand:  2026-06-27
+Version: 1.3.19
+Stand:  2026-07-07
 Autor:  Dr. Thomas Kienzle
 
 Changelog (komplett):
@@ -92,6 +96,11 @@ Changelog (komplett):
     `.job.lock`, liest den Status innerhalb des Locks erneut und fuegt nur Live-Daten
     in weiterhin aktive Jobs ein. Dadurch kann ein veralteter Live-Snapshot kein
     bereits geschriebenes send_end-Ergebnis mehr ueberschreiben.
+- 1.3.19:
+  - Versuchszahl wird nicht mehr beim AMI-Submit, sondern erst durch das AGI-Ereignis
+    dial_start nach erfolgreicher Provider-Kapazitaetsreservierung erhoeht.
+  - Status DEFERRED bei voller externer Kapazitaet wird nach dem normalen Cooldown
+    ohne Verbrauch eines Sendeversuchs in die Queue zurueckgestellt.
 """
 
 import fcntl
@@ -610,7 +619,7 @@ def count_inflight() -> int:
         except Exception:
             continue
         st = _st_norm(job)
-        if st in ("CLAIMED", "SUBMITTED", "PROCESSING", "CALLING", "SENDING"):
+        if st in ("CLAIMED", "SUBMITTED", "PROCESSING", "CALLING", "SENDING", "DEFERRED"):
             n += 1
     return n
 
@@ -625,7 +634,7 @@ def get_busy_numbers() -> set[str]:
         except Exception:
             continue
         st = _st_norm(job)
-        if st in ("CLAIMED", "SUBMITTED", "PROCESSING", "CALLING", "SENDING", "RETRY_WAIT"):
+        if st in ("CLAIMED", "SUBMITTED", "PROCESSING", "CALLING", "SENDING", "DEFERRED", "RETRY_WAIT"):
             num = normalize_number(((job.get("recipient") or {}).get("number") or ""))
             if num:
                 busy.add(num)
@@ -747,7 +756,7 @@ def build_report_pdf(job: Dict[str, Any], out_pdf: Path) -> None:
             y -= 16
 
     c.setFont("Helvetica", 9)
-    c.drawString(50, 40, f"Erzeugt: {now_iso()}  |  kienzlefax-worker v1.3.18")
+    c.drawString(50, 40, f"Erzeugt: {now_iso()}  |  kienzlefax-worker v1.3.19")
     c.showPage()
     c.save()
 
@@ -903,7 +912,7 @@ def _attempt_limit_reached(job: Dict[str, Any]) -> bool:
         mx_int = int(mx) if mx is not None else 0
     except Exception:
         mx_int = 0
-    return (mx_int > 0 and cur > mx_int)
+    return (mx_int > 0 and cur >= mx_int)
 
 def submit_job(jobdir: Path) -> None:
     global _next_submit_ts
@@ -946,8 +955,6 @@ def submit_job(jobdir: Path) -> None:
         prev = int(a.get("current") or 0)
     except Exception:
         prev = 0
-    a["current"] = prev + 1
-    a["started_at"] = job["submitted_at"]
 
     r = job.get("retry") or {}
     if r.get("max") is not None:
@@ -975,7 +982,7 @@ def submit_job(jobdir: Path) -> None:
         ami_originate_local(jobid=str(job.get("job_id") or jobdir.name),
                             exten=number,
                             tiff_path=str(tiff))
-        log(f"submitted via AMI -> {jobdir.name} exten={number} attempt={a.get('current')} wait={AMI_ORIGINATE_WAIT_SEC}s")
+        log(f"submitted via AMI -> {jobdir.name} exten={number} next_attempt={prev + 1} wait={AMI_ORIGINATE_WAIT_SEC}s")
     except Exception as e:
         job = read_json(jp)
         job["status"] = "FAILED"
@@ -1393,6 +1400,23 @@ def step_finalize_processing() -> None:
 
         st = _st_norm(job)
 
+        if st == "DEFERRED":
+            try:
+                delay = max(1, int(POST_CALL_COOLDOWN_SEC))
+                retry = job.setdefault("retry", {})
+                retry["last_reason"] = "EXTERNAL_CAPACITY_FULL"
+                retry["suggested_delay_sec"] = delay
+                retry["next_try_at"] = (
+                    datetime.now(timezone.utc) + timedelta(seconds=delay)
+                ).replace(microsecond=0).isoformat()
+                job.setdefault("result", {})["reason"] = "EXTERNAL_CAPACITY_FULL"
+                requeue_retry(jdir, job)
+                log(f"capacity deferred without attempt -> {jdir.name} cooldown={delay}s")
+            except Exception as e:
+                log(f"capacity defer requeue exception {jdir.name}: {e}")
+            _next_submit_ts = time.time() + POST_CALL_COOLDOWN_SEC
+            continue
+
         if mark_orphaned_call_for_retry(jdir, job):
             _next_submit_ts = time.time() + POST_CALL_COOLDOWN_SEC
             continue
@@ -1495,7 +1519,7 @@ def step_submit() -> None:
 def main() -> None:
     ensure_dirs()
     acquire_lock()
-    log("started (v1.3.18)")
+    log("started (v1.3.19)")
     try:
         while True:
             step_update_asterisk_fax_live()
