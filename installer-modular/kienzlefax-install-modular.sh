@@ -2,7 +2,7 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.3.17
+# Version: 3.3.18
 # Stand:   2026-07-07
 # Autor:   Dr. Thomas Kienzle
 #
@@ -186,6 +186,13 @@
 # - Falls `apt-get download asterisk-prompt-de` das Paket in der aktuellen Debian-Suite
 #   nicht findet, wird das offizielle Debian-All-Paket direkt aus deb.debian.org geladen.
 # - Weiterhin werden nur die Audiodateien extrahiert; ein Debian-Asterisk-Paket wird nicht installiert.
+#
+# NEU in 3.3.18:
+# - Queue-only erzeugt PJSIP-, Dialplan- und Queue-Dateien bei jedem Installerlauf erneut
+#   aus `/etc/kienzlefax-installer.env`, unabhaengig von einem Remote-Moduldownload.
+# - Abfrage fuer Erreichbarkeit lokaler SIP-Nebenstellen aus anderen Netzen/Internet;
+#   bei Aktivierung wird ein erlaubtes Quellnetz abgefragt und deutlich gewarnt.
+# - Progressive Klingelstufen wechseln jetzt alle 20 statt alle 15 Sekunden.
 # ==============================================================================
 
 set -euo pipefail
@@ -712,6 +719,17 @@ if address.version != 4 or network.version != 4 or address not in network:
 PY
 }
 
+validate_ipv4_network(){
+  python3 - "$1" <<'PY'
+import ipaddress
+import sys
+
+network = ipaddress.ip_network(sys.argv[1], strict=False)
+if network.version != 4:
+    raise SystemExit(1)
+PY
+}
+
 collect_phone_options(){
   PHONE_QUEUE_ENABLED="n"
   PHONE_COUNT="0"
@@ -720,6 +738,8 @@ collect_phone_options(){
   PHONE_BIND_IFACE=""
   PHONE_BIND_IP=""
   PHONE_LOCAL_CIDR=""
+  PHONE_REMOTE_ACCESS_ENABLED="n"
+  PHONE_ALLOWED_CIDR=""
   PHONE_SEPARATE_OUTBOUND="n"
   PHONE_OUT_COUNTS_PROVIDER_LIMIT="y"
   PROVIDER_CHANNEL_LIMIT="4"
@@ -787,6 +807,17 @@ collect_phone_options(){
       || die "Interne Telefonie-IP '${PHONE_BIND_IP}' liegt nicht im Netz '${PHONE_LOCAL_CIDR}'."
     [[ "$PHONE_INTERNAL_PORT" != "${SIP_BIND_PORT:-${KFX_SIP_BIND_PORT:-5070}}" ]] \
       || die "Interner Telefonie-Port und externer Provider-Port duerfen nicht identisch sein."
+
+    ask_yes_no PHONE_REMOTE_ACCESS_ENABLED \
+      "Sollen sich SIP-Nebenstellen auch aus anderen Netzen bzw. dem Internet registrieren duerfen?" "n"
+    if [[ "$PHONE_REMOTE_ACCESS_ENABLED" == "y" ]]; then
+      echo "[WARN] EXTERNE SIP-REGISTRIERUNG: Port ${PHONE_INTERNAL_PORT}/UDP kann dadurch Angriffen ausgesetzt sein."
+      echo "[WARN] Der Installer richtet weiterhin keine Firewall ein. Sichere Passwoerter, Quellnetzbegrenzung und Schutzmassnahmen sind Betreiberaufgabe."
+      ask_default PHONE_ALLOWED_CIDR "Erlaubtes Quellnetz fuer SIP-Endgeraete (CIDR; gesamtes Internet = 0.0.0.0/0)" "0.0.0.0/0"
+      validate_ipv4_network "$PHONE_ALLOWED_CIDR" || die "Ungueltiges erlaubtes IPv4-Quellnetz: ${PHONE_ALLOWED_CIDR}"
+    else
+      PHONE_ALLOWED_CIDR="$PHONE_LOCAL_CIDR"
+    fi
 
     collect_phone_provider_config PHONE_IN "die eingehende Telefonieleitung"
     local fax_did="${FAX_DID:-${KFX_FAX_DID:-}}"
@@ -884,6 +915,8 @@ PY
     printf 'KFX_PHONE_BIND_IFACE=%s\n' "$(quote_env_value "${PHONE_BIND_IFACE:-}")"
     printf 'KFX_PHONE_BIND_IP=%s\n' "$(quote_env_value "${PHONE_BIND_IP:-}")"
     printf 'KFX_PHONE_LOCAL_CIDR=%s\n' "$(quote_env_value "${PHONE_LOCAL_CIDR:-}")"
+    printf 'KFX_PHONE_REMOTE_ACCESS_ENABLED=%s\n' "${PHONE_REMOTE_ACCESS_ENABLED:-n}"
+    printf 'KFX_PHONE_ALLOWED_CIDR=%s\n' "$(quote_env_value "${PHONE_ALLOWED_CIDR:-${PHONE_LOCAL_CIDR:-}}")"
     printf 'KFX_PHONE_SEPARATE_OUTBOUND=%s\n' "${PHONE_SEPARATE_OUTBOUND:-n}"
     printf 'KFX_PHONE_OUT_COUNTS_PROVIDER_LIMIT=%s\n' "${PHONE_OUT_COUNTS_PROVIDER_LIMIT:-y}"
     printf 'KFX_PROVIDER_CHANNEL_LIMIT=%s\n' "${PROVIDER_CHANNEL_LIMIT:-4}"
@@ -1071,7 +1104,7 @@ if [[ "$RESET_OPTS" == "n" ]]; then
     RESET_OPTS="y"
   else
     log "[OK] Verwende vorhandene Grundkonfiguration aus ${ENVFILE}"
-    if [[ -z "${KFX_PHONE_QUEUE_ENABLED+x}" || -z "${KFX_PROVIDER_CHANNEL_LIMIT+x}" || -z "${KFX_PROVIDER_PHONE_LIMIT+x}" || -z "${KFX_PROVIDER_FAX_LIMIT+x}" || -z "${KFX_QUEUE_MAX_WAITING+x}" || -z "${KFX_PHONE_OUT_COUNTS_PROVIDER_LIMIT+x}" || -z "${KFX_SIPGATE_OVERFLOW_ENABLED+x}" ]]; then
+    if [[ -z "${KFX_PHONE_QUEUE_ENABLED+x}" || -z "${KFX_PHONE_REMOTE_ACCESS_ENABLED+x}" || -z "${KFX_PHONE_ALLOWED_CIDR+x}" || -z "${KFX_PROVIDER_CHANNEL_LIMIT+x}" || -z "${KFX_PROVIDER_PHONE_LIMIT+x}" || -z "${KFX_PROVIDER_FAX_LIMIT+x}" || -z "${KFX_QUEUE_MAX_WAITING+x}" || -z "${KFX_PHONE_OUT_COUNTS_PROVIDER_LIMIT+x}" || -z "${KFX_SIPGATE_OVERFLOW_ENABLED+x}" ]]; then
       sep "Neue Grundoptionen: Telefoniewarteschlange und Kanalgrenzen"
       collect_phone_options
       write_phone_options_to_env "$ENVFILE"
@@ -2741,6 +2774,8 @@ if e("KFX_PHONE_QUEUE_ENABLED", "n") == "y":
         f"- Interne SIP-Adresse/Registrar: {e('KFX_PHONE_BIND_IP')}:{e('KFX_PHONE_INTERNAL_PORT', '5060')}",
         f"- Erkannte Schnittstelle: {e('KFX_PHONE_BIND_IFACE', '-')}",
         f"- Erkanntes internes Netz: {e('KFX_PHONE_LOCAL_CIDR', '-')}",
+        f"- SIP-Endgeraete aus anderen Netzen/Internet: {'ja' if e('KFX_PHONE_REMOTE_ACCESS_ENABLED', 'n') == 'y' else 'nein'}",
+        f"- Erlaubtes Quellnetz fuer SIP-Endgeraete: {e('KFX_PHONE_ALLOWED_CIDR', e('KFX_PHONE_LOCAL_CIDR', '-'))}",
         "- Keine Firewallregeln wurden eingerichtet; Routing und Firewall bleiben Aufgabe des Betreibers.",
         "- Lokale Telefonkonten sind per PJSIP-ACL auf das erkannte interne Netz beschraenkt.",
         "- Alle externen ein- und ausgehenden Telefonate muessen fuer verlaessliche Grenzen ueber Asterisk laufen.",
@@ -3041,7 +3076,7 @@ export KFX_SIP_USER KFX_SIP_NUMBER KFX_SIP_PASSWORD KFX_SIP_DOMAIN KFX_SIP_OUTBO
 export KFX_FAX_DID KFX_SIP_BIND_PORT KFX_PJSIP_ENDPOINT
 export KFX_RTP_START KFX_RTP_END KFX_AST_REF KFX_AMI_SECRET
 export KFX_PHONE_QUEUE_ENABLED KFX_PHONE_COUNT KFX_PHONE_FIRST_EXTENSION KFX_PHONE_INTERNAL_PORT
-export KFX_PHONE_BIND_IFACE KFX_PHONE_BIND_IP KFX_PHONE_LOCAL_CIDR KFX_PHONE_SEPARATE_OUTBOUND
+export KFX_PHONE_BIND_IFACE KFX_PHONE_BIND_IP KFX_PHONE_LOCAL_CIDR KFX_PHONE_REMOTE_ACCESS_ENABLED KFX_PHONE_ALLOWED_CIDR KFX_PHONE_SEPARATE_OUTBOUND
 export KFX_PHONE_OUT_COUNTS_PROVIDER_LIMIT KFX_PROVIDER_CHANNEL_LIMIT KFX_PROVIDER_PHONE_LIMIT KFX_PROVIDER_FAX_LIMIT KFX_QUEUE_MAX_WAITING
 export KFX_SIPGATE_OVERFLOW_ENABLED KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT KFX_SIPGATE_OVERFLOW_SIP_ID
 export KFX_SIPGATE_OVERFLOW_SIP_PASSWORD KFX_SIPGATE_OVERFLOW_DID KFX_SIPGATE_OVERFLOW_DOMAIN KFX_SIPGATE_OVERFLOW_IDENTIFY_MATCH
@@ -3086,6 +3121,10 @@ if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]] && systemctl is-active --quiet kienzlefax
   KFX_RESTART_WORKER_ON_EXIT="y"
   log "[INFO] Stoppe kienzlefax-worker kurz fuer die atomare AGI-/Dialplan-/Worker-Aktualisierung."
   systemctl stop kienzlefax-worker
+fi
+
+if [[ "${KFX_QUEUE_ONLY:-n}" == "y" ]]; then
+  log "[INFO] Queue-only: PJSIP, Dialplan und Queue werden jetzt aus ${ENVFILE} neu erzeugt."
 fi
 
 sep "Remote Provider-PJSIP (befüllt pjsip.conf)"
@@ -3166,6 +3205,11 @@ if [[ "${KFX_PHONE_QUEUE_ENABLED:-n}" == "y" ]]; then
   echo "Telefoniewarteschlange: aktiv"
   echo "Interner SIP-Registrar: ${KFX_PHONE_BIND_IP}:${KFX_PHONE_INTERNAL_PORT}"
   echo "Internes SIP-Netz: ${KFX_PHONE_LOCAL_CIDR}"
+  if [[ "${KFX_PHONE_REMOTE_ACCESS_ENABLED:-n}" == "y" ]]; then
+    echo "Externe SIP-Endgeraete: erlaubt aus ${KFX_PHONE_ALLOWED_CIDR} (Firewall/Schutz nicht durch Installer)"
+  else
+    echo "Externe SIP-Endgeraete: nicht erlaubt"
+  fi
   echo "Nebenstellen: ${KFX_PHONE_FIRST_EXTENSION}-$((KFX_PHONE_FIRST_EXTENSION + KFX_PHONE_COUNT - 1))"
   if [[ "${KFX_QUEUE_ONLY:-n}" == "y" ]]; then
     echo "Hauptleitung: max. ${KFX_PROVIDER_CHANNEL_LIMIT} insgesamt / ${KFX_PROVIDER_PHONE_LIMIT} Telefonie"

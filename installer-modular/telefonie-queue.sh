@@ -33,6 +33,8 @@ FIRST_EXTENSION="${KFX_PHONE_FIRST_EXTENSION:-201}"
 PHONE_PORT="${KFX_PHONE_INTERNAL_PORT:-5060}"
 PHONE_BIND_IP="${KFX_PHONE_BIND_IP:-}"
 PHONE_LOCAL_CIDR="${KFX_PHONE_LOCAL_CIDR:-}"
+PHONE_REMOTE_ACCESS_ENABLED="${KFX_PHONE_REMOTE_ACCESS_ENABLED:-n}"
+PHONE_ALLOWED_CIDR="${KFX_PHONE_ALLOWED_CIDR:-$PHONE_LOCAL_CIDR}"
 PROVIDER_CHANNEL_LIMIT="${KFX_PROVIDER_CHANNEL_LIMIT:-4}"
 PROVIDER_PHONE_LIMIT="${KFX_PROVIDER_PHONE_LIMIT:-3}"
 PROVIDER_FAX_LIMIT="${KFX_PROVIDER_FAX_LIMIT:-3}"
@@ -138,6 +140,19 @@ network = ipaddress.ip_network(sys.argv[2], strict=False)
 if address.version != 4 or network.version != 4 or address not in network:
     raise SystemExit(1)
 PY
+  python3 - "$PHONE_ALLOWED_CIDR" <<'PY'
+import ipaddress
+import sys
+
+network = ipaddress.ip_network(sys.argv[1], strict=False)
+if network.version != 4:
+    raise SystemExit(1)
+PY
+  [[ "$PHONE_REMOTE_ACCESS_ENABLED" == "y" || "$PHONE_REMOTE_ACCESS_ENABLED" == "n" ]] \
+    || die "KFX_PHONE_REMOTE_ACCESS_ENABLED muss y oder n sein."
+  if [[ "$PHONE_REMOTE_ACCESS_ENABLED" != "y" && "$PHONE_ALLOWED_CIDR" != "$PHONE_LOCAL_CIDR" ]]; then
+    die "Ohne externe SIP-Erreichbarkeit muss KFX_PHONE_ALLOWED_CIDR dem internen Netz entsprechen."
+  fi
   command -v ip >/dev/null 2>&1 || die "ip aus iproute2 fehlt."
   ip -o -4 addr show | awk -v ip="$PHONE_BIND_IP" '{split($4, a, "/"); if (a[1] == ip) found=1} END {exit found ? 0 : 1}' \
     || die "Interne Bind-IP ${PHONE_BIND_IP} ist auf diesem System nicht aktiv. Optionen bitte neu setzen."
@@ -403,9 +418,9 @@ rtp_symmetric=yes
 force_rport=yes
 device_state_busy_at=1
 deny=0.0.0.0/0.0.0.0
-permit=${PHONE_LOCAL_CIDR}
+permit=${PHONE_ALLOWED_CIDR}
 contact_deny=0.0.0.0/0.0.0.0
-contact_permit=${PHONE_LOCAL_CIDR}
+contact_permit=${PHONE_ALLOWED_CIDR}
 EOF
   done
 
@@ -571,8 +586,8 @@ autofill=yes
 ringinuse=no
 joinempty=yes
 leavewhenempty=no
-; 14 Sekunden Rufversuch + 1 Sekunde Retry = naechste Prioritaetsstufe nach 15 Sekunden
-timeout=14
+; 19 Sekunden Rufversuch + 1 Sekunde Retry = naechste Prioritaetsstufe nach 20 Sekunden
+timeout=19
 retry=1
 defaultrule=kfx-phone-progressive
 ; Warteposition sofort beim Eintritt und danach hoechstens einmal pro Minute ansagen.
@@ -597,7 +612,7 @@ EOF
 [kfx-phone-progressive]
 EOF
   for (( index=1; index<PHONE_COUNT; index++ )); do
-    printf 'penaltychange => %s,,,%s\n' "$((index * 15))" "$index" >>"$QUEUE_RULES_TMP"
+    printf 'penaltychange => %s,,,%s\n' "$((index * 20))" "$index" >>"$QUEUE_RULES_TMP"
   done
 else
   printf '; Telefoniewarteschlange ist deaktiviert.\n' >"$PJSIP_TMP"
@@ -680,6 +695,11 @@ if [[ "$PHONE_ENABLED" == "y" ]]; then
   echo "[INFO] Interne SIP-Schnittstelle: ${KFX_PHONE_BIND_IFACE:-unbekannt}"
   echo "[INFO] Interner SIP-Registrar: ${PHONE_BIND_IP}:${PHONE_PORT}"
   echo "[INFO] Zulaessiges internes SIP-Netz: ${PHONE_LOCAL_CIDR}"
+  if [[ "$PHONE_REMOTE_ACCESS_ENABLED" == "y" ]]; then
+    echo "[WARN] SIP-Nebenstellen aus anderen Netzen/Internet erlaubt; Quellnetz: ${PHONE_ALLOWED_CIDR}."
+  else
+    echo "[INFO] SIP-Nebenstellen nur aus dem internen Netz erlaubt."
+  fi
   echo "[INFO] Nebenstellen: ${FIRST_EXTENSION}-$((FIRST_EXTENSION + PHONE_COUNT - 1))"
   echo "[INFO] Wartesignal: Klingelzeichen; deutsche Positionsansage sofort beim Eintritt und danach minuetlich."
   echo "[INFO] Grenzen Hauptleitung: ${PROVIDER_CHANNEL_LIMIT} insgesamt, ${PROVIDER_PHONE_LIMIT} Telefonie, ${PROVIDER_FAX_LIMIT} Fax."
