@@ -510,12 +510,12 @@ leavewhenempty=no
 timeout=14
 retry=1
 defaultrule=kfx-phone-progressive
-announce-position=no
-announce-to-first-user=no
+; Warteposition sofort beim Eintritt und danach hoechstens einmal pro Minute ansagen.
+announce-position=yes
+announce-frequency=60
+min-announce-frequency=60
+announce-to-first-user=yes
 announce-holdtime=no
-periodic-announce=queue-thankyou
-periodic-announce-frequency=60
-periodic-announce-startdelay=60
 maxlen=__KFX_QUEUE_MAX_WAITING__
 EOF
 
@@ -616,7 +616,7 @@ if [[ "$PHONE_ENABLED" == "y" ]]; then
   echo "[INFO] Interner SIP-Registrar: ${PHONE_BIND_IP}:${PHONE_PORT}"
   echo "[INFO] Zulaessiges internes SIP-Netz: ${PHONE_LOCAL_CIDR}"
   echo "[INFO] Nebenstellen: ${FIRST_EXTENSION}-$((FIRST_EXTENSION + PHONE_COUNT - 1))"
-  echo "[INFO] Wartesignal: Klingelzeichen; neutrale deutsche Warteansage erstmals nach 60 Sekunden und danach minuetlich."
+  echo "[INFO] Wartesignal: Klingelzeichen; deutsche Positionsansage sofort beim Eintritt und danach minuetlich."
   echo "[INFO] Grenzen Hauptleitung: ${PROVIDER_CHANNEL_LIMIT} insgesamt, ${PROVIDER_PHONE_LIMIT} Telefonie, ${PROVIDER_FAX_LIMIT} Fax."
   echo "[INFO] Warteschlange: maximal ${QUEUE_MAX_WAITING} wartende Anrufer."
   if [[ "$SIPGATE_OVERFLOW_ENABLED" == "y" ]]; then

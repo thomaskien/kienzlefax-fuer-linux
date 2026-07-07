@@ -2,7 +2,7 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.3.12
+# Version: 3.3.13
 # Stand:   2026-07-07
 # Autor:   Dr. Thomas Kienzle
 #
@@ -163,6 +163,10 @@
 # - Ausgehende Telefonate ueber eine separate SIP-Leitung koennen auf Wunsch zur Hauptgrenze zaehlen.
 # - Abweichungen von den Stabilitaetsdefaults muessen nach einer erneuten deutlichen Warnung bestaetigt werden.
 # - Ausgehende Faxe warten bei voller Providerkapazitaet im Worker, ohne einen Sendeversuch zu verbrauchen.
+#
+# NEU in 3.3.13:
+# - Queue-Regression behoben: Die echte deutsche Warteposition wird sofort beim Eintritt
+#   und danach hoechstens einmal pro Minute angesagt; die doppelte allgemeine Minutenansage entfaellt.
 # ==============================================================================
 
 set -euo pipefail
@@ -2620,7 +2624,7 @@ if e("KFX_PHONE_QUEUE_ENABLED", "n") == "y":
         "- Alle externen ein- und ausgehenden Telefonate muessen fuer verlaessliche Grenzen ueber Asterisk laufen.",
         "- Interne Telefonate zwischen lokalen Nebenstellen zaehlen nicht zur Providergrenze.",
         "- Direkte FRITZ!Box-Gespraeche sind fuer den Queue-Belegtstatus nicht sichtbar.",
-        "- Wartesignal: Klingelzeichen; neutrale deutsche Warteansage erstmals nach 60 Sekunden und danach minuetlich.",
+        "- Wartesignal: Klingelzeichen; deutsche Positionsansage sofort beim Eintritt und danach minuetlich.",
         f"- Eingangsprovider: {e('KFX_PHONE_IN_PROVIDER_LABEL', e('KFX_PHONE_IN_PROVIDER', '-'))}",
         f"- Eingangs-SIP-Benutzer/Auth-ID: {e('KFX_PHONE_IN_SIP_USER')}",
         f"- Eingangs-SIP-Nummer: {e('KFX_PHONE_IN_SIP_NUMBER')}",
