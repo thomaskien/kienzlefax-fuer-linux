@@ -2,7 +2,7 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.3.16
+# Version: 3.3.17
 # Stand:   2026-07-07
 # Autor:   Dr. Thomas Kienzle
 #
@@ -181,6 +181,11 @@
 #   keine Fax-PJSIP-Nebenstelle und keine Fax-/OCR-/Worker-/CUPS-/Samba-Webmodule.
 # - Queue-only installiert nur die benoetigten Asterisk-/Telefoniekomponenten; es erzeugt
 #   kein PDF, Konfiguration und Passwoerter bleiben ausschliesslich in der geschuetzten ENV-Datei.
+#
+# NEU in 3.3.17:
+# - Falls `apt-get download asterisk-prompt-de` das Paket in der aktuellen Debian-Suite
+#   nicht findet, wird das offizielle Debian-All-Paket direkt aus deb.debian.org geladen.
+# - Weiterhin werden nur die Audiodateien extrahiert; ein Debian-Asterisk-Paket wird nicht installiert.
 # ==============================================================================
 
 set -euo pipefail
@@ -1377,6 +1382,7 @@ install_german_asterisk_prompts(){
   local target="/usr/share/asterisk/sounds/de"
   local tmp source
   local -a packages
+  local fallback_url="https://deb.debian.org/debian/pool/main/a/asterisk-prompt-de/asterisk-prompt-de_2.0-1.3_all.deb"
 
   if [[ -s "${target}/queue-thankyou.gsm" && -s "${target}/queue-youarenext.gsm" && -s "${target}/queue-thereare.gsm" && -s "${target}/queue-callswaiting.gsm" ]]; then
     log "[OK] Deutsche Asterisk-Ansagen bereits vorhanden."
@@ -1386,7 +1392,11 @@ install_german_asterisk_prompts(){
   tmp="$(mktemp -d)"
   if ! (
     cd "$tmp"
-    apt-get download asterisk-prompt-de
+    if ! apt-get download asterisk-prompt-de; then
+      log "[WARN] asterisk-prompt-de ist ueber APT nicht verfuegbar; nutze offizielles Debian-Paketarchiv."
+      rm -f asterisk-prompt-de_*.deb
+      curl -fsSL "$fallback_url" -o "asterisk-prompt-de_2.0-1.3_all.deb"
+    fi
     mapfile -t packages < <(find "$tmp" -maxdepth 1 -type f -name 'asterisk-prompt-de_*.deb' -print)
     (( ${#packages[@]} == 1 )) || exit 1
     dpkg-deb -x "${packages[0]}" "$tmp/extracted"
