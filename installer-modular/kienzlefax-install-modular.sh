@@ -2,7 +2,7 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.3.14
+# Version: 3.3.16
 # Stand:   2026-07-07
 # Autor:   Dr. Thomas Kienzle
 #
@@ -171,6 +171,16 @@
 # NEU in 3.3.14:
 # - Angenommene Queue-Anrufe werden nach allen Provider-/Queue-Busy-Pruefungen, aber vor
 #   der Positionsansage beantwortet. Dadurch ist die Ansage nicht von SIP-Early-Media abhaengig.
+#
+# NEU in 3.3.15:
+# - Der optionale Sipgate-Ueberlauf wird in Installer-Dialog, Warnung, Installationsbericht
+#   und Abschlussausgabe eindeutig als experimentell gekennzeichnet.
+#
+# NEU in 3.3.16:
+# - Neuer Installationsmodus `nur Telefoniewarteschlange`: keine Fax-DID, keine Faxdrucker,
+#   keine Fax-PJSIP-Nebenstelle und keine Fax-/OCR-/Worker-/CUPS-/Samba-Webmodule.
+# - Queue-only installiert nur die benoetigten Asterisk-/Telefoniekomponenten; es erzeugt
+#   kein PDF, Konfiguration und Passwoerter bleiben ausschliesslich in der geschuetzten ENV-Datei.
 # ==============================================================================
 
 set -euo pipefail
@@ -719,16 +729,29 @@ collect_phone_options(){
   SIPGATE_OVERFLOW_DOMAIN="sipconnect.sipgate.de"
   SIPGATE_OVERFLOW_IDENTIFY_MATCH="217.10.68.150"
 
-  ask_yes_no PHONE_QUEUE_ENABLED "Warteschlange fuer Telefonie erstellen?" "n"
+  if [[ "${KFX_QUEUE_ONLY:-${QUEUE_ONLY:-n}}" == "y" ]]; then
+    PHONE_QUEUE_ENABLED="y"
+    PROVIDER_FAX_LIMIT="0"
+    echo "[INFO] Queue-only: Telefoniewarteschlange wird verbindlich installiert."
+  else
+    ask_yes_no PHONE_QUEUE_ENABLED "Warteschlange fuer Telefonie erstellen?" "n"
+  fi
 
   echo
   echo "ACHTUNG – Stabilitaetsrelevante Kanalgrenzen"
   echo "Zu hohe Werte koennen massive Probleme durch Providerlimits, Bandbreite, RTP und Faxlast verursachen."
-  echo "Empfohlene und erprobte Defaults fuer 1&1: insgesamt 4, Telefonie 3, Fax 3, Wartende 5."
-  echo "Telefonie- und Faxgrenze sind Teilgrenzen; zusaetzlich gilt immer die Gesamtgrenze."
+  if [[ "${KFX_QUEUE_ONLY:-${QUEUE_ONLY:-n}}" == "y" ]]; then
+    echo "Empfohlene Defaults: insgesamt 4, Telefonie 3, Wartende 5. Fax ist deaktiviert."
+    echo "Die Telefoniegrenze ist eine Teilgrenze; zusaetzlich gilt immer die Gesamtgrenze."
+  else
+    echo "Empfohlene und erprobte Defaults fuer 1&1: insgesamt 4, Telefonie 3, Fax 3, Wartende 5."
+    echo "Telefonie- und Faxgrenze sind Teilgrenzen; zusaetzlich gilt immer die Gesamtgrenze."
+  fi
   ask_int_range PROVIDER_CHANNEL_LIMIT "Maximale gleichzeitige Kanaele der Haupt-SIP-Leitung" "4" "1" "100"
   ask_int_range PROVIDER_PHONE_LIMIT "Davon maximal fuer Telefonie" "3" "1" "$PROVIDER_CHANNEL_LIMIT"
-  ask_int_range PROVIDER_FAX_LIMIT "Davon maximal fuer Fax (eingehend und ausgehend)" "3" "1" "$PROVIDER_CHANNEL_LIMIT"
+  if [[ "${KFX_QUEUE_ONLY:-${QUEUE_ONLY:-n}}" != "y" ]]; then
+    ask_int_range PROVIDER_FAX_LIMIT "Davon maximal fuer Fax (eingehend und ausgehend)" "3" "1" "$PROVIDER_CHANNEL_LIMIT"
+  fi
   ask_int_range QUEUE_MAX_WAITING "Maximale Zahl wartender Anrufer in der Warteschlange" "5" "1" "100"
 
   if [[ "$PHONE_QUEUE_ENABLED" != "y" ]]; then
@@ -762,7 +785,7 @@ collect_phone_options(){
 
     collect_phone_provider_config PHONE_IN "die eingehende Telefonieleitung"
     local fax_did="${FAX_DID:-${KFX_FAX_DID:-}}"
-    [[ "${PHONE_IN_SIP_NUMBER}" != "$fax_did" ]] \
+    [[ -z "$fax_did" || "${PHONE_IN_SIP_NUMBER}" != "$fax_did" ]] \
       || die "Telefonie-DID und Fax-DID muessen verschieden sein, damit eingehende Anrufe eindeutig geroutet werden."
 
     ask_yes_no PHONE_SEPARATE_OUTBOUND "Fuer ausgehende Telefonate eine andere SIP-Leitung verwenden?" "n"
@@ -776,9 +799,11 @@ collect_phone_options(){
     fi
 
     echo
-    echo "Optional kann sipgate trunking als zusaetzlicher Eingangsweg fuer Ueberlauf-Anrufe eingerichtet werden."
-    ask_yes_no SIPGATE_OVERFLOW_ENABLED "Sipgate-Ueberlauf ueber sipconnect.sipgate.de einrichten?" "n"
+    echo "EXPERIMENTELL: Optional kann sipgate trunking als zusaetzlicher Eingangsweg fuer Ueberlauf-Anrufe eingerichtet werden."
+    echo "Diese Funktion muss vor einem produktiven Einsatz mit Registrierung, Audio und Busy-Verhalten getestet werden."
+    ask_yes_no SIPGATE_OVERFLOW_ENABLED "Experimentellen Sipgate-Ueberlauf ueber sipconnect.sipgate.de einrichten?" "n"
     if [[ "$SIPGATE_OVERFLOW_ENABLED" == "y" ]]; then
+      echo "[WARN] Der Sipgate-Ueberlauf ist experimentell und noch nicht fuer jeden Anschluss validiert."
       while [[ ! "$SIPGATE_OVERFLOW_SIP_ID" =~ ^[A-Za-z0-9._-]+$ ]]; do
         ask_default SIPGATE_OVERFLOW_SIP_ID "Sipgate trunking SIP-ID" ""
         [[ "$SIPGATE_OVERFLOW_SIP_ID" =~ ^[A-Za-z0-9._-]+$ ]] || echo "Bitte nur Buchstaben, Ziffern, Punkt, Unterstrich oder Bindestrich verwenden."
@@ -803,7 +828,9 @@ collect_phone_options(){
   local capacity_deviation="n" capacity_confirm="n" reachable_phone_capacity="$PROVIDER_PHONE_LIMIT"
   [[ "$PROVIDER_CHANNEL_LIMIT" == "4" ]] || capacity_deviation="y"
   [[ "$PROVIDER_PHONE_LIMIT" == "3" ]] || capacity_deviation="y"
-  [[ "$PROVIDER_FAX_LIMIT" == "3" ]] || capacity_deviation="y"
+  if [[ "${KFX_QUEUE_ONLY:-${QUEUE_ONLY:-n}}" != "y" ]]; then
+    [[ "$PROVIDER_FAX_LIMIT" == "3" ]] || capacity_deviation="y"
+  fi
   [[ "$QUEUE_MAX_WAITING" == "5" ]] || capacity_deviation="y"
   [[ "$PHONE_OUT_COUNTS_PROVIDER_LIMIT" == "y" ]] || capacity_deviation="y"
   if [[ "$SIPGATE_OVERFLOW_ENABLED" == "y" ]]; then
@@ -922,21 +949,30 @@ collect_run_options(){
   ask_yes_no REMOTE_REFRESH_EXTENSIONS "Remote-Datei extensions.sh holen/aktualisieren?" "$default"
   default="n"; [[ -s "${cache_dir}/pjsip-provider.sh" ]] || default="y"
   ask_yes_no REMOTE_REFRESH_PJSIP_PROVIDER "Remote-Datei pjsip-provider.sh holen/aktualisieren?" "$default"
-  default="n"; [[ -s "${cache_dir}/pjsip-1und1.sh" ]] || default="y"
-  ask_yes_no REMOTE_REFRESH_PJSIP_1UND1 "Remote-Datei pjsip-1und1.sh holen/aktualisieren?" "$default"
   default="n"; [[ -s "${cache_dir}/telefonie-queue.sh" ]] || default="y"
   ask_yes_no REMOTE_REFRESH_TELEFONIE_QUEUE "Remote-Datei telefonie-queue.sh holen/aktualisieren?" "$default"
-  default="n"; [[ -s "${cache_dir}/worker.sh" ]] || default="y"
-  ask_yes_no REMOTE_REFRESH_WORKER "Remote-Datei worker.sh holen/aktualisieren?" "$default"
-  default="n"; [[ -s "${cache_dir}/agi.sh" ]] || default="y"
-  ask_yes_no REMOTE_REFRESH_AGI "Remote-Datei agi.sh holen/aktualisieren?" "$default"
-  default="n"; [[ -s "${cache_dir}/pdf_with_header.sh" ]] || default="y"
-  ask_yes_no REMOTE_REFRESH_PDF_WITH_HEADER "Remote-Datei pdf_with_header.sh holen/aktualisieren?" "$default"
-  default="n"; [[ -s "${cache_dir}/scan_ocr.sh" ]] || default="y"
-  ask_yes_no REMOTE_REFRESH_SCAN_OCR "Remote-Datei scan_ocr.sh holen/aktualisieren?" "$default"
-
-  default="n"; [[ -s /var/www/html/kienzlefax.php ]] || default="y"
-  ask_yes_no WEB_REFRESH "Weboberflaeche neu herunterladen/aktualisieren?" "$default"
+  if [[ "${KFX_QUEUE_ONLY:-${QUEUE_ONLY:-n}}" == "y" ]]; then
+    REMOTE_REFRESH_PJSIP_1UND1="n"
+    REMOTE_REFRESH_WORKER="n"
+    REMOTE_REFRESH_AGI="n"
+    REMOTE_REFRESH_PDF_WITH_HEADER="n"
+    REMOTE_REFRESH_SCAN_OCR="n"
+    WEB_REFRESH="n"
+    echo "[INFO] Queue-only: Fax-, OCR-, Worker- und Webmodule werden nicht abgefragt."
+  else
+    default="n"; [[ -s "${cache_dir}/pjsip-1und1.sh" ]] || default="y"
+    ask_yes_no REMOTE_REFRESH_PJSIP_1UND1 "Remote-Datei pjsip-1und1.sh holen/aktualisieren?" "$default"
+    default="n"; [[ -s "${cache_dir}/worker.sh" ]] || default="y"
+    ask_yes_no REMOTE_REFRESH_WORKER "Remote-Datei worker.sh holen/aktualisieren?" "$default"
+    default="n"; [[ -s "${cache_dir}/agi.sh" ]] || default="y"
+    ask_yes_no REMOTE_REFRESH_AGI "Remote-Datei agi.sh holen/aktualisieren?" "$default"
+    default="n"; [[ -s "${cache_dir}/pdf_with_header.sh" ]] || default="y"
+    ask_yes_no REMOTE_REFRESH_PDF_WITH_HEADER "Remote-Datei pdf_with_header.sh holen/aktualisieren?" "$default"
+    default="n"; [[ -s "${cache_dir}/scan_ocr.sh" ]] || default="y"
+    ask_yes_no REMOTE_REFRESH_SCAN_OCR "Remote-Datei scan_ocr.sh holen/aktualisieren?" "$default"
+    default="n"; [[ -s /var/www/html/kienzlefax.php ]] || default="y"
+    ask_yes_no WEB_REFRESH "Weboberflaeche neu herunterladen/aktualisieren?" "$default"
+  fi
   ask_yes_no AST_MANUAL_MENUSELECT "Asterisk-Modulauswahl manuell zur Pruefung oeffnen? Beenden mit X" "n"
 
   if command -v asterisk >/dev/null 2>&1; then
@@ -946,12 +982,17 @@ collect_run_options(){
     log "[INFO] Asterisk ist noch nicht installiert; Build wird ausgefuehrt."
   fi
 
-  ask_yes_no INSTALL_REPORT "Installationsbericht mit Klartext-Passwoertern erzeugen?" "y"
+  if [[ "${KFX_QUEUE_ONLY:-${QUEUE_ONLY:-n}}" == "y" ]]; then
+    INSTALL_REPORT="n"
+    echo "[INFO] Queue-only: Kein Installations-PDF; Konfiguration bleibt in ${ENVFILE}."
+  else
+    ask_yes_no INSTALL_REPORT "Installationsbericht mit Klartext-Passwoertern erzeugen?" "y"
+  fi
 
   REMOVE_USER_NAME=""
   REMOVE_USER_HOME="n"
   CURRENT_USER_CANDIDATE="$(detect_current_user_candidate || true)"
-  if [[ -n "$CURRENT_USER_CANDIDATE" ]]; then
+  if [[ "${KFX_QUEUE_ONLY:-${QUEUE_ONLY:-n}}" != "y" && -n "$CURRENT_USER_CANDIDATE" ]]; then
     ask_yes_no REMOVE_CURRENT_USER "Aktuellen Benutzer '${CURRENT_USER_CANDIDATE}' am Ende entfernen?" "n"
     if [[ "$REMOVE_CURRENT_USER" == "y" ]]; then
       REMOVE_USER_NAME="$CURRENT_USER_CANDIDATE"
@@ -1010,8 +1051,18 @@ fi
 if [[ "$RESET_OPTS" == "n" ]]; then
   # shellcheck disable=SC1090
   source "$ENVFILE"
-  if [[ -z "${KFX_ADMIN_PASSWORD:-}" || -z "${KFX_PROVIDER:-}" || -z "${KFX_SIP_USER:-}" || -z "${KFX_FAX_PRINTER_COUNT:-}" || -z "${KFX_PDF_INPUT_COUNT:-}" ]]; then
+  if [[ -z "${KFX_QUEUE_ONLY+x}" ]]; then
+    ask_yes_no KFX_QUEUE_ONLY "Nur Telefoniewarteschlange installieren (ohne Faxfunktionen)?" "n"
+    upsert_env_line KFX_QUEUE_ONLY "$KFX_QUEUE_ONLY"
+    if [[ "$KFX_QUEUE_ONLY" == "y" ]]; then
+      log "[WARN] Queue-only entfernt keine bereits vorhandenen Faxkomponenten; es installiert/aktualisiert sie lediglich nicht."
+    fi
+  fi
+  if [[ "${KFX_QUEUE_ONLY:-n}" != "y" && ( -z "${KFX_ADMIN_PASSWORD:-}" || -z "${KFX_PROVIDER:-}" || -z "${KFX_SIP_USER:-}" || -z "${KFX_FAX_PRINTER_COUNT:-}" || -z "${KFX_PDF_INPUT_COUNT:-}" ) ]]; then
     log "[INFO] Vorhandene Optionen sind aelter als 3.3.8; Eingaben werden neu gesammelt."
+    RESET_OPTS="y"
+  elif [[ "${KFX_QUEUE_ONLY:-n}" == "y" && ( -z "${KFX_PHONE_QUEUE_ENABLED:-}" || -z "${KFX_PHONE_IN_SIP_USER:-}" ) ]]; then
+    log "[INFO] Queue-only-Grundoptionen fehlen; Eingaben werden neu gesammelt."
     RESET_OPTS="y"
   else
     log "[OK] Verwende vorhandene Grundkonfiguration aus ${ENVFILE}"
@@ -1042,6 +1093,14 @@ else
   echo -e "127.0.1.1\t${KFX_HOSTNAME}" >> /etc/hosts
 fi
 
+ask_yes_no QUEUE_ONLY "Nur Telefoniewarteschlange installieren (ohne Fax, Faxdrucker, OCR, Web und Samba)?" "n"
+KFX_QUEUE_ONLY="$QUEUE_ONLY"
+if [[ "$QUEUE_ONLY" == "y" ]]; then
+  echo "[OK] Installationsmodus: nur Telefoniewarteschlange."
+  echo "[INFO] Es werden keine vorhandenen Faxkomponenten entfernt."
+fi
+
+if [[ "$QUEUE_ONLY" != "y" ]]; then
 echo
 echo "Provider-Auswahl:"
 echo "  1 = 1&1 Deutschland (bisher getesteter Standard)"
@@ -1144,6 +1203,24 @@ ask_default KFX_PRACTICE_NAME "Praxis-Kopfzeile fuer ausgehende Faxe" "KienzleFa
 
 ask_int_range FAX_PRINTER_COUNT "Anzahl Faxdrucker fax1..faxN" "5" "1" "100"
 ask_int_range PDF_INPUT_COUNT "Anzahl PDF-zu-Fax-Eingaenge" "1" "1" "100"
+else
+  KFX_PROVIDER="none"
+  KFX_PROVIDER_LABEL="Nicht verwendet (Queue-only)"
+  echo "DynDNS / Public FQDN ist optional, zur optimalen Provider-Stabilitaet aber empfohlen."
+  read -r -p "DynDNS / Public FQDN (Enter = leer lassen): " PUBLIC_FQDN
+  SIP_USER=""
+  SIP_NUMBER=""
+  SIP_PASSWORD=""
+  KFX_SIP_DOMAIN=""
+  KFX_SIP_OUTBOUND_PROXY=""
+  KFX_SIP_IDENTIFY_MATCH=""
+  KFX_SIP_EXPIRATION="300"
+  ADMIN_PASSWORD=""
+  FAX_DID=""
+  KFX_PRACTICE_NAME=""
+  FAX_PRINTER_COUNT="0"
+  PDF_INPUT_COUNT="0"
+fi
 
 ask_default SIP_BIND_PORT "SIP Bind Port (PJSIP extern; Provider-Config)" "${DEFAULT_SIP_BIND_PORT}"
 [[ "$SIP_BIND_PORT" =~ ^[0-9]+$ ]] || die "SIP_BIND_PORT ungültig"
@@ -1155,13 +1232,18 @@ ask_default RTP_END   "RTP End-Port"   "${DEFAULT_RTP_END}"
 [ "$RTP_START" -lt "$RTP_END" ] || die "RTP_START muss < RTP_END sein"
 
 echo
-sep "Optionale Telefoniewarteschlange"
+sep "Telefoniewarteschlange"
 collect_phone_options
 
 echo
-echo "Hinweis Portweiterleitung nur fuer Fax-Kommunikation:"
-echo "  UDP ${SIP_BIND_PORT} -> dieses System (SIP)"
-echo "  UDP ${RTP_START}-${RTP_END} -> dieses System (RTP)"
+if [[ "$QUEUE_ONLY" == "y" ]]; then
+  echo "Hinweis Telefonie-Netzwerk:"
+  echo "  Externe Provider-Erreichbarkeit und NAT richten sich nach dem gewaehlten Telefonieprovider."
+else
+  echo "Hinweis Portweiterleitung nur fuer Fax-Kommunikation:"
+  echo "  UDP ${SIP_BIND_PORT} -> dieses System (SIP)"
+  echo "  UDP ${RTP_START}-${RTP_END} -> dieses System (RTP)"
+fi
 echo "Eine feste IP per DHCP-Reservierung im Router wird empfohlen."
 
 sep "Laufoptionen fuer diese Installation"
@@ -1190,6 +1272,7 @@ AST_REF_ENV="$(quote_env_value "$AST_REF")"
 
 cat >"$ENVFILE" <<EENV
 # generated by kienzlefax installer
+KFX_QUEUE_ONLY=${QUEUE_ONLY}
 KFX_HOSTNAME=${KFX_HOSTNAME_ENV}
 KFX_PUBLIC_FQDN=${PUBLIC_FQDN_ENV}
 KFX_PROVIDER=${KFX_PROVIDER_ENV}
@@ -1265,33 +1348,37 @@ if ! apt-cache show "$NCURSES_DEV_PACKAGE" >/dev/null 2>&1; then
   NCURSES_DEV_PACKAGE="libncurses-dev"
 fi
 
-apt-get install -y --no-install-recommends \
-  ca-certificates curl wget jq \
-  acl lsof coreutils iproute2 psmisc \
-  apache2 libapache2-mod-php \
-  php php-cli php-sqlite3 php-mbstring sqlite3 \
-  qpdf ghostscript poppler-utils libtiff-tools \
-  ocrmypdf tesseract-ocr tesseract-ocr-deu tesseract-ocr-eng \
-  inotify-tools img2pdf python3-pikepdf unpaper \
-  cups cups-client \
-  avahi-daemon avahi-utils \
-  samba smbclient sudo \
-  python3 python3-venv python3-pip python3-reportlab \
-  sox lame \
-  build-essential git pkg-config autoconf automake libtool \
-  libxml2-dev "$NCURSES_DEV_PACKAGE" libedit-dev uuid-dev \
-  libssl-dev libsqlite3-dev \
-  libsrtp2-dev \
-  libtiff-dev \
-  libjansson-dev \
-  libspandsp-dev
+COMMON_PACKAGES=(
+  ca-certificates curl wget jq
+  lsof coreutils iproute2 psmisc
+  python3
+  build-essential git pkg-config autoconf automake libtool
+  libxml2-dev "$NCURSES_DEV_PACKAGE" libedit-dev uuid-dev
+  libssl-dev libsqlite3-dev libsrtp2-dev libjansson-dev
+)
+FAX_PACKAGES=(
+  acl apache2 libapache2-mod-php
+  php php-cli php-sqlite3 php-mbstring sqlite3
+  qpdf ghostscript poppler-utils libtiff-tools
+  ocrmypdf tesseract-ocr tesseract-ocr-deu tesseract-ocr-eng
+  inotify-tools img2pdf python3-pikepdf unpaper
+  cups cups-client avahi-daemon avahi-utils
+  samba smbclient sudo
+  python3-venv python3-pip python3-reportlab sox lame
+  libtiff-dev libspandsp-dev
+)
+if [[ "${KFX_QUEUE_ONLY:-n}" == "y" ]]; then
+  apt-get install -y --no-install-recommends "${COMMON_PACKAGES[@]}"
+else
+  apt-get install -y --no-install-recommends "${COMMON_PACKAGES[@]}" "${FAX_PACKAGES[@]}"
+fi
 
 install_german_asterisk_prompts(){
   local target="/usr/share/asterisk/sounds/de"
   local tmp source
   local -a packages
 
-  if [[ -s "${target}/queue-thankyou.gsm" ]]; then
+  if [[ -s "${target}/queue-thankyou.gsm" && -s "${target}/queue-youarenext.gsm" && -s "${target}/queue-thereare.gsm" && -s "${target}/queue-callswaiting.gsm" ]]; then
     log "[OK] Deutsche Asterisk-Ansagen bereits vorhanden."
     return 0
   fi
@@ -1305,6 +1392,9 @@ install_german_asterisk_prompts(){
     dpkg-deb -x "${packages[0]}" "$tmp/extracted"
     source="${tmp}/extracted/usr/share/asterisk/sounds/de"
     [[ -s "${source}/queue-thankyou.gsm" ]] || exit 1
+    [[ -s "${source}/queue-youarenext.gsm" ]] || exit 1
+    [[ -s "${source}/queue-thereare.gsm" ]] || exit 1
+    [[ -s "${source}/queue-callswaiting.gsm" ]] || exit 1
     install -d -m 0755 "$target"
     cp -a "${source}/." "${target}/"
   ); then
@@ -1319,14 +1409,16 @@ if [[ "${KFX_PHONE_QUEUE_ENABLED:-n}" == "y" ]]; then
   install_german_asterisk_prompts
 fi
 
-set +e
-apt-get install -y --no-install-recommends python3-pypdf >/dev/null 2>&1
-rc1=$?
-apt-get install -y --no-install-recommends python3-pypdf2 >/dev/null 2>&1
-rc2=$?
-set -e
-if [[ $rc1 -ne 0 && $rc2 -ne 0 ]]; then
-  die "Konnte weder python3-pypdf noch python3-pypdf2 installieren. Bitte Paketname prüfen."
+if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]]; then
+  set +e
+  apt-get install -y --no-install-recommends python3-pypdf >/dev/null 2>&1
+  rc1=$?
+  apt-get install -y --no-install-recommends python3-pypdf2 >/dev/null 2>&1
+  rc2=$?
+  set -e
+  if [[ $rc1 -ne 0 && $rc2 -ne 0 ]]; then
+    die "Konnte weder python3-pypdf noch python3-pypdf2 installieren. Bitte Paketname prüfen."
+  fi
 fi
 
 log "[OK] Pakete installiert."
@@ -2119,10 +2211,13 @@ make_asterisk_with_retry(){
 configure_asterisk_modules(){
   local ms="./menuselect/menuselect"
   local failed=0
-  local required_modules=(res_fax res_fax_spandsp)
+  local required_modules=()
   make menuselect.makeopts
   [[ -x "$ms" ]] || die "menuselect CLI fehlt: $ms"
 
+  if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]]; then
+    required_modules+=(res_fax res_fax_spandsp)
+  fi
   if [[ "${KFX_PHONE_QUEUE_ENABLED:-n}" == "y" ]]; then
     required_modules+=(app_queue res_musiconhold)
   fi
@@ -2134,11 +2229,13 @@ configure_asterisk_modules(){
     fi
   done
 
-  for mod in app_fax format_tiff; do
-    if ! "$ms" --enable "$mod" menuselect.makeopts; then
-      log "[INFO] Asterisk-Option ist in diesem Source-Tree nicht vorhanden oder nicht separat waehlbar: $mod"
-    fi
-  done
+  if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]]; then
+    for mod in app_fax format_tiff; do
+      if ! "$ms" --enable "$mod" menuselect.makeopts; then
+        log "[INFO] Asterisk-Option ist in diesem Source-Tree nicht vorhanden oder nicht separat waehlbar: $mod"
+      fi
+    done
+  fi
 
   if ! "$ms" --check-deps menuselect.makeopts; then
     log "[WARN] Asterisk-menuselect meldet fehlende Abhaengigkeiten."
@@ -2166,7 +2263,11 @@ source "$ENVFILE"
 ASTERISK_SRC_DIR="/usr/src/asterisk"
 ASTERISK_GIT_URL="https://github.com/asterisk/asterisk.git"
 
-sep "Asterisk: Source holen + Build (Fax-Module nichtinteraktiv)"
+if [[ "${KFX_QUEUE_ONLY:-n}" == "y" ]]; then
+  sep "Asterisk: Source holen + Build (Telefonie/Queue)"
+else
+  sep "Asterisk: Source holen + Build (Fax-Module nichtinteraktiv)"
+fi
 mkdir -p "$(dirname "$ASTERISK_SRC_DIR")"
 if [[ ! -d "$ASTERISK_SRC_DIR/.git" ]]; then
   rm -rf "$ASTERISK_SRC_DIR"
@@ -2372,6 +2473,11 @@ sep "Asterisk: RTP Range setzen"
 touch "$RTP_CONF"
 ini_set_kv_py "$RTP_CONF" "general" "rtpstart" "$KFX_RTP_START"
 ini_set_kv_py "$RTP_CONF" "general" "rtpend"   "$KFX_RTP_END"
+
+if [[ "${KFX_QUEUE_ONLY:-n}" == "y" ]]; then
+  log "[OK] Queue-only: RTP konfiguriert; AMI/Manager wird nicht eingerichtet."
+  exit 0
+fi
 
 sep "Asterisk AMI/Manager aktivieren + nur localhost"
 [[ -f "$MANAGER_CONF" ]] && cp -a "$MANAGER_CONF" "${MANAGER_CONF}.old.kienzlefax.$(date +%Y%m%d-%H%M%S)" || true
@@ -2648,7 +2754,8 @@ if e("KFX_PHONE_QUEUE_ENABLED", "n") == "y":
         phone_lines.append("- Ausgehende Telefonate verwenden dieselbe SIP-Leitung wie eingehende Telefonate.")
     if e("KFX_SIPGATE_OVERFLOW_ENABLED", "n") == "y":
         phone_lines.extend([
-            "Sipgate-Ueberlauf:",
+            "Sipgate-Ueberlauf (EXPERIMENTELL):",
+            "- Vor produktivem Einsatz Registrierung, Audio, Kanalgrenze und Busy-Verhalten pruefen.",
             f"- Registrar: {e('KFX_SIPGATE_OVERFLOW_DOMAIN', 'sipconnect.sipgate.de')}",
             f"- SIP-ID: {e('KFX_SIPGATE_OVERFLOW_SIP_ID')}",
             f"- SIP-Passwort: {e('KFX_SIPGATE_OVERFLOW_SIP_PASSWORD')}",
@@ -2860,22 +2967,28 @@ source "$ENVFILE"
 sep "Remote Module holen/aktualisieren"
 maybe_fetch_one "extensions.sh"       "$URL_EXTENSIONS"       "${MOD_CACHE}/extensions.sh"       "${KFX_REMOTE_REFRESH_EXTENSIONS:-n}"
 maybe_fetch_one "pjsip-provider.sh"   "$URL_PJSIP_PROVIDER"   "${MOD_CACHE}/pjsip-provider.sh"   "${KFX_REMOTE_REFRESH_PJSIP_PROVIDER:-n}"
-maybe_fetch_one "pjsip-1und1.sh"      "$URL_PJSIP_1UND1"      "${MOD_CACHE}/pjsip-1und1.sh"      "${KFX_REMOTE_REFRESH_PJSIP_1UND1:-n}"
 maybe_fetch_one "telefonie-queue.sh"  "$URL_TELEFONIE_QUEUE"  "${MOD_CACHE}/telefonie-queue.sh"  "${KFX_REMOTE_REFRESH_TELEFONIE_QUEUE:-n}"
-maybe_fetch_one "worker.sh"           "$URL_WORKER"           "${MOD_CACHE}/worker.sh"           "${KFX_REMOTE_REFRESH_WORKER:-n}"
-maybe_fetch_one "agi.sh"              "$URL_AGI"              "${MOD_CACHE}/agi.sh"              "${KFX_REMOTE_REFRESH_AGI:-n}"
-maybe_fetch_one "pdf_with_header.sh"  "$URL_PDF_WITH_HEADER"  "${MOD_CACHE}/pdf_with_header.sh"  "${KFX_REMOTE_REFRESH_PDF_WITH_HEADER:-n}"
-maybe_fetch_one "scan_ocr.sh"         "$URL_SCAN_OCR"         "${MOD_CACHE}/scan_ocr.sh"         "${KFX_REMOTE_REFRESH_SCAN_OCR:-n}"
+if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]]; then
+  maybe_fetch_one "pjsip-1und1.sh"      "$URL_PJSIP_1UND1"      "${MOD_CACHE}/pjsip-1und1.sh"      "${KFX_REMOTE_REFRESH_PJSIP_1UND1:-n}"
+  maybe_fetch_one "worker.sh"           "$URL_WORKER"           "${MOD_CACHE}/worker.sh"           "${KFX_REMOTE_REFRESH_WORKER:-n}"
+  maybe_fetch_one "agi.sh"              "$URL_AGI"              "${MOD_CACHE}/agi.sh"              "${KFX_REMOTE_REFRESH_AGI:-n}"
+  maybe_fetch_one "pdf_with_header.sh"  "$URL_PDF_WITH_HEADER"  "${MOD_CACHE}/pdf_with_header.sh"  "${KFX_REMOTE_REFRESH_PDF_WITH_HEADER:-n}"
+  maybe_fetch_one "scan_ocr.sh"         "$URL_SCAN_OCR"         "${MOD_CACHE}/scan_ocr.sh"         "${KFX_REMOTE_REFRESH_SCAN_OCR:-n}"
+fi
 
 sep "Module ausführen (feste Reihenfolge)"
 run_module "${MOD_DIR}/10-packages.sh"
-run_module "${MOD_DIR}/20-dirs-acl.sh"
-run_module "${MOD_DIR}/30-admin-user.sh"
-run_module "${MOD_DIR}/40-web-ssl.sh"
-run_module "${MOD_DIR}/50-cups-samba.sh"
+if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]]; then
+  run_module "${MOD_DIR}/20-dirs-acl.sh"
+  run_module "${MOD_DIR}/30-admin-user.sh"
+  run_module "${MOD_DIR}/40-web-ssl.sh"
+  run_module "${MOD_DIR}/50-cups-samba.sh"
 
-sep "Remote Scan-OCR installieren"
-run_remote_script "${MOD_CACHE}/scan_ocr.sh"
+  sep "Remote Scan-OCR installieren"
+  run_remote_script "${MOD_CACHE}/scan_ocr.sh"
+else
+  log "[OK] Queue-only: Faxverzeichnisse, Admin/Samba, Web, CUPS und OCR uebersprungen."
+fi
 
 DO_ASTERISK_BUILD="${KFX_REBUILD_ASTERISK:-y}"
 if [[ "$DO_ASTERISK_BUILD" == "y" ]]; then
@@ -2898,7 +3011,9 @@ fi
 
 require_asterisk_cli 90
 require_asterisk_pjsip_runtime
-run_module "${MOD_DIR}/80-samba-access-check.sh"
+if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]]; then
+  run_module "${MOD_DIR}/80-samba-access-check.sh"
+fi
 run_module "${MOD_DIR}/70-rtp-ami.sh"
 
 # Load ENV
@@ -2909,6 +3024,7 @@ source "$ENVFILE"
 # Export variables for remote scripts (compatibility layer)
 # ------------------------------------------------------------------------------
 export KFX_HOSTNAME KFX_PUBLIC_FQDN KFX_PROVIDER KFX_PROVIDER_LABEL
+export KFX_QUEUE_ONLY
 export KFX_SIP_USER KFX_SIP_NUMBER KFX_SIP_PASSWORD KFX_SIP_DOMAIN KFX_SIP_OUTBOUND_PROXY KFX_SIP_IDENTIFY_MATCH KFX_SIP_EXPIRATION
 export KFX_FAX_DID KFX_SIP_BIND_PORT KFX_PJSIP_ENDPOINT
 export KFX_RTP_START KFX_RTP_END KFX_AST_REF KFX_AMI_SECRET
@@ -2954,7 +3070,7 @@ restart_worker_after_failed_update(){
   fi
 }
 trap restart_worker_after_failed_update EXIT
-if systemctl is-active --quiet kienzlefax-worker 2>/dev/null; then
+if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]] && systemctl is-active --quiet kienzlefax-worker 2>/dev/null; then
   KFX_RESTART_WORKER_ON_EXIT="y"
   log "[INFO] Stoppe kienzlefax-worker kurz fuer die atomare AGI-/Dialplan-/Worker-Aktualisierung."
   systemctl stop kienzlefax-worker
@@ -2971,23 +3087,29 @@ asterisk_rx "dialplan reload"
 sep "Remote Telefoniewarteschlange installieren/aktualisieren"
 run_remote_script "${MOD_CACHE}/telefonie-queue.sh"
 
-sep "Remote AGI installieren"
-run_remote_script "${MOD_CACHE}/agi.sh"
+if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]]; then
+  sep "Remote AGI installieren"
+  run_remote_script "${MOD_CACHE}/agi.sh"
 
-sep "Remote Worker installieren (nur Datei/Code)"
-run_remote_script "${MOD_CACHE}/worker.sh"
+  sep "Remote Worker installieren (nur Datei/Code)"
+  run_remote_script "${MOD_CACHE}/worker.sh"
 
-sep "Worker: /etc/default + systemd Unit (EnvironmentFile)"
-run_module "${MOD_DIR}/90-worker-unit.sh"
-KFX_RESTART_WORKER_ON_EXIT="n"
-trap - EXIT
+  sep "Worker: /etc/default + systemd Unit (EnvironmentFile)"
+  run_module "${MOD_DIR}/90-worker-unit.sh"
+  KFX_RESTART_WORKER_ON_EXIT="n"
+  trap - EXIT
 
-sep "Remote pdf_with_header.sh installieren"
-run_remote_script "${MOD_CACHE}/pdf_with_header.sh"
+  sep "Remote pdf_with_header.sh installieren"
+  run_remote_script "${MOD_CACHE}/pdf_with_header.sh"
 
-sep "Installationsbericht"
-run_module "${MOD_DIR}/95-install-report.sh"
-run_module "${MOD_DIR}/96-remove-initial-user.sh"
+  sep "Installationsbericht"
+  run_module "${MOD_DIR}/95-install-report.sh"
+  run_module "${MOD_DIR}/96-remove-initial-user.sh"
+else
+  KFX_RESTART_WORKER_ON_EXIT="n"
+  trap - EXIT
+  log "[OK] Queue-only: AGI, Faxworker, PDF-Header und Installations-PDF uebersprungen."
+fi
 
 sep "Reloads + Status"
 asterisk_rx "core reload"
@@ -3007,18 +3129,25 @@ if [[ "${KFX_PHONE_QUEUE_ENABLED:-n}" == "y" ]]; then
   asterisk_rx "pjsip show transport transport-kfx-phone"
 fi
 
-systemctl status apache2 --no-pager -l || true
-systemctl status cups --no-pager -l || true
-systemctl status smbd --no-pager -l || true
-systemctl status scan-ocr --no-pager -l || true
-systemctl status scan-ocr-fax --no-pager -l || true
 systemctl status asterisk --no-pager -l || true
-systemctl status kienzlefax-worker --no-pager -l || true
+if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]]; then
+  systemctl status apache2 --no-pager -l || true
+  systemctl status cups --no-pager -l || true
+  systemctl status smbd --no-pager -l || true
+  systemctl status scan-ocr --no-pager -l || true
+  systemctl status scan-ocr-fax --no-pager -l || true
+  systemctl status kienzlefax-worker --no-pager -l || true
+fi
 
 sep "Fertig: Kurzinfo"
 echo "Hostname: $(hostname)"
-echo "Web: http://$(hostname)/ -> /kienzlefax.php"
-echo "Web SSL (self-signed 50y): https://$(hostname)/"
+if [[ "${KFX_QUEUE_ONLY:-n}" == "y" ]]; then
+  echo "Installationsmodus: NUR TELEFONIEWARTESCHLANGE"
+  echo "Fax, Faxdrucker, OCR, Web, Samba, AMI, Worker und Installations-PDF: nicht installiert"
+else
+  echo "Web: http://$(hostname)/ -> /kienzlefax.php"
+  echo "Web SSL (self-signed 50y): https://$(hostname)/"
+fi
 echo "SIP Bind Port (Provider): ${KFX_SIP_BIND_PORT}"
 echo "RTP: ${KFX_RTP_START}-${KFX_RTP_END}"
 if [[ "${KFX_PHONE_QUEUE_ENABLED:-n}" == "y" ]]; then
@@ -3026,10 +3155,14 @@ if [[ "${KFX_PHONE_QUEUE_ENABLED:-n}" == "y" ]]; then
   echo "Interner SIP-Registrar: ${KFX_PHONE_BIND_IP}:${KFX_PHONE_INTERNAL_PORT}"
   echo "Internes SIP-Netz: ${KFX_PHONE_LOCAL_CIDR}"
   echo "Nebenstellen: ${KFX_PHONE_FIRST_EXTENSION}-$((KFX_PHONE_FIRST_EXTENSION + KFX_PHONE_COUNT - 1))"
-  echo "Hauptleitung: max. ${KFX_PROVIDER_CHANNEL_LIMIT} insgesamt / ${KFX_PROVIDER_PHONE_LIMIT} Telefonie / ${KFX_PROVIDER_FAX_LIMIT} Fax"
+  if [[ "${KFX_QUEUE_ONLY:-n}" == "y" ]]; then
+    echo "Hauptleitung: max. ${KFX_PROVIDER_CHANNEL_LIMIT} insgesamt / ${KFX_PROVIDER_PHONE_LIMIT} Telefonie"
+  else
+    echo "Hauptleitung: max. ${KFX_PROVIDER_CHANNEL_LIMIT} insgesamt / ${KFX_PROVIDER_PHONE_LIMIT} Telefonie / ${KFX_PROVIDER_FAX_LIMIT} Fax"
+  fi
   echo "Warteschlange: max. ${KFX_QUEUE_MAX_WAITING} wartende Anrufer"
   if [[ "${KFX_SIPGATE_OVERFLOW_ENABLED:-n}" == "y" ]]; then
-    echo "Sipgate-Ueberlauf: aktiv, separate additive Grenze ${KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT}"
+    echo "Sipgate-Ueberlauf: EXPERIMENTELL aktiv, separate additive Grenze ${KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT}"
   fi
   echo "Busy-Umleitung netzseitig z.B. #67*Zielrufnummer#; Steuercode beim Provider pruefen"
   echo "Externe Registrierung der lokalen Endpunkte: per PJSIP-Netzbeschraenkung gesperrt"
@@ -3038,8 +3171,12 @@ if [[ "${KFX_PHONE_QUEUE_ENABLED:-n}" == "y" ]]; then
 else
   echo "Telefoniewarteschlange: deaktiviert"
 fi
-echo "AMI: 127.0.0.1:5038 user=kfx (secret in /etc/default/kienzlefax-worker)"
-if [[ "${KFX_INSTALL_REPORT_WITH_PASSWORDS:-y}" == "y" ]]; then
-  echo "Installationsbericht: /var/spool/asterisk/fax/installationsbericht_kienzlefax_*_bitte_loeschen_mit_passwoertern.pdf"
+if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]]; then
+  echo "AMI: 127.0.0.1:5038 user=kfx (secret in /etc/default/kienzlefax-worker)"
+  if [[ "${KFX_INSTALL_REPORT_WITH_PASSWORDS:-y}" == "y" ]]; then
+    echo "Installationsbericht: /var/spool/asterisk/fax/installationsbericht_kienzlefax_*_bitte_loeschen_mit_passwoertern.pdf"
+  fi
+else
+  echo "Konfiguration und Passwoerter: /etc/kienzlefax-installer.env (0600)"
 fi
 echo "Remote module cache: ${MOD_CACHE}"

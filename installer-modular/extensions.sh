@@ -18,17 +18,26 @@ KFX_CALLERID_NAME="${KFX_CALLERID_NAME:-Fax}"
 KFX_PJSIP_ENDPOINT="${KFX_PJSIP_ENDPOINT:-kfx-provider-endpoint}"
 KFX_PHONE_QUEUE_ENABLED="${KFX_PHONE_QUEUE_ENABLED:-n}"
 KFX_PHONE_IN_DID="${KFX_PHONE_IN_SIP_NUMBER:-}"
+KFX_QUEUE_ONLY="${KFX_QUEUE_ONLY:-n}"
 KFX_PROVIDER_CHANNEL_LIMIT="${KFX_PROVIDER_CHANNEL_LIMIT:-4}"
 KFX_PROVIDER_PHONE_LIMIT="${KFX_PROVIDER_PHONE_LIMIT:-3}"
 KFX_PROVIDER_FAX_LIMIT="${KFX_PROVIDER_FAX_LIMIT:-3}"
 KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT="${KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT:-2}"
 
-for value in KFX_PROVIDER_CHANNEL_LIMIT KFX_PROVIDER_PHONE_LIMIT KFX_PROVIDER_FAX_LIMIT KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT; do
+for value in KFX_PROVIDER_CHANNEL_LIMIT KFX_PROVIDER_PHONE_LIMIT KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT; do
   [[ "${!value}" =~ ^[1-9][0-9]*$ ]] || {
     echo "ERROR: ${value} muss eine positive Ganzzahl sein." >&2
     exit 1
   }
 done
+if [[ "$KFX_QUEUE_ONLY" != "y" ]]; then
+  [[ "$KFX_PROVIDER_FAX_LIMIT" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ERROR: KFX_PROVIDER_FAX_LIMIT muss eine positive Ganzzahl sein." >&2
+    exit 1
+  }
+else
+  KFX_PROVIDER_FAX_LIMIT="0"
+fi
 (( KFX_PROVIDER_PHONE_LIMIT <= KFX_PROVIDER_CHANNEL_LIMIT )) || {
   echo "ERROR: KFX_PROVIDER_PHONE_LIMIT darf die Gesamtgrenze nicht ueberschreiten." >&2
   exit 1
@@ -133,6 +142,23 @@ ensure_capacity_modules_running(){
 }
 
 ensure_capacity_modules_running
+
+if [[ "$KFX_QUEUE_ONLY" == "y" ]]; then
+  cat >"$EXT" <<'EOF'
+[general]
+static=yes
+writeprotect=no
+clearglobalvars=no
+
+; Queue-only: bewusst kein Fax-Dialplan und keine Fax-Nebenstelle.
+#tryinclude "/etc/asterisk/extensions-kfx-telefonie.conf"
+EOF
+  chmod 0640 "$EXT" || true
+  chown root:asterisk "$EXT" 2>/dev/null || true
+  asterisk -rx "dialplan reload" >/dev/null 2>&1 || true
+  echo "[OK] Queue-only-Dialplan ohne Fax-Nebenstelle geschrieben: $EXT"
+  exit 0
+fi
 
 # Write dialplan WITHOUT shell expansion (Asterisk vars must survive)
 cat >"$EXT" <<'EOF'
