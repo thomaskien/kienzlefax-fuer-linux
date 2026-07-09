@@ -1,22 +1,90 @@
-# kienzlefax
-**der ideale Faxserver für die Arztpraxis**
+# KienzleFax und Telefoniewarteschlange
+
+**Faxserver und optionale Asterisk-Telefoniewarteschlange für Arztpraxen und andere kleine Einrichtungen**
+
+**Installerstand:** 3.3.19 · **Zielsystem:** Debian Linux · **Telefonie:** Asterisk/PJSIP
 
 https://www.kienzlefax.de
 
-- NEU: nun mit installer!
 - läuft einfach in einer VM auf dem server
-- oder auf einem raspberry pi
 - alles open source und unter linux
 - angebunden per SIP direkt an die eigene nummer
 - optimal für den workflow von arztpraxen
 - stabiler empfang und senden
-- OCR auch für den scanner direkt integriert
 - voll anpassbar
 - papierfreies fax: ende der zettelwirtschaft
 - optimale lesbarkeit der wichtigen befunde da nicht z.B "mal wieder bei fast leerem toner ausgedruckt und anschließend gefaxt" wird
 - clients drucken einfach auf einem freigegebenen windows-drucker aus (geht von windows, linux, mac, ega)
 - separater faxdrucker für jeden arbeitsplatz
 - wenn der server läuft absichern nicht vergessen: sichere passwörter, ssh-mit key usw
+
+## Installation
+
+Als `root` im gewünschten Arbeitsverzeichnis:
+
+```bash
+wget https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/main/kienzlefax-installer.sh
+chmod +x kienzlefax-installer.sh
+./kienzlefax-installer.sh
+```
+
+Der Bootstrap lädt den modularen Hauptinstaller. Grundoptionen werden in
+`/etc/kienzlefax-installer.env` gespeichert; die Datei enthält Passwörter und hat den Modus `0600`.
+Bei einem erneuten Lauf können vorhandene Optionen weiterverwendet werden. Die Asterisk-Dateien
+werden anschließend erneut aus der ENV erzeugt, auch wenn keine Remote-Module aktualisiert werden.
+Lokale SIP-Passwörter für Telefon-Nebenstellen bleiben bei erneuter Konfiguration standardmäßig
+erhalten; neue Passwörter werden nur nach expliziter Rückfrage erzeugt.
+
+## Installationsmodi
+
+### Vollinstallation
+
+Installiert den Faxworkflow mit Asterisk, Faxempfang und -versand, Faxdruckern, Weboberfläche,
+Samba, OCR, Worker und optionaler Telefoniewarteschlange.
+
+### Nur Telefoniewarteschlange
+
+Setzt `KFX_QUEUE_ONLY=y` und installiert ausschließlich:
+
+- Asterisk/PJSIP und RTP
+- lokale SIP-Nebenstellen, standardmäßig ab `201`
+- die Telefoniewarteschlange und ihre Kanalbegrenzungen
+- deutsche Positionsansagen
+
+Nicht installiert werden Fax-DID oder Fax-Endpunkt, Faxdrucker, CUPS/Samba, Weboberfläche,
+OCR, AMI, AGI, Faxworker oder ein Installations-PDF. Konfiguration und Passwörter stehen nur
+in `/etc/kienzlefax-installer.env`. Bereits vorhandene Faxkomponenten werden beim Wechsel in
+diesen Modus nicht automatisch entfernt.
+
+## Verhalten der Telefoniewarteschlange
+
+- Das erste freie Telefon klingelt zuerst.
+- Ist es belegt, beginnt unmittelbar das nächste freie Telefon.
+- Wird nicht abgenommen, kommt alle 20 Sekunden das nächste Telefon hinzu.
+- Die Warteposition wird sofort beim Eintritt und anschließend höchstens einmal pro Minute angesagt.
+- Als Wartesignal wird ein Klingelzeichen statt Wartemusik verwendet.
+- Telefonie bevorzugt `G.722`, danach `alaw` und `ulaw`.
+- Überlast wird vor Annahme mit Q.850 Cause 17 beziehungsweise SIP `486 Busy Here` abgewiesen.
+- Eine netzseitige Besetztumleitung kann dadurch greifen; Steuercodes sind providerabhängig.
+
+Empfohlene Standardgrenzen für die Hauptleitung sind vier externe Kanäle insgesamt,
+davon höchstens drei für Telefonie und bei der Vollinstallation höchstens drei für Fax.
+Die maximale Anzahl wartender Anrufer ist standardmäßig fünf. Der experimentelle
+Sipgate-Überlauf über `sipconnect.sipgate.de` hat eine separate additive Grenze von zwei Kanälen.
+
+## SIP-Zugriff und Sicherheit
+
+Lokale Nebenstellen dürfen sich standardmäßig nur aus dem automatisch erkannten internen Netz
+registrieren. Der Installer kann optional Registrierungen aus anderen Netzen oder dem Internet
+zulassen und fragt dafür ein erlaubtes IPv4-Quellnetz ab. `0.0.0.0/0` erlaubt das gesamte Internet
+und sollte nur mit zusätzlichen Schutzmaßnahmen verwendet werden. Bei konkreten Quellnetzen schreibt
+der Installer eine PJSIP-ACL nach dem Muster „deny all, permit Netz“; bei `0.0.0.0/0` wird keine
+redundante PJSIP-ACL geschrieben.
+
+Der Installer richtet bewusst keine Firewallregeln ein. Betreiber müssen insbesondere Firewall,
+Quellnetzbegrenzung, starke Passwörter und gegebenenfalls Angriffsschutz selbst konfigurieren.
+Webports `80/443` der Fax-Vollinstallation dürfen wegen der enthaltenen Patientendaten nicht ins
+Internet weitergeleitet werden.
 
 **Einfach was ausdrucken auf einem der faxdrucker:**
 
@@ -37,9 +105,14 @@ https://www.kienzlefax.de
 
 
 
-# kienzlefax – Systemdesign (README.md)
-**Stand:** 2026-02-13  
-**Ziel:** Ubuntu LTS Fax-Workflow mit maximaler Robustheit (SMB→PDF→Web-UI→Queue→Worker→HylaFAX→Archiv/Fehler).
+# Historische Systemdesign-Notizen
+
+> Die folgenden Abschnitte dokumentieren den früheren Entwurfsstand vom 13.02.2026.
+> Hinweise auf HylaFAX und feste fünf Drucker sind historisch; maßgeblich sind der aktuelle
+> modulare Installer, `AGENTS.md` und die vorstehenden Installationsmodi.
+
+**Historischer Stand:** 2026-02-13  
+**Historisches Ziel:** Ubuntu-LTS-Faxworkflow (SMB→PDF→Web-UI→Queue→Worker→HylaFAX→Archiv/Fehler).
 
 ---
 
@@ -271,4 +344,3 @@ Drucker-Freigabe (SMB) erfolgt separat; im Setup werden CUPS-Queues bereitgestel
 
 ### Aktive Jobs immer sichtbar
 - Counts/Listen aus `queue/` und `processing/`
-
