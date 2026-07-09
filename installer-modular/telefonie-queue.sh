@@ -417,11 +417,20 @@ rewrite_contact=yes
 rtp_symmetric=yes
 force_rport=yes
 device_state_busy_at=1
+EOF
+    if [[ "$PHONE_ALLOWED_CIDR" == "0.0.0.0/0" ]]; then
+      cat >>"$PJSIP_TMP" <<EOF
+; Keine PJSIP-ACL: SIP-Nebenstellen sind aus allen IPv4-Netzen erlaubt.
+; Der Installer richtet bewusst keine Firewallregeln ein; Schutz ist Betreiberaufgabe.
+EOF
+    else
+      cat >>"$PJSIP_TMP" <<EOF
 deny=0.0.0.0/0.0.0.0
 permit=${PHONE_ALLOWED_CIDR}
 contact_deny=0.0.0.0/0.0.0.0
 contact_permit=${PHONE_ALLOWED_CIDR}
 EOF
+    fi
   done
 
   append_provider IN "kfx-phone-in" "kfx-phone-in-endpoint"

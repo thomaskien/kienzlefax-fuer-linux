@@ -2,8 +2,8 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.3.18
-# Stand:   2026-07-07
+# Version: 3.3.19
+# Stand:   2026-07-09
 # Autor:   Dr. Thomas Kienzle
 #
 # Modularer Installer (alles gehört dazu; Provider per Template-Auswahl).
@@ -193,6 +193,12 @@
 # - Abfrage fuer Erreichbarkeit lokaler SIP-Nebenstellen aus anderen Netzen/Internet;
 #   bei Aktivierung wird ein erlaubtes Quellnetz abgefragt und deutlich gewarnt.
 # - Progressive Klingelstufen wechseln jetzt alle 20 statt alle 15 Sekunden.
+#
+# NEU in 3.3.19:
+# - Lokale SIP-Passwoerter der Telefon-Nebenstellen werden bei erneuter Konfiguration
+#   standardmaessig aus der vorhandenen ENV beibehalten.
+# - Neue lokale SIP-Passwoerter werden nur nach expliziter Rueckfrage erzeugt; fehlende
+#   oder neu hinzugekommene Nebenstellen erhalten weiterhin automatisch ein Passwort.
 # ==============================================================================
 
 set -euo pipefail
@@ -852,13 +858,46 @@ collect_phone_options(){
       ask_int_range SIPGATE_OVERFLOW_CHANNEL_LIMIT "Maximale gleichzeitige Sipgate-Ueberlaufkanaele" "2" "1" "100"
     fi
 
-    local index ext password_var
+    local index ext password_var existing_password_var existing_password
+    local existing_password_count=0 generated_password_count=0 preserved_password_count=0
+    local regenerate_phone_passwords="n"
+    for (( index=0; index<PHONE_COUNT; index++ )); do
+      ext=$((PHONE_FIRST_EXTENSION + index))
+      existing_password_var="KFX_PHONE_ENDPOINT_${ext}_PASSWORD"
+      existing_password="${!existing_password_var-}"
+      [[ -n "$existing_password" ]] && existing_password_count=$((existing_password_count + 1))
+    done
+
+    if (( existing_password_count > 0 )); then
+      echo
+      echo "[INFO] Vorhandene lokale SIP-Passwoerter fuer ${existing_password_count} Telefon-Nebenstelle(n) wurden in ${ENVFILE} gefunden."
+      echo "[INFO] Wenn neue Passwoerter erzeugt werden, muessen FRITZ!Box/Telefone entsprechend angepasst werden."
+      ask_yes_no regenerate_phone_passwords "Neue lokale SIP-Passwoerter fuer die Telefon-Nebenstellen generieren?" "n"
+    else
+      regenerate_phone_passwords="y"
+      echo "[INFO] Keine vorhandenen lokalen SIP-Passwoerter gefunden; sie werden neu generiert."
+    fi
+
     for (( index=0; index<PHONE_COUNT; index++ )); do
       ext=$((PHONE_FIRST_EXTENSION + index))
       password_var="PHONE_ENDPOINT_${ext}_PASSWORD"
-      printf -v "$password_var" '%s' "$(generate_secure_password)"
+      existing_password_var="KFX_PHONE_ENDPOINT_${ext}_PASSWORD"
+      existing_password="${!existing_password_var-}"
+      if [[ "$regenerate_phone_passwords" == "y" || -z "$existing_password" ]]; then
+        printf -v "$password_var" '%s' "$(generate_secure_password)"
+        generated_password_count=$((generated_password_count + 1))
+      else
+        printf -v "$password_var" '%s' "$existing_password"
+        preserved_password_count=$((preserved_password_count + 1))
+      fi
     done
-    echo "[OK] ${PHONE_COUNT} lokale PJSIP-Passwoerter wurden sicher generiert; Ausgabe nur in ENV/Installationsbericht."
+    if (( generated_password_count > 0 && preserved_password_count > 0 )); then
+      echo "[OK] ${preserved_password_count} lokale PJSIP-Passwoerter wurden beibehalten; ${generated_password_count} wurden neu erzeugt."
+    elif (( generated_password_count > 0 )); then
+      echo "[OK] ${generated_password_count} lokale PJSIP-Passwoerter wurden sicher generiert; Ausgabe nur in ENV/Installationsbericht."
+    else
+      echo "[OK] ${preserved_password_count} lokale PJSIP-Passwoerter wurden aus der vorhandenen ENV beibehalten."
+    fi
   fi
 
   local capacity_deviation="n" capacity_confirm="n" reachable_phone_capacity="$PROVIDER_PHONE_LIMIT"
@@ -1081,14 +1120,16 @@ DEFAULT_AMI_SECRET="${DEFAULT_AMI_SECRET:-mysecret}"
 sep "Optionen / Hostname / Provider-Daten"
 
 if [[ -f "$ENVFILE" ]]; then
+  # Vorhandene Werte frueh laden, damit lokale Telefon-Passwoerter bei einer
+  # erneuten Grundkonfiguration beibehalten werden koennen.
+  # shellcheck disable=SC1090
+  source "$ENVFILE"
   ask_yes_no RESET_OPTS "Vorhandene Optionen gefunden (${ENVFILE}). Neu setzen?" "n"
 else
   RESET_OPTS="y"
 fi
 
 if [[ "$RESET_OPTS" == "n" ]]; then
-  # shellcheck disable=SC1090
-  source "$ENVFILE"
   if [[ -z "${KFX_QUEUE_ONLY+x}" ]]; then
     ask_yes_no KFX_QUEUE_ONLY "Nur Telefoniewarteschlange installieren (ohne Faxfunktionen)?" "n"
     upsert_env_line KFX_QUEUE_ONLY "$KFX_QUEUE_ONLY"
