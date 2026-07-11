@@ -513,8 +513,12 @@ routes = []
 for extension in range(first, first + count):
     routes.extend([
         f"exten => {extension},1,NoOp(Interner Anruf zu Empfang {extension})",
-        f" same => n,Dial(PJSIP/{extension},120)",
+        f" same => n,Set(KFX_INTERNAL_TARGET_STATE=${{DEVICE_STATE(PJSIP/{extension})}})",
+        ' same => n,GotoIf($["${KFX_INTERNAL_TARGET_STATE}"="NOT_INUSE"]?dial:busy)',
+        f" same => n(dial),Dial(PJSIP/{extension},120)",
         " same => n,Hangup()",
+        f" same => n(busy),NoOp(Interner Anruf zu Empfang {extension} abgewiesen: ${{KFX_INTERNAL_TARGET_STATE}})",
+        " same => n,Hangup(17)",
         "",
     ])
 text = path.read_text(encoding="utf-8")
