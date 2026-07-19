@@ -2,8 +2,8 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.3.19
-# Stand:   2026-07-09
+# Version: 3.4.0
+# Stand:   2026-07-19
 # Autor:   Dr. Thomas Kienzle
 #
 # Modularer Installer (alles gehört dazu; Provider per Template-Auswahl).
@@ -15,12 +15,13 @@
 #   * optional: bisherigen Erstbenutzer entfernen
 #   * optional: Asterisk-menuselect manuell pruefen (Default: N)
 #   * optional: Installationsbericht mit Klartext-Passwoertern erzeugen (Default: Y)
+#   * optional: separaten WireGuard-Telefonie-Installer im Anschluss starten
 # - Asterisk baut nichtinteraktiv; menuselect ist nur noch optionale manuelle Pruefung
 # - Fix: INI-Patching via Python (kein awk/mawk Problem)
 # - Webroot: kienzlefax.php + index redirect + self-signed SSL 50y
 # - Remote Module:
 #     extensions.sh, pjsip-provider.sh, telefonie-queue.sh, worker.sh, agi.sh,
-#     pdf_with_header.sh, scan_ocr.sh
+#     pdf_with_header.sh, scan_ocr.sh, optional wireguard-installer.sh
 #
 # NEU in 3.2.1 (konservativ):
 # - /etc/default/kienzlefax-worker wird angelegt (KFX_AMI_PASS NICHT interaktiv; kommt aus ENV/Default).
@@ -117,7 +118,7 @@
 # NEU in 3.3.8:
 # - Anzahl Faxdrucker wird abgefragt (1-100, Default 5) und CUPS/Backend/sources.json folgen dynamisch.
 # - PDF-zu-Fax-Eingaenge werden abgefragt; Default bleibt ein unnummerierter Share `pdf-zu-fax`.
-# - Provider-Auswahl am Anfang: 1und1, Telekom, sipgate oder manuell; Provider-Template schreibt pjsip.conf.
+# - Provider-Auswahl am Anfang: 1und1, 1und1-TLS, Telekom, sipgate oder manuell; Provider-Template schreibt pjsip.conf.
 # - sources.json wird unter /srv/kienzlefax/config/sources.json erzeugt.
 # - SSH authorized_keys werden neben admin auch nach /root/.ssh/authorized_keys uebernommen.
 #
@@ -199,6 +200,16 @@
 #   standardmaessig aus der vorhandenen ENV beibehalten.
 # - Neue lokale SIP-Passwoerter werden nur nach expliziter Rueckfrage erzeugt; fehlende
 #   oder neu hinzugekommene Nebenstellen erhalten weiterhin automatisch ein Passwort.
+#
+# NEU in 3.4.0:
+# - Eigenes 1&1-TLS-Provider-Template fuer Fax sowie Telefonie-Ein-/Ausgang ergaenzt;
+#   das bestehende 1&1-UDP-Template bleibt unveraendert verfuegbar.
+# - Interne Nebenstellenanrufe klingeln nur bei einer freien Zielnebenstelle; Anklopfen wird
+#   durch eine DEVICE_STATE-Pruefung mit SIP-Besetzt abgewiesen.
+# - Der WireGuard-Telefonie-Installer kann am Anfang als separater Folgeinstaller ausgewaehlt
+#   und nach Abschluss der Hauptinstallation interaktiv ausgefuehrt werden.
+# - Eine gewaehlte WireGuard-Bindung wird dauerhaft in der Installer-ENV gespeichert;
+#   Asterisk wird nur ohne aktive Kanaele kontrolliert neu gestartet und danach geprueft.
 # ==============================================================================
 
 set -euo pipefail
@@ -214,6 +225,7 @@ URL_WORKER="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/r
 URL_AGI="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/agi.sh"
 URL_PDF_WITH_HEADER="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/pdf_with_header.sh"
 URL_SCAN_OCR="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/scan_ocr.sh"
+URL_WIREGUARD_INSTALLER="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/wireguard-installer.sh"
 
 # Web bootstrap
 WEBROOT="/var/www/html"
@@ -574,6 +586,7 @@ normalize_provider(){
   p="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
   case "$p" in
     1|1und1|und1|ionos) echo "1und1";;
+    5|1und1-tls|1und1tls|und1tls|ionostls|11-tls|11tls) echo "1und1-tls";;
     2|telekom|deutschetelekom|tkom|t-online|tonline) echo "telekom";;
     3|sipgate) echo "sipgate";;
     4|manual|manuell|manuellkonfiguration) echo "manual";;
@@ -584,6 +597,7 @@ normalize_provider(){
 provider_label(){
   case "${1:-}" in
     1und1) echo "1&1 Deutschland";;
+    1und1-tls) echo "1&1 Deutschland (TLS)";;
     telekom) echo "Deutsche Telekom";;
     sipgate) echo "sipgate";;
     manual) echo "Manuelle Konfiguration";;
@@ -596,7 +610,7 @@ provider_defaults(){
   local provider="$1" domain_var="$2" identify_var="$3" expiration_var="$4"
   local domain="" identify="" expiration="300"
   case "$provider" in
-    1und1)
+    1und1|1und1-tls)
       domain="sip.1und1.de"
       identify="212.227.0.0/16"
       ;;
@@ -629,11 +643,12 @@ collect_phone_provider_config(){
   echo "  2 = Deutsche Telekom (Template; Felder bitte pruefen)"
   echo "  3 = sipgate (Template; Felder bitte pruefen)"
   echo "  4 = manuell (Provider-Trunk wird nicht automatisch geschrieben)"
+  echo "  5 = 1&1 Deutschland ueber TLS 1.2 und SDES-SRTP"
   while true; do
     ask_default provider_in "Provider fuer ${description}" "1und1"
     provider="$(normalize_provider "$provider_in")"
     [[ -n "$provider" ]] && break
-    echo "Bitte 1und1, telekom, sipgate oder manuell eingeben."
+    echo "Bitte 1und1, 1und1-tls, telekom, sipgate oder manuell eingeben."
   done
   label="$(provider_label "$provider")"
 
@@ -1021,13 +1036,29 @@ upsert_env_line(){
 }
 
 collect_run_options(){
-  local cache_dir="/usr/local/lib/kienzlefax-installer/cache" default=""
+  local cache_dir="/usr/local/lib/kienzlefax-installer/cache" default="" phone_enabled=""
   default="n"; [[ -s "${cache_dir}/extensions.sh" ]] || default="y"
   ask_yes_no REMOTE_REFRESH_EXTENSIONS "Remote-Datei extensions.sh holen/aktualisieren?" "$default"
   default="n"; [[ -s "${cache_dir}/pjsip-provider.sh" ]] || default="y"
   ask_yes_no REMOTE_REFRESH_PJSIP_PROVIDER "Remote-Datei pjsip-provider.sh holen/aktualisieren?" "$default"
   default="n"; [[ -s "${cache_dir}/telefonie-queue.sh" ]] || default="y"
   ask_yes_no REMOTE_REFRESH_TELEFONIE_QUEUE "Remote-Datei telefonie-queue.sh holen/aktualisieren?" "$default"
+  phone_enabled="${PHONE_QUEUE_ENABLED:-${KFX_PHONE_QUEUE_ENABLED:-n}}"
+  if [[ "$phone_enabled" == "y" ]]; then
+    ask_yes_no RUN_WIREGUARD_INSTALLER \
+      "WireGuard-Telefonie-Installer nach Abschluss separat ausfuehren?" "n"
+    if [[ "$RUN_WIREGUARD_INSTALLER" == "y" ]]; then
+      default="n"; [[ -s "${cache_dir}/wireguard-installer.sh" ]] || default="y"
+      ask_yes_no REMOTE_REFRESH_WIREGUARD_INSTALLER \
+        "Remote-Datei wireguard-installer.sh holen/aktualisieren?" "$default"
+    else
+      REMOTE_REFRESH_WIREGUARD_INSTALLER="n"
+    fi
+  else
+    RUN_WIREGUARD_INSTALLER="n"
+    REMOTE_REFRESH_WIREGUARD_INSTALLER="n"
+    echo "[INFO] WireGuard-Telefonie-Folgeinstaller uebersprungen: Telefoniewarteschlange ist deaktiviert."
+  fi
   if [[ "${KFX_QUEUE_ONLY:-${QUEUE_ONLY:-n}}" == "y" ]]; then
     REMOTE_REFRESH_PJSIP_1UND1="n"
     REMOTE_REFRESH_WORKER="n"
@@ -1086,6 +1117,8 @@ write_run_options_to_env(){
   upsert_env_line KFX_REMOTE_REFRESH_PJSIP_PROVIDER "${REMOTE_REFRESH_PJSIP_PROVIDER:-n}"
   upsert_env_line KFX_REMOTE_REFRESH_PJSIP_1UND1 "${REMOTE_REFRESH_PJSIP_1UND1:-n}"
   upsert_env_line KFX_REMOTE_REFRESH_TELEFONIE_QUEUE "${REMOTE_REFRESH_TELEFONIE_QUEUE:-n}"
+  upsert_env_line KFX_RUN_WIREGUARD_INSTALLER "${RUN_WIREGUARD_INSTALLER:-n}"
+  upsert_env_line KFX_REMOTE_REFRESH_WIREGUARD_INSTALLER "${REMOTE_REFRESH_WIREGUARD_INSTALLER:-n}"
   upsert_env_line KFX_REMOTE_REFRESH_WORKER "${REMOTE_REFRESH_WORKER:-n}"
   upsert_env_line KFX_REMOTE_REFRESH_AGI "${REMOTE_REFRESH_AGI:-n}"
   upsert_env_line KFX_REMOTE_REFRESH_PDF_WITH_HEADER "${REMOTE_REFRESH_PDF_WITH_HEADER:-n}"
@@ -1186,13 +1219,14 @@ echo "  1 = 1&1 Deutschland (bisher getesteter Standard)"
 echo "  2 = Deutsche Telekom (Template; Felder bitte pruefen)"
 echo "  3 = sipgate (Template; Felder bitte pruefen)"
 echo "  4 = manuell (pjsip.conf wird nicht automatisch geschrieben)"
+echo "  5 = 1&1 Deutschland ueber TLS 1.2 und SDES-SRTP"
 while true; do
   ask_default PROVIDER_IN "Provider" "1und1"
   KFX_PROVIDER="$(normalize_provider "$PROVIDER_IN")"
   if [[ -n "$KFX_PROVIDER" ]]; then
     break
   fi
-  echo "Bitte 1und1, telekom, sipgate oder manuell eingeben."
+  echo "Bitte 1und1, 1und1-tls, telekom, sipgate oder manuell eingeben."
 done
 KFX_PROVIDER_LABEL="$(provider_label "$KFX_PROVIDER")"
 echo "[OK] Provider: ${KFX_PROVIDER_LABEL}"
@@ -1226,7 +1260,7 @@ echo "==== SIP Passwort eingeben (sichtbar aus = nein) ===="
 read_secret_twice SIP_PASSWORD "SIP Passwort"
 
 case "$KFX_PROVIDER" in
-  1und1)
+  1und1|1und1-tls)
     PROVIDER_DOMAIN_DEFAULT="sip.1und1.de"
     PROVIDER_IDENTIFY_DEFAULT="212.227.0.0/16"
     PROVIDER_EXPIRATION_DEFAULT="300"
@@ -1378,6 +1412,8 @@ KFX_REMOTE_REFRESH_EXTENSIONS=${REMOTE_REFRESH_EXTENSIONS}
 KFX_REMOTE_REFRESH_PJSIP_PROVIDER=${REMOTE_REFRESH_PJSIP_PROVIDER}
 KFX_REMOTE_REFRESH_PJSIP_1UND1=${REMOTE_REFRESH_PJSIP_1UND1}
 KFX_REMOTE_REFRESH_TELEFONIE_QUEUE=${REMOTE_REFRESH_TELEFONIE_QUEUE}
+KFX_RUN_WIREGUARD_INSTALLER=${RUN_WIREGUARD_INSTALLER}
+KFX_REMOTE_REFRESH_WIREGUARD_INSTALLER=${REMOTE_REFRESH_WIREGUARD_INSTALLER}
 KFX_REMOTE_REFRESH_WORKER=${REMOTE_REFRESH_WORKER}
 KFX_REMOTE_REFRESH_AGI=${REMOTE_REFRESH_AGI}
 KFX_REMOTE_REFRESH_PDF_WITH_HEADER=${REMOTE_REFRESH_PDF_WITH_HEADER}
@@ -3056,6 +3092,9 @@ sep "Remote Module holen/aktualisieren"
 maybe_fetch_one "extensions.sh"       "$URL_EXTENSIONS"       "${MOD_CACHE}/extensions.sh"       "${KFX_REMOTE_REFRESH_EXTENSIONS:-n}"
 maybe_fetch_one "pjsip-provider.sh"   "$URL_PJSIP_PROVIDER"   "${MOD_CACHE}/pjsip-provider.sh"   "${KFX_REMOTE_REFRESH_PJSIP_PROVIDER:-n}"
 maybe_fetch_one "telefonie-queue.sh"  "$URL_TELEFONIE_QUEUE"  "${MOD_CACHE}/telefonie-queue.sh"  "${KFX_REMOTE_REFRESH_TELEFONIE_QUEUE:-n}"
+if [[ "${KFX_RUN_WIREGUARD_INSTALLER:-n}" == "y" ]]; then
+  maybe_fetch_one "wireguard-installer.sh" "$URL_WIREGUARD_INSTALLER" "${MOD_CACHE}/wireguard-installer.sh" "${KFX_REMOTE_REFRESH_WIREGUARD_INSTALLER:-n}"
+fi
 if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]]; then
   maybe_fetch_one "pjsip-1und1.sh"      "$URL_PJSIP_1UND1"      "${MOD_CACHE}/pjsip-1und1.sh"      "${KFX_REMOTE_REFRESH_PJSIP_1UND1:-n}"
   maybe_fetch_one "worker.sh"           "$URL_WORKER"           "${MOD_CACHE}/worker.sh"           "${KFX_REMOTE_REFRESH_WORKER:-n}"
@@ -3277,3 +3316,9 @@ else
   echo "Konfiguration und Passwoerter: /etc/kienzlefax-installer.env (0600)"
 fi
 echo "Remote module cache: ${MOD_CACHE}"
+
+if [[ "${KFX_RUN_WIREGUARD_INSTALLER:-n}" == "y" ]]; then
+  sep "Optionaler Folgeinstaller: WireGuard-Telefonie"
+  echo "[INFO] Die Hauptinstallation ist abgeschlossen. Jetzt startet der separate interaktive WireGuard-Installer."
+  run_remote_script "${MOD_CACHE}/wireguard-installer.sh"
+fi

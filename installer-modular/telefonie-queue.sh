@@ -252,6 +252,7 @@ EOF
 append_provider(){
   local role="$1" object_prefix="$2" endpoint="$3"
   local prefix="KFX_PHONE_${role}" provider user password domain proxy identify expiration endpoint_context="kfx-provider-in"
+  local provider_transport="transport-udp" server_uri="" aor_contact="" endpoint_media_security=""
   if [[ "$QUEUE_ONLY" == "y" ]]; then
     endpoint_context="kfx-phone-in"
   fi
@@ -272,6 +273,16 @@ append_provider(){
     return 0
   fi
 
+  if [[ "$provider" == "1und1-tls" ]]; then
+    provider_transport="transport-1und1-tls"
+    server_uri='sip:tls-sip.1und1.de:5061\;transport=tls'
+    aor_contact='sip:tls-sip.1und1.de:5061\;transport=tls'
+    endpoint_media_security=$'media_encryption=sdes\nmedia_encryption_optimistic=no'
+  else
+    server_uri="sip:${domain}"
+    aor_contact="sip:${domain}"
+  fi
+
   [[ -n "$user" && -n "$password" && -n "$domain" ]] \
     || die "Providerdaten fuer Telefonie-${role} sind unvollstaendig."
   [[ "$expiration" =~ ^[0-9]+$ ]] || die "Ungueltige Registration Expiration fuer Telefonie-${role}."
@@ -290,9 +301,9 @@ append_provider(){
 
 [${object_prefix}-registration]
 type=registration
-transport=transport-udp
+transport=${provider_transport}
 outbound_auth=${object_prefix}-auth
-server_uri=sip:${domain}
+server_uri=${server_uri}
 client_uri=sip:${user}@${domain}
 contact_user=${user}
 retry_interval=60
@@ -308,14 +319,15 @@ password=${password_cfg}
 
 [${object_prefix}-aor]
 type=aor
-contact=sip:${domain}
+contact=${aor_contact}
 
 [${endpoint}]
 type=endpoint
-transport=transport-udp
+transport=${provider_transport}
 context=${endpoint_context}
 disallow=all
 allow=g722,alaw,ulaw
+${endpoint_media_security}
 outbound_auth=${object_prefix}-auth
 aors=${object_prefix}-aor
 direct_media=no

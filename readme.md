@@ -2,7 +2,7 @@
 
 **Faxserver und optionale Asterisk-Telefoniewarteschlange für Arztpraxen und andere kleine Einrichtungen**
 
-**Installerstand:** 3.3.19 · **Zielsystem:** Debian Linux · **Telefonie:** Asterisk/PJSIP
+**Installerstand:** 3.4.0 · **Zielsystem:** Debian Linux · **Telefonie:** Asterisk/PJSIP
 
 https://www.kienzlefax.de
 
@@ -34,6 +34,8 @@ Bei einem erneuten Lauf können vorhandene Optionen weiterverwendet werden. Die 
 werden anschließend erneut aus der ENV erzeugt, auch wenn keine Remote-Module aktualisiert werden.
 Lokale SIP-Passwörter für Telefon-Nebenstellen bleiben bei erneuter Konfiguration standardmäßig
 erhalten; neue Passwörter werden nur nach expliziter Rückfrage erzeugt.
+Für 1&1 stehen getrennte UDP- und TLS-Templates zur Verfügung. Bei aktivierter Telefoniewarteschlange
+kann außerdem ein separater WireGuard-Telefonie-Installer für die Ausführung im Anschluss gewählt werden.
 
 ## Installationsmodi
 
@@ -66,6 +68,7 @@ diesen Modus nicht automatisch entfernt.
 - Telefonie bevorzugt `G.722`, danach `alaw` und `ulaw`.
 - Überlast wird vor Annahme mit Q.850 Cause 17 beziehungsweise SIP `486 Busy Here` abgewiesen.
 - Eine netzseitige Besetztumleitung kann dadurch greifen; Steuercodes sind providerabhängig.
+- Interne Nebenstellenanrufe klingeln nur bei freiem Ziel; Anklopfen wird mit SIP-Besetzt verhindert.
 
 Empfohlene Standardgrenzen für die Hauptleitung sind vier externe Kanäle insgesamt,
 davon höchstens drei für Telefonie und bei der Vollinstallation höchstens drei für Fax.
@@ -85,6 +88,14 @@ Der Installer richtet bewusst keine Firewallregeln ein. Betreiber müssen insbes
 Quellnetzbegrenzung, starke Passwörter und gegebenenfalls Angriffsschutz selbst konfigurieren.
 Webports `80/443` der Fax-Vollinstallation dürfen wegen der enthaltenen Patientendaten nicht ins
 Internet weitergeleitet werden.
+
+## Optionale WireGuard-Telefonie
+
+Der WireGuard-Folgeinstaller wird nur nach vorheriger Auswahl und erst nach Abschluss der
+Hauptinstallation gestartet. Er erzeugt FRITZ!Box-Konfigurationen ohne Routing, NAT oder
+Firewallregeln. Wird der interne Asterisk-Transport auf WireGuard umgestellt, speichert er Interface,
+VPN-IP, Netz und SIP-Port dauerhaft in `/etc/kienzlefax-installer.env`. Ein Asterisk-Neustart erfolgt
+nur ohne aktive Kanäle; anschließend werden Transport und tatsächlich geöffneter UDP-Socket geprüft.
 
 **Einfach was ausdrucken auf einem der faxdrucker:**
 

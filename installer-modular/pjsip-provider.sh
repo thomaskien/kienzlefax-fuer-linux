@@ -8,6 +8,50 @@ if [ -f "$ENVFILE" ]; then
   source "$ENVFILE"
 fi
 
+KFX_1UND1_TLS_REQUIRED="n"
+if [[ "${KFX_PROVIDER:-1und1}" == "1und1-tls" ]] \
+  || [[ "${KFX_PHONE_QUEUE_ENABLED:-n}" == "y" && "${KFX_PHONE_IN_PROVIDER:-}" == "1und1-tls" ]] \
+  || [[ "${KFX_PHONE_QUEUE_ENABLED:-n}" == "y" \
+        && "${KFX_PHONE_SEPARATE_OUTBOUND:-n}" == "y" \
+        && "${KFX_PHONE_OUT_PROVIDER:-}" == "1und1-tls" ]]; then
+  KFX_1UND1_TLS_REQUIRED="y"
+fi
+
+ONEUNDONE_TLS_TRANSPORT_BLOCK=""
+if [[ "$KFX_1UND1_TLS_REQUIRED" == "y" ]]; then
+  [[ -r /etc/ssl/certs/ca-certificates.crt ]] || {
+    echo "ERROR: CA-Liste fuer 1&1-TLS fehlt: /etc/ssl/certs/ca-certificates.crt" >&2
+    exit 1
+  }
+  ONEUNDONE_TLS_TRANSPORT_BLOCK="$(cat <<'EOF'
+[transport-1und1-tls]
+type=transport
+protocol=tls
+bind=0.0.0.0:5061
+method=tlsv1_2
+verify_server=yes
+verify_client=no
+require_client_cert=no
+ca_list_file=/etc/ssl/certs/ca-certificates.crt
+allow_reload=no
+EOF
+)"
+fi
+
+wait_for_asterisk_cli() {
+  local timeout="${1:-60}"
+  local waited=0
+  command -v asterisk >/dev/null 2>&1 || return 1
+  while (( waited < timeout )); do
+    if asterisk -rx "core show version" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
 if [[ "${KFX_QUEUE_ONLY:-n}" == "y" ]]; then
   SIP_BIND_PORT="${KFX_SIP_BIND_PORT:-5070}"
   PUBLIC_FQDN="${KFX_PUBLIC_FQDN:-}"
@@ -33,6 +77,8 @@ user_agent=KienzleQueue
 type=transport
 protocol=udp
 bind=0.0.0.0:${SIP_BIND_PORT}
+
+${ONEUNDONE_TLS_TRANSPORT_BLOCK}
 EOF
     if [[ -n "$PUBLIC_FQDN" ]]; then
       printf 'external_signaling_address=%s\nexternal_media_address=%s\n' "$PUBLIC_FQDN" "$PUBLIC_FQDN"
@@ -58,8 +104,17 @@ EOF
     chmod 0640 "$PJSIP"
     chown root:asterisk "$PJSIP" 2>/dev/null || true
     systemctl restart asterisk
+    wait_for_asterisk_cli 90 || {
+      echo "ERROR: Asterisk CLI nach Restart nicht bereit." >&2
+      exit 1
+    }
   else
     asterisk -rx "pjsip reload" >/dev/null 2>&1 || true
+  fi
+  if [[ "$KFX_1UND1_TLS_REQUIRED" == "y" ]] \
+    && ! asterisk -rx "pjsip show transport transport-1und1-tls" >/dev/null 2>&1; then
+    echo "ERROR: 1&1-TLS-Transport wurde von Asterisk nicht geladen." >&2
+    exit 1
   fi
   echo "[OK] Queue-only-PJSIP ohne Fax-Endpoint geschrieben: $PJSIP"
   exit 0
@@ -67,13 +122,40 @@ fi
 
 KFX_PROVIDER="${KFX_PROVIDER:-1und1}"
 if [[ "$KFX_PROVIDER" == "manual" ]]; then
+  MANUAL_PJSIP="/etc/asterisk/pjsip.conf"
+  MANUAL_RESTART_REQUIRED="n"
   echo "[INFO] Provider steht auf manuell; pjsip.conf wird nicht automatisch geschrieben."
   echo "[INFO] Bitte /etc/asterisk/pjsip.conf selbst anlegen/anpassen und Endpoint '${KFX_PJSIP_ENDPOINT:-kfx-provider-endpoint}' verwenden."
   echo "[INFO] Fuer UDP-/MTU-Schutz compact_headers=yes (type=system) und einen kurzen user_agent (type=global) setzen; danach Asterisk neu starten."
-  if [[ -f /etc/asterisk/pjsip.conf ]] \
-    && ! grep -Fxq '#tryinclude "/etc/asterisk/pjsip-kfx-telefonie.conf"' /etc/asterisk/pjsip.conf; then
-    cp -a /etc/asterisk/pjsip.conf "/etc/asterisk/pjsip.conf.old.kienzlefax.$(date +%Y%m%d-%H%M%S)"
-    printf '\n#tryinclude "/etc/asterisk/pjsip-kfx-telefonie.conf"\n' >>/etc/asterisk/pjsip.conf
+  if [[ -f "$MANUAL_PJSIP" ]] \
+    && ! grep -Fxq '#tryinclude "/etc/asterisk/pjsip-kfx-telefonie.conf"' "$MANUAL_PJSIP"; then
+    cp -a "$MANUAL_PJSIP" "${MANUAL_PJSIP}.old.kienzlefax.$(date +%Y%m%d-%H%M%S)"
+    printf '\n#tryinclude "/etc/asterisk/pjsip-kfx-telefonie.conf"\n' >>"$MANUAL_PJSIP"
+  fi
+  if [[ "$KFX_1UND1_TLS_REQUIRED" == "y" ]] \
+    && [[ -f "$MANUAL_PJSIP" ]] \
+    && ! grep -Fxq '[transport-1und1-tls]' "$MANUAL_PJSIP"; then
+    ACTIVE_CHANNELS="$(asterisk -rx "core show channels concise" 2>/dev/null | awk 'NF {count++} END {print count+0}')"
+    [[ "$ACTIVE_CHANNELS" =~ ^[0-9]+$ ]] || ACTIVE_CHANNELS=0
+    (( ACTIVE_CHANNELS == 0 )) || {
+      echo "ERROR: Neuer 1&1-TLS-Transport braucht einen Neustart, aber ${ACTIVE_CHANNELS} Kanaele sind aktiv." >&2
+      exit 1
+    }
+    cp -a "$MANUAL_PJSIP" "${MANUAL_PJSIP}.old.kienzlefax.$(date +%Y%m%d-%H%M%S)"
+    printf '\n%s\n' "$ONEUNDONE_TLS_TRANSPORT_BLOCK" >>"$MANUAL_PJSIP"
+    MANUAL_RESTART_REQUIRED="y"
+  fi
+  if [[ "$MANUAL_RESTART_REQUIRED" == "y" ]]; then
+    systemctl restart asterisk || service asterisk restart
+    wait_for_asterisk_cli 90 || {
+      echo "ERROR: Asterisk CLI nach Restart nicht bereit." >&2
+      exit 1
+    }
+  fi
+  if [[ "$KFX_1UND1_TLS_REQUIRED" == "y" ]] \
+    && ! asterisk -rx "pjsip show transport transport-1und1-tls" >/dev/null 2>&1; then
+    echo "ERROR: 1&1-TLS-Transport wurde von Asterisk nicht geladen." >&2
+    exit 1
   fi
   exit 0
 fi
@@ -88,11 +170,23 @@ PROVIDER_LABEL="${KFX_PROVIDER_LABEL:-$KFX_PROVIDER}"
 PROVIDER_DOMAIN="${KFX_SIP_DOMAIN:-}"
 PJSIP_OUTBOUND_PROXY="${PJSIP_OUTBOUND_PROXY:-${KFX_SIP_OUTBOUND_PROXY:-}}"
 PJSIP_IDENTIFY_MATCH="${PJSIP_IDENTIFY_MATCH:-${KFX_SIP_IDENTIFY_MATCH:-}}"
+PROVIDER_TRANSPORT="transport-udp"
+PJSIP_SERVER_URI=""
+PJSIP_AOR_CONTACT=""
+ENDPOINT_MEDIA_SECURITY=""
 
 case "$KFX_PROVIDER" in
   1und1)
     PROVIDER_DOMAIN="${PROVIDER_DOMAIN:-sip.1und1.de}"
     PJSIP_IDENTIFY_MATCH="${PJSIP_IDENTIFY_MATCH:-212.227.0.0/16}"
+    ;;
+  1und1-tls)
+    PROVIDER_DOMAIN="${PROVIDER_DOMAIN:-sip.1und1.de}"
+    PJSIP_IDENTIFY_MATCH="${PJSIP_IDENTIFY_MATCH:-212.227.0.0/16}"
+    PROVIDER_TRANSPORT="transport-1und1-tls"
+    PJSIP_SERVER_URI='sip:tls-sip.1und1.de:5061\;transport=tls'
+    PJSIP_AOR_CONTACT='sip:tls-sip.1und1.de:5061\;transport=tls'
+    ENDPOINT_MEDIA_SECURITY=$'media_encryption=sdes\nmedia_encryption_optimistic=no'
     ;;
   telekom)
     PROVIDER_DOMAIN="${PROVIDER_DOMAIN:-tel.t-online.de}"
@@ -101,6 +195,9 @@ case "$KFX_PROVIDER" in
     PROVIDER_DOMAIN="${PROVIDER_DOMAIN:-sipgate.de}"
     ;;
 esac
+
+PJSIP_SERVER_URI="${PJSIP_SERVER_URI:-sip:${PROVIDER_DOMAIN}}"
+PJSIP_AOR_CONTACT="${PJSIP_AOR_CONTACT:-sip:${PROVIDER_DOMAIN}}"
 
 REG_NAME="${KFX_PJSIP_REGISTRATION:-kfx-provider}"
 AUTH_NAME="${KFX_PJSIP_AUTH:-kfx-provider-auth}"
@@ -135,20 +232,6 @@ ast_cfg_value() {
 
 PJSIP_PASS_CFG="$(ast_cfg_value "$PJSIP_PASS")"
 
-wait_for_asterisk_cli() {
-  local timeout="${1:-60}"
-  local waited=0
-  command -v asterisk >/dev/null 2>&1 || return 1
-  while (( waited < timeout )); do
-    if asterisk -rx "core show version" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 1
-    waited=$((waited + 1))
-  done
-  return 1
-}
-
 registration_status() {
   local out
   out="$(asterisk -rx "pjsip show registrations" 2>/dev/null || true)"
@@ -180,10 +263,58 @@ active_channel_count() {
   awk 'NF {count++} END {print count+0}' <<<"$out"
 }
 
+pjsip_section_setting_equals() {
+  local file="$1" section="$2" key="$3" expected="$4"
+  awk -v wanted="[${section}]" -v wanted_key="$key" -v expected="$expected" '
+    /^[[:space:]]*\[/ {
+      header=$0
+      sub(/^[[:space:]]*/, "", header)
+      sub(/[[:space:]]*$/, "", header)
+      in_section=(header == wanted)
+      next
+    }
+    in_section {
+      line=$0
+      pos=index(line, "=")
+      if (!pos) next
+      current_key=substr(line, 1, pos - 1)
+      value=substr(line, pos + 1)
+      sub(/^[[:space:]]*/, "", current_key)
+      sub(/[[:space:]]*$/, "", current_key)
+      sub(/^[[:space:]]*/, "", value)
+      sub(/[[:space:]]*$/, "", value)
+      if (current_key == wanted_key && value == expected) found=1
+    }
+    END {exit(found ? 0 : 1)}
+  ' "$file"
+}
+
 PJSIP="/etc/asterisk/pjsip.conf"
 PJSIP_RESTART_REQUIRED="n"
-if ! grep -Eq '^[[:space:]]*compact_headers[[:space:]]*=[[:space:]]*yes([[:space:]]*;.*)?$' "$PJSIP" 2>/dev/null \
-  || ! grep -Eq "^[[:space:]]*bind[[:space:]]*=[[:space:]]*0[.]0[.]0[.]0:${SIP_BIND_PORT}([[:space:]]*;.*)?$" "$PJSIP" 2>/dev/null; then
+if ! pjsip_section_setting_equals "$PJSIP" "system" "compact_headers" "yes" \
+  || ! pjsip_section_setting_equals "$PJSIP" "transport-udp" "type" "transport" \
+  || ! pjsip_section_setting_equals "$PJSIP" "transport-udp" "protocol" "udp" \
+  || ! pjsip_section_setting_equals "$PJSIP" "transport-udp" "bind" "0.0.0.0:${SIP_BIND_PORT}"; then
+  PJSIP_RESTART_REQUIRED="y"
+fi
+if [[ "$KFX_1UND1_TLS_REQUIRED" == "y" ]]; then
+  while IFS='|' read -r key expected; do
+    if ! pjsip_section_setting_equals "$PJSIP" "transport-1und1-tls" "$key" "$expected"; then
+      PJSIP_RESTART_REQUIRED="y"
+      break
+    fi
+  done <<'EOF'
+type|transport
+protocol|tls
+bind|0.0.0.0:5061
+method|tlsv1_2
+verify_server|yes
+verify_client|no
+require_client_cert|no
+ca_list_file|/etc/ssl/certs/ca-certificates.crt
+allow_reload|no
+EOF
+elif grep -Fxq '[transport-1und1-tls]' "$PJSIP" 2>/dev/null; then
   PJSIP_RESTART_REQUIRED="y"
 fi
 cp -a "$PJSIP" "${PJSIP}.old.kienzlefax.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
@@ -250,6 +381,8 @@ type=transport
 protocol=udp
 bind=0.0.0.0:${SIP_BIND_PORT}
 
+${ONEUNDONE_TLS_TRANSPORT_BLOCK}
+
 ${EXTERNAL_ADDR_LINES}
 
 local_net = 10.0.0.0/8
@@ -257,9 +390,9 @@ local_net = 192.168.0.0/16
 
 [${REG_NAME}]
 type=registration
-transport=transport-udp
+transport=${PROVIDER_TRANSPORT}
 outbound_auth=${AUTH_NAME}
-server_uri=sip:${PROVIDER_DOMAIN}
+server_uri=${PJSIP_SERVER_URI}
 client_uri=${PJSIP_CLIENT_URI}
 contact_user=${PJSIP_USER}
 retry_interval=60
@@ -275,14 +408,15 @@ password=${PJSIP_PASS_CFG}
 
 [${AOR_NAME}]
 type=aor
-contact=sip:${PROVIDER_DOMAIN}
+contact=${PJSIP_AOR_CONTACT}
 
 [${ENDPOINT_NAME}]
 type=endpoint
-transport=transport-udp
+transport=${PROVIDER_TRANSPORT}
 context=kfx-provider-in
 disallow=all
 allow=alaw,ulaw
+${ENDPOINT_MEDIA_SECURITY}
 outbound_auth=${AUTH_NAME}
 aors=${AOR_NAME}
 direct_media=no
@@ -338,6 +472,11 @@ if command -v asterisk >/dev/null 2>&1; then
   else
     echo "[INFO] Reloading PJSIP..."
     asterisk -rx "pjsip reload" || true
+  fi
+  if [[ "$KFX_1UND1_TLS_REQUIRED" == "y" ]] \
+    && ! asterisk -rx "pjsip show transport transport-1und1-tls" >/dev/null 2>&1; then
+    echo "ERROR: 1&1-TLS-Transport wurde von Asterisk nicht geladen." >&2
+    exit 1
   fi
   asterisk -rx "pjsip send register ${REG_NAME}" || true
 
