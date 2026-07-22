@@ -60,7 +60,11 @@
       display:flex;
       align-items:center;
       gap:10px;
+      color:var(--text);
+      text-decoration:none;
     }
+
+    .brand:hover{ text-decoration:underline; }
 
     .dot{
       width:10px;
@@ -297,11 +301,9 @@
 <div class="wrap">
 
 <header>
-  <div class="brand"><span class="dot"></span>kienzlefax - Fax für Prax</div>
+  <a class="brand" href="https://kienzlebox.de/kienzlebox-frame.php?projekt=kienzlefax"><span class="dot"></span>kienzlefax - Fax für Prax</a>
   <nav>
-    <a href="http://kienzlelock.de">kienzlelock.de - NFC Bildschirmsperre</a>
-    <a href="https://fragebogenpi.de">fragebogenpi.de - Open Source Anamnesebögen</a>
-    <a href="http://wartezi.de">wartezi.de - Patientenaufruf</a>
+    <a href="https://kienzlebox.de/">Alle Projekte: kienzlebox.de</a>
     <a href="https://github.com/thomaskien/kienzlefax-fuer-linux">GitHub</a>
     <a href="/impressum/">Impressum</a>
   </nav>
