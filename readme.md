@@ -37,6 +37,15 @@ erhalten; neue Passwörter werden nur nach expliziter Rückfrage erzeugt.
 Für 1&1 stehen getrennte UDP- und TLS-Templates zur Verfügung. Bei aktivierter Telefoniewarteschlange
 kann außerdem ein separater WireGuard-Telefonie-Installer für die Ausführung im Anschluss gewählt werden.
 
+## Bestehende Installation pausieren oder wieder aktivieren
+
+Der separate Assistent **`kienzlefax-verwalten.sh` (0.1.0)** schaltet Faxversand,
+Faxempfang, Telefonie, Webinterface, Scan-/Fax-OCR, einzelne Netzwerkfreigaben und
+Faxdrucker gezielt um. Dokumente und Konfigurationen bleiben zur Wiederherstellung
+erhalten. Er zeigt zuerst eine Vorschau; die letzte Änderung lässt sich zurücknehmen.
+
+[Download, Bedienung und Grenzen des Verwaltungsassistenten](README-verwalten.md)
+
 ## Installationsmodi
 
 ### Vollinstallation
