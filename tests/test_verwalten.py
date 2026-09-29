@@ -99,6 +99,38 @@ path = /srv/other
 guest ok = no
 '''
 
+# Shared-host layout: another application re-enters [global] after fax shares.
+# Keep its settings and unrelated shares byte-for-byte, including print commands.
+SHARED_SMB = SMB + '''
+# BEGIN OTHER APPLICATION SHARES
+[GDT]
+path = /srv/fragebogenpi/GDT
+force user = www-data
+[webroot-lan]
+path = /var/www/html
+valid users = admin
+# END OTHER APPLICATION SHARES
+
+# BEGIN TERMINZETTEL MANAGED
+[global]
+cache directory = /run/terminzettel/samba-cache
+log file = /dev/null
+logging = file
+log level = 0
+
+[Terminzettel]
+path = /run/terminzettel/spool
+printable = yes
+printing = bsd
+print command = /usr/local/sbin/terminzettel-submit "%s"
+# END TERMINZETTEL MANAGED
+
+[formularkopf-klebchen]
+path = /var/spool/samba/formularkopf-klebchen
+printable = yes
+printing = cups
+'''
+
 
 class FakeHost(v.Host):
     def __init__(self):
@@ -510,6 +542,48 @@ class ManagementTests(unittest.TestCase):
                 self.host.put(v.SMB, text)
                 with self.assertRaises(v.Error):
                     self.manager.plan({'share:scan-eingang'})
+
+    def test_repeated_global_inventory_and_status_are_read_only(self):
+        self.host.put(v.SMB, SHARED_SMB)
+        found = self.manager.inventory()
+        self.assertEqual(found.count('share:scan-eingang'), 1)
+        for name in ('global', 'gdt', 'webroot-lan', 'terminzettel', 'formularkopf-klebchen'):
+            self.assertNotIn('share:' + name, found)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(v.show_status(self.manager))
+        self.assertFalse(self.host.writes)
+
+    def test_repeated_global_does_not_block_unrelated_web_change(self):
+        self.host.put(v.SMB, SHARED_SMB)
+        before = self.host.snapshot(v.SMB)
+        self.apply({'web'})
+        self.assertEqual(self.host.snapshot(v.SMB), before)
+        self.assertNotIn(v.SMB, self.host.writes)
+
+    def test_repeated_global_share_change_preserves_other_applications(self):
+        self.host.put(v.SMB, SHARED_SMB, mode=0o640)
+        before = self.host.snapshot(v.SMB)
+        self.apply({'share:scan-eingang'})
+        expected = SHARED_SMB.replace('[scan-eingang]\npath = /srv/scan/ocr\navailable = yes\n',
+                                      '[scan-eingang]\n   available = no\npath = /srv/scan/ocr\n')
+        self.assertEqual(v.snapshot_text(self.host.snapshot(v.SMB)), expected)
+        self.assertEqual(self.host.snapshot(v.SMB)['mode'], before['mode'])
+        self.apply(set())
+        self.assertEqual(self.host.snapshot(v.SMB), before)
+
+    def test_repeated_global_undo_restores_original_file(self):
+        self.host.put(v.SMB, SHARED_SMB, mode=0o640)
+        before = self.host.snapshot(v.SMB)
+        plan = self.apply({'share:scan-eingang', 'web'})
+        self.manager.rollback(plan)
+        self.assertEqual(self.host.snapshot(v.SMB), before)
+        self.assertIsNone(self.host.snapshot(v.WEB))
+
+    def test_repeated_global_is_case_insensitive(self):
+        self.host.put(v.SMB, SMB + '\n[ GLOBAL ]\nlog level = 0\n')
+        self.assertIn('share:scan-eingang', self.manager.inventory())
+        self.apply({'share:scan-eingang'})
+        self.assertIn('[ GLOBAL ]\nlog level = 0\n', v.snapshot_text(self.host.snapshot(v.SMB)))
 
     def test_other_samba_share_with_spaces_and_dollar_is_preserved(self):
         extra = '\n[print$]\npath=/drivers\n[Our documents]\npath=/documents\n'

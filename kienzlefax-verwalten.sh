@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # IMMER verwenden wenn KienzleFax-Funktionen reversibel pausiert oder wieder freigegeben werden sollen.
-# Version 0.1.0 (2026-09-29)
+# Version 0.1.1 (2026-09-29)
 # Changelog:
+# 0.1.1: Wiederholte Samba-[global]-Abschnitte zulassen und unveraendert erhalten.
 # 0.1.0: Separater Verwaltungsassistent mit Vorschau, Einzelschaltern und Ruecknahme.
 set -euo pipefail
 command -v python3 >/dev/null 2>&1 || { echo 'Python 3 wird benoetigt.' >&2; exit 1; }
@@ -22,7 +23,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = '0.1.0'
+VERSION = '0.1.1'
 STATE_DIR = '/var/lib/kienzlefax-verwalten'
 STATE_FILE = STATE_DIR + '/state.json'
 PENDING = STATE_DIR + '/pending.json'
@@ -108,8 +109,10 @@ def sections(text, asterisk=False):
         end = found[i + 1][1] if i + 1 < len(found) else len(lines)
         result.append((name, start, end))
     if not asterisk:
-        names = [name.lower() for name, _, _ in result]
-        require(len(names) == len(set(names)), 'Doppelte Samba-Sektionen: bitte zuerst bereinigen.')
+        # Samba can re-enter [global], e.g. for another application's settings.
+        # Preserve every block; only repeated share definitions remain ambiguous.
+        names = [name.lower() for name, _, _ in result if name.lower() != 'global']
+        require(len(names) == len(set(names)), 'Doppelte Samba-Freigaben: bitte zuerst bereinigen.')
     return lines, result
 
 

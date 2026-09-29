@@ -3,7 +3,7 @@
 IMMER verwenden wenn einzelne KienzleFax-Funktionen auf einem bestehenden Gerät
 pausiert oder wieder freigegeben werden sollen.
 
-**Werkzeug:** `kienzlefax-verwalten.sh` · **Version:** 0.1.0 · **Stand:** 29.09.2026
+**Werkzeug:** `kienzlefax-verwalten.sh` · **Version:** 0.1.1 · **Stand:** 29.09.2026
 
 Der separate Terminal-Assistent verändert die bestehende Installation gezielt.
 Dokumente, wartende Faxe, Benutzer, Zugangsdaten und installierte Pakete bleiben
@@ -61,6 +61,12 @@ Ein Eingabeabbruch vor der Bestätigung verändert keine Konfigurationen oder Di
 Einzeln auswählbar sind die vorhandenen Freigaben `hierhin-scannen-fuer-ocr`,
 `scan-eingang`, `fax-eingang`, `sendeberichte`, `sendefehler-eingang`,
 `sendefehler-berichte` sowie `pdf-zu-fax` beziehungsweise `pdf-zu-faxN`.
+
+Mehrere `[global]`-Abschnitte, beispielsweise durch eine zusätzliche
+Terminzettel-Anwendung, werden akzeptiert und unverändert erhalten. Fremde
+Freigaben und Drucker werden nicht als KienzleFax-Freigaben behandelt. Mehrfach
+definierte Freigaben mit demselben Namen bleiben vorerst von der automatischen
+Verwaltung ausgeschlossen.
 
 Wenn **Faxversand und Faxempfang gemeinsam aus** sind, wird zusätzlich die
 Fax-Providerregistrierung aus der aktiven Konfiguration entfernt und abgemeldet.
@@ -166,5 +172,9 @@ Technische Referenzen:
 
 ## Changelog
 
+- **0.1.1 – 29.09.2026:** Wiederholte Samba-`[global]`-Abschnitte verhindern die
+  Bestandsaufnahme nicht mehr. Alle globalen Blöcke und Fremdfreigaben bleiben
+  bei der Verwaltung und Rücknahme unverändert. Regressionstests decken eine
+  gemeinsame Installation mit weiteren Anwendungen ab.
 - **0.1.0 – 29.09.2026:** Erster separater Verwaltungsassistent mit einzeln wählbaren
   Bereichen, Vorschau, geschützten Sicherungen, Abweichungserkennung und Rücknahme.
