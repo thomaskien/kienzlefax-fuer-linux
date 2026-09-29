@@ -132,6 +132,18 @@ printing = cups
 '''
 
 
+def generated_fax_dialplan():
+    """Include the footer appended *after* the installer's main heredoc."""
+    source = (SCRIPT.parent / 'installer-modular/extensions.sh').read_text()
+    text = re.findall(r'cat >"\$EXT" <<\'EOF\'\n(.*?)\nEOF', source, re.S)[-1]
+    footer = re.search(r"^printf '\\n(#tryinclude [^']+)\\n' >>\"\$EXT\"$", source, re.M)
+    if footer is None:
+        raise AssertionError('Installer footer changed; update the complete dialplan fixture.')
+    text = text.replace('__KFX_FAX_DID__', '12345')
+    text = text.replace('__KFX_PHONE_ROUTE__', 'exten => 67890,1,Goto(kfx-phone-in,s,1)')
+    return text + '\n\n' + footer.group(1) + '\n'
+
+
 class FakeHost(v.Host):
     def __init__(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -391,7 +403,7 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual(original, self.host.snapshot(v.PJSIP))
 
     def test_entry_patch_preserves_inflight_priorities_and_runtime_variables(self):
-        transformed = v.block_entries(EXT, {'fax-in'})
+        transformed = v.block_entries(EXT, {'fax-in'}, allowed_file_includes=(v.PHONE_DIALPLAN_INCLUDE,))
         self.assertIn('exten => 12345,1,Hangup(17)', transformed)
         self.assertIn(' same => n,ReceiveFAX(${TIFF})', transformed)
         self.assertIn('exten => h,1,NoOp(cleanup)', transformed)
@@ -607,17 +619,56 @@ class ManagementTests(unittest.TestCase):
 
     def test_actual_generated_dialplans_keep_all_following_priorities(self):
         root = SCRIPT.parent
-        fax_script = (root / 'installer-modular/extensions.sh').read_text()
-        fax = re.findall(r'cat >"\$EXT" <<\'EOF\'\n(.*?)\nEOF', fax_script, re.S)[-1]
+        fax = generated_fax_dialplan()
         phone_script = (root / 'installer-modular/telefonie-queue.sh').read_text()
         phone = re.search(r'cat >"\$EXTENSIONS_TMP" <<\'EOF\'\n(.*?)\nEOF', phone_script, re.S).group(1)
-        for original, contexts in ((fax, {'fax-in'}), (phone, v.PHONE_CONTEXTS)):
+        for original, contexts, allowed in ((fax, {'fax-in'}, (v.PHONE_DIALPLAN_INCLUDE,)),
+                                            (phone, v.PHONE_CONTEXTS, ())):
             with self.subTest(contexts=contexts):
-                result = v.block_entries(original, contexts)
+                result = v.block_entries(original, contexts, allowed_file_includes=allowed)
                 unchanged_before = [line for line in original.splitlines() if not line.strip().startswith('exten')]
                 unchanged_after = [line for line in result.splitlines() if not line.strip().startswith('exten')]
                 self.assertEqual(unchanged_before, unchanged_after)
                 self.assertIn('${', result)
+
+    def test_installer_footer_fax_pause_preserves_phone_include(self):
+        original = generated_fax_dialplan()
+        self.host.put(v.EXT, original, mode=0o640)
+        phone = self.host.snapshot(v.PHONE_EXT)
+        self.apply({'fax_receive'})
+        updated = v.snapshot_text(self.host.snapshot(v.EXT))
+        self.assertTrue(updated.endswith('#tryinclude "/etc/asterisk/extensions-kfx-telefonie.conf"\n'))
+        self.assertEqual(updated.count('#tryinclude'), original.count('#tryinclude'))
+        self.assertEqual(updated, original.replace('exten => 12345,1,NoOp(Inbound Fax)',
+                                                  'exten => 12345,1,Hangup(17) ; KienzleFax Verwaltung'))
+        self.assertEqual(self.host.snapshot(v.PHONE_EXT), phone)
+
+    def test_installer_footer_fax_shutdown_roundtrip_and_undo(self):
+        self.host.put(v.EXT, generated_fax_dialplan(), mode=0o640)
+        before = copy.deepcopy(self.host.files)
+        plan = self.apply({'fax_send', 'fax_receive', 'share:scan-eingang'})
+        self.manager.rollback(plan)
+        for path in (v.EXT, v.PJSIP, v.PHONE_EXT, v.PHONE_PJSIP, v.SMB):
+            self.assertEqual(self.host.snapshot(path), before[path])
+        self.apply({'fax_send', 'fax_receive'})
+        self.apply(set())
+        self.assertEqual(self.host.snapshot(v.EXT), before[v.EXT])
+
+    def test_installer_footer_keeps_unknown_directives_blocked(self):
+        for directive in ('include => other-context', 'switch => Realtime/other',
+                          'eswitch => other', 'lswitch => other', '#exec /bin/true',
+                          '#tryinclude "/etc/asterisk/other.conf"'):
+            with self.subTest(directive=directive):
+                self.host.put(v.EXT, generated_fax_dialplan() + directive + '\n')
+                with self.assertRaises(v.Error):
+                    self.manager.plan({'fax_receive'})
+                self.assertFalse(self.host.writes)
+
+    def test_installer_footer_is_not_implicitly_allowed_in_phone_file(self):
+        self.host.put(v.PHONE_EXT, PHONE_EXT + '\n#tryinclude "/etc/asterisk/extensions-kfx-telefonie.conf"\n')
+        with self.assertRaises(v.Error):
+            self.manager.plan({'phone'})
+        self.assertFalse(self.host.writes)
 
     def test_runtime_dialplan_verification_requires_first_priority(self):
         with patch.object(self.host, 'ast', return_value="'12345' => 1. NoOp(original)\n 5. Hangup(17)"):

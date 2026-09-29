@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # IMMER verwenden wenn KienzleFax-Funktionen reversibel pausiert oder wieder freigegeben werden sollen.
-# Version 0.1.1 (2026-09-29)
+# Version 0.1.2 (2026-09-29)
 # Changelog:
+# 0.1.2: Den freigegebenen Telefonie-Datei-Include auch am Dialplan-Ende erhalten.
 # 0.1.1: Wiederholte Samba-[global]-Abschnitte zulassen und unveraendert erhalten.
 # 0.1.0: Separater Verwaltungsassistent mit Vorschau, Einzelschaltern und Ruecknahme.
 set -euo pipefail
@@ -23,7 +24,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = '0.1.1'
+VERSION = '0.1.2'
 STATE_DIR = '/var/lib/kienzlefax-verwalten'
 STATE_FILE = STATE_DIR + '/state.json'
 PENDING = STATE_DIR + '/pending.json'
@@ -33,6 +34,7 @@ EXT = '/etc/asterisk/extensions.conf'
 PJSIP = '/etc/asterisk/pjsip.conf'
 PHONE_EXT = '/etc/asterisk/extensions-kfx-telefonie.conf'
 PHONE_PJSIP = '/etc/asterisk/pjsip-kfx-telefonie.conf'
+PHONE_DIALPLAN_INCLUDE = '#tryinclude "/etc/asterisk/extensions-kfx-telefonie.conf"'
 WEB = '/etc/apache2/conf-enabled/zz-kienzlefax-verwalten.conf'
 SERVICES = {'fax_send': 'kienzlefax-worker.service',
             'scan_ocr': 'scan-ocr.service', 'fax_ocr': 'scan-ocr-fax.service'}
@@ -142,8 +144,9 @@ def samba_render(text, disabled):
     return ''.join(lines)
 
 
-def block_entries(text, contexts):
+def block_entries(text, contexts, allowed_file_includes=()):
     """Replace only priority 1: channels already past entry keep all subsequent priorities."""
+    validate_includes(text, allowed_file_includes)
     lines, parts = sections(text, asterisk=True)
     names = [name for name, _, _ in parts]
     require(len(names) == len(set(names)), 'Doppelte Dialplan-Kontexte: bitte manuell pruefen.')
@@ -154,8 +157,13 @@ def block_entries(text, contexts):
         changed = 0
         for index in range(start + 1, end):
             s = lines[index].strip()
-            if s.startswith(('include', 'switch', 'eswitch', 'lswitch', '#')):
-                raise Error('Individueller Dialplan im betroffenen Kontext: automatische Sperre verweigert.')
+            if s.startswith('#'):
+                # File directives were checked above. The installer appends the
+                # known phone include after [fax-in]; keep it verbatim in place.
+                continue
+            if s.startswith(('include', 'switch', 'eswitch', 'lswitch')):
+                raise Error('Individueller Dialplan in [' + name + '], Zeile ' + str(index + 1) +
+                            ': Kontext-Include/Switch; automatische Sperre verweigert.')
             match = re.match(r'^(\s*exten\s*=>\s*([^,]+),\s*1(?:\([^)]*\))?\s*,).*(\n?)$', lines[index])
             if match and match.group(2).strip() != 'h':
                 lines[index] = match.group(1) + 'Hangup(17) ; KienzleFax Verwaltung\n'
@@ -548,9 +556,8 @@ class Manager:
             render(WEB, web_block())
         if 'fax_receive' in desired:
             text = self.base_text(EXT)
-            validate_includes(text, ('#tryinclude "/etc/asterisk/extensions-kfx-telefonie.conf"',))
             require('ReceiveFAX(' in text, 'Kein bekannter ReceiveFAX-Dialplan vorhanden.')
-            render(EXT, block_entries(text, {'fax-in'}))
+            render(EXT, block_entries(text, {'fax-in'}, allowed_file_includes=(PHONE_DIALPLAN_INCLUDE,)))
         if {'fax_send', 'fax_receive'} <= desired:
             text, registrations, _ = pjsip_render(self.base_text(PJSIP))
             render(PJSIP, text)
@@ -560,7 +567,6 @@ class Manager:
             text, registrations, endpoints = pjsip_render(self.base_text(PHONE_PJSIP), phone=True)
             render(PHONE_PJSIP, text)
             ext = self.base_text(PHONE_EXT)
-            validate_includes(ext)
             present = {name for name, _, _ in sections(ext, asterisk=True)[1]}
             require({'kfx-phone-in', 'kfx-phone-local'} <= present, 'Unbekannter Telefonie-Dialplan.')
             render(PHONE_EXT, block_entries(ext, PHONE_CONTEXTS & present))

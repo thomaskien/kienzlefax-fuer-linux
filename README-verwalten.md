@@ -3,7 +3,7 @@
 IMMER verwenden wenn einzelne KienzleFax-Funktionen auf einem bestehenden Gerät
 pausiert oder wieder freigegeben werden sollen.
 
-**Werkzeug:** `kienzlefax-verwalten.sh` · **Version:** 0.1.1 · **Stand:** 29.09.2026
+**Werkzeug:** `kienzlefax-verwalten.sh` · **Version:** 0.1.2 · **Stand:** 29.09.2026
 
 Der separate Terminal-Assistent verändert die bestehende Installation gezielt.
 Dokumente, wartende Faxe, Benutzer, Zugangsdaten und installierte Pakete bleiben
@@ -128,6 +128,10 @@ Wiederherstellung wird protokolliert und kann erneut mit `--restore` versucht we
 - Manuelle/ungewöhnliche PJSIP-Konfigurationen, zusätzliche Registrierungen in
   `pjsip.conf`, komplexe Dialplan-Includes sowie Samba-Includes/Registry-Konfiguration
   werden konservativ abgelehnt. Dafür werden keine Konfigurationen geraten.
+  Der vom Installer angehängte `#tryinclude` für `extensions-kfx-telefonie.conf`
+  ist ausdrücklich erlaubt und bleibt auch am Ende des Fax-Kontexts unverändert.
+  Andere Datei-Includes, `#exec` und Kontext-Includes (`include =>`) werden dadurch
+  nicht freigegeben.
 - **Installerläufe berücksichtigen diese Verwaltung noch nicht.** Sie können
   Dateien neu schreiben oder Dienste aktivieren. Danach `--status` ausführen.
   Erkannte Änderungen an verwalteten Dateien verhindern automatisches Überschreiben
@@ -172,6 +176,10 @@ Technische Referenzen:
 
 ## Changelog
 
+- **0.1.2 – 29.09.2026:** Die Faxabschaltung akzeptiert den bereits freigegebenen
+  Telefonie-Datei-Include auch nach dem letzten Dialplan-Kontext. Tests verwenden
+  den vollständigen Installer-Dialplan einschließlich angehängter Abschlusszeile
+  und prüfen Abschaltung, Rücknahme sowie weiterhin abgewiesene fremde Anweisungen.
 - **0.1.1 – 29.09.2026:** Wiederholte Samba-`[global]`-Abschnitte verhindern die
   Bestandsaufnahme nicht mehr. Alle globalen Blöcke und Fremdfreigaben bleiben
   bei der Verwaltung und Rücknahme unverändert. Regressionstests decken eine
