@@ -161,8 +161,7 @@ class FakeHost(v.Host):
         self.busy = set()
         self.connected = set()
         self.jobs = set()
-        self.reload_fail = False
-        self.on_freeze = None
+        self.fail_write = None
         self.queue = 0
         self.put(v.EXT, EXT, 0o640)
         self.put(v.PJSIP, PJSIP, 0o640)
@@ -186,6 +185,9 @@ class FakeHost(v.Host):
         return copy.deepcopy(self.files.get(path))
 
     def write(self, path, snapshot):
+        if self.fail_write == path:
+            self.fail_write = None
+            raise v.Error('simulierter Schreibfehler')
         self.writes.append(path)
         if snapshot is None:
             self.files.pop(path, None)
@@ -202,24 +204,7 @@ class FakeHost(v.Host):
         return '', 0
 
     def ast(self, command):
-        self.commands.append(('asterisk', command))
-        if command.startswith('dialplan show '):
-            context = command.split()[-1]
-            path = v.EXT if context == 'fax-in' else v.PHONE_EXT
-            text = v.snapshot_text(self.snapshot(path))
-            lines, parts = v.sections(text, asterisk=True)
-            for name, start, end in parts:
-                if name == context:
-                    return '\n'.join("'" + ext + "' => 1. " + app + " [pbx_config]"
-                                     for ext, app in re.findall(r'^exten => ([^,]+),1,(.*)',
-                                                                ''.join(lines[start:end]), re.M))
-        if command == 'pjsip show registrations':
-            names = v.pjsip_objects(self.snapshot(v.PJSIP), 'registration') | v.pjsip_objects(self.snapshot(v.PHONE_PJSIP), 'registration')
-            return '\n'.join(name + '/sip:example.invalid auth Registered' for name in names)
-        if command == 'pjsip show endpoints':
-            names = v.pjsip_objects(self.snapshot(v.PJSIP), 'endpoint') | v.pjsip_objects(self.snapshot(v.PHONE_PJSIP), 'endpoint')
-            return '\n'.join(' Endpoint: ' + name + '/fixture Not in use' for name in names)
-        return 'No objects found.'
+        raise AssertionError('Live-Dienststeuerung ist im Neustart-Ablauf nicht erlaubt.')
 
     def idle_calls(self):
         v.require(not self.calls, 'Telefonat oder Fax aktiv.')
@@ -237,20 +222,13 @@ class FakeHost(v.Host):
         v.require(name not in self.jobs, 'Druckauftraege vorhanden: ' + name)
 
     def freeze(self, unit):
-        if self.units[unit]['active']:
-            self.units[unit]['frozen'] = True
-            if self.on_freeze:
-                self.on_freeze(unit)
-            return True
-        return False
+        raise AssertionError('Live-Dienststeuerung ist im Neustart-Ablauf nicht erlaubt.')
 
     def thaw(self, unit):
-        if unit in self.units:
-            self.units[unit]['frozen'] = False
+        raise AssertionError('Live-Dienststeuerung ist im Neustart-Ablauf nicht erlaubt.')
 
     def service_active(self, unit, active):
-        self.units[unit]['active'] = active
-        self.units[unit]['frozen'] = False
+        raise AssertionError('Live-Dienststeuerung ist im Neustart-Ablauf nicht erlaubt.')
 
     def printers(self):
         return list(self.flags)
@@ -265,10 +243,7 @@ class FakeHost(v.Host):
         pass
 
     def reload(self, paths, disabled, verify=True):
-        self.commands.append(('reload', tuple(paths)))
-        if self.reload_fail:
-            self.reload_fail = False
-            raise v.Error('simulierter Reload-Fehler')
+        raise AssertionError('Live-Dienststeuerung ist im Neustart-Ablauf nicht erlaubt.')
 
     def queue_count(self):
         return self.queue
@@ -328,26 +303,36 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual(self.host.units['scan-ocr.service']['enabled'], 'disabled')
         self.assertIsNone(self.host.snapshot(v.dropin('scan-ocr.service')))
 
-    def test_active_service_roundtrip(self):
+    def test_active_service_roundtrip_only_changes_boot_configuration(self):
+        original = copy.deepcopy(self.host.units)
         self.apply({'scan_ocr'})
-        self.assertFalse(self.host.units['scan-ocr.service']['active'])
+        self.assertIsNotNone(self.host.snapshot(v.dropin('scan-ocr.service')))
+        self.assertEqual(self.host.units, original)
         self.apply(set())
-        self.assertTrue(self.host.units['scan-ocr.service']['active'])
+        self.assertIsNone(self.host.snapshot(v.dropin('scan-ocr.service')))
+        self.assertEqual(self.host.units, original)
 
-    def test_active_ocr_work_refuses_before_any_write(self):
+    def test_active_work_does_not_block_boot_configuration(self):
         self.host.busy.add('scan_ocr')
-        with self.assertRaises(v.Error):
-            self.manager.plan({'scan_ocr'})
-        self.assertFalse(self.host.writes)
+        self.host.calls = True
+        self.host.connected.add('scan-eingang')
+        original = copy.deepcopy(self.host.units)
+        self.apply({'scan_ocr', 'fax_receive', 'share:scan-eingang'})
+        self.assertEqual(self.host.units, original)
+        self.assertIsNotNone(self.host.snapshot(v.dropin('scan-ocr.service')))
 
-    def test_processing_race_after_freeze_thaws_and_preserves_files(self):
-        plan = self.manager.plan({'fax_send'})
-        self.host.on_freeze = lambda unit: self.host.busy.add('fax_send')
-        with self.assertRaises(v.Error):
-            self.manager.apply(plan)
-        self.assertFalse(self.host.units['kienzlefax-worker.service']['frozen'])
-        self.assertTrue(self.host.units['kienzlefax-worker.service']['active'])
-        self.assertIsNone(self.host.snapshot(v.dropin('kienzlefax-worker.service')))
+    def test_apply_and_restore_never_control_running_services(self):
+        original = copy.deepcopy(self.host.units)
+        desired = {'fax_send', 'fax_receive', 'fax_ocr', 'phone', 'scan_ocr', 'web', 'share:scan-eingang'}
+        with patch.object(self.host, 'freeze', side_effect=AssertionError('no freeze')), \
+                patch.object(self.host, 'thaw', side_effect=AssertionError('no thaw')), \
+                patch.object(self.host, 'service_active', side_effect=AssertionError('no start/stop')), \
+                patch.object(self.host, 'reload', side_effect=AssertionError('no reload')), \
+                patch.object(self.host, 'ast', side_effect=AssertionError('no Asterisk CLI')):
+            plan = self.apply(desired)
+            self.manager.rollback(plan)
+        self.assertEqual(self.host.units, original)
+        self.assertFalse(any(cmd[0] in ('systemctl', 'asterisk', 'smbcontrol', 'smbclient') for cmd in self.host.commands))
 
     def test_paused_scanner_can_resume_with_new_input(self):
         self.apply({'scan_ocr'})
@@ -355,27 +340,34 @@ class ManagementTests(unittest.TestCase):
         self.apply(set())
         self.assertTrue(self.host.units['scan-ocr.service']['active'])
 
-    def test_restore_reactivation_refuses_to_stop_busy_scanner(self):
+    def test_restore_reactivation_does_not_stop_busy_scanner(self):
         self.apply({'scan_ocr'})
         plan = self.apply(set())
         self.host.busy.add('scan_ocr')
-        with self.assertRaises(v.Error):
-            self.manager.rollback(plan)
+        self.manager.rollback(plan)
         self.assertTrue(self.host.units['scan-ocr.service']['active'])
-        self.assertFalse(self.host.units['scan-ocr.service']['frozen'])
+        self.assertIsNotNone(self.host.snapshot(v.dropin('scan-ocr.service')))
 
-    def test_crash_after_freeze_recovery_thaws_on_active_call(self):
-        plan = self.manager.plan({'fax_send'})
+    def test_legacy_pending_restore_ignores_frozen_restart_and_stopped_worker(self):
+        plan = self.manager.plan({'fax_send', 'fax_receive', 'fax_ocr', 'web', 'share:scan-eingang'})
+        plan['before_state']['version'] = '0.1.4'
         self.manager.save(v.PENDING, plan)
-        self.host.units['kienzlefax-worker.service']['frozen'] = True
-        self.host.calls = True
-        with self.assertRaises(v.Error):
+        for path, value in plan['after_files'].items():
+            self.host.write(path, value)
+        self.host.units['scan-ocr-fax.service'].update(active=False, frozen=True)
+        self.host.units['kienzlefax-worker.service'].update(active=False)
+        original_runtime = copy.deepcopy(self.host.units)
+        with patch.object(self.host, 'service', side_effect=AssertionError('no runtime status required')):
             self.manager.rollback(plan, pending=True)
-        self.assertFalse(self.host.units['kienzlefax-worker.service']['frozen'])
+        self.assertEqual(self.host.units, original_runtime)
+        for path, value in plan['before_files'].items():
+            self.assertEqual(self.host.snapshot(path), value)
+        self.assertIsNone(self.host.snapshot(v.PENDING))
+        self.assertEqual(self.manager.load(v.LAST)['status'], 'restored')
 
     def test_recovery_after_interrupted_restore(self):
         plan = self.apply({'share:scan-eingang', 'web'})
-        self.host.reload_fail = True
+        self.host.fail_write = v.WEB
         with self.assertRaises(v.Error):
             self.manager.rollback(plan)
         pending = self.manager.load(v.PENDING)
@@ -383,12 +375,6 @@ class ManagementTests(unittest.TestCase):
         self.manager.rollback(pending, pending=True)
         self.assertEqual(v.snapshot_text(self.host.snapshot(v.SMB)), SMB)
         self.assertEqual(v.snapshot_text(self.host.snapshot(v.WEB)), WEB_PHP)
-
-    def test_active_call_blocks_before_write(self):
-        self.host.calls = True
-        with self.assertRaises(v.Error):
-            self.manager.plan({'fax_receive'})
-        self.assertFalse(self.host.writes)
 
     def test_fax_off_keeps_phone_and_transports(self):
         phone = self.host.snapshot(v.PHONE_PJSIP)
@@ -398,7 +384,7 @@ class ManagementTests(unittest.TestCase):
         self.assertIn('type=transport', pjsip)
         self.assertIn('#tryinclude', pjsip)
         self.assertEqual(self.host.snapshot(v.PHONE_PJSIP), phone)
-        self.assertIn(('asterisk', 'pjsip send unregister kfx-provider'), self.host.commands)
+        self.assertFalse(any(cmd[0] == 'asterisk' for cmd in self.host.commands))
 
     def test_fax_receive_only_keeps_outbound_registration(self):
         original = self.host.snapshot(v.PJSIP)
@@ -429,7 +415,8 @@ class ManagementTests(unittest.TestCase):
 
     def test_fax_ocr_and_receive_can_stop_together(self):
         self.apply({'fax_receive', 'fax_ocr'})
-        self.assertFalse(self.host.units['scan-ocr-fax.service']['active'])
+        self.assertTrue(self.host.units['scan-ocr-fax.service']['active'])
+        self.assertIsNotNone(self.host.snapshot(v.dropin('scan-ocr-fax.service')))
         self.assertTrue(self.host.units['scan-ocr.service']['active'])
 
     def test_receive_reenable_requires_ocr_running(self):
@@ -472,7 +459,7 @@ class ManagementTests(unittest.TestCase):
 
     def test_service_drift_detected(self):
         self.apply({'fax_send'})
-        self.host.units['kienzlefax-worker.service']['active'] = True
+        self.host.units['kienzlefax-worker.service']['enabled'] = 'disabled'
         self.assertTrue(self.manager.drift())
         with self.assertRaises(v.Error):
             self.manager.plan(set())
@@ -483,9 +470,9 @@ class ManagementTests(unittest.TestCase):
         self.assertIsNone(self.manager.plan({'web'}))
         self.assertEqual(len(self.host.writes), writes)
 
-    def test_reload_failure_rolls_back_exact_state(self):
+    def test_write_failure_rolls_back_exact_state(self):
         before = copy.deepcopy(self.host.files)
-        self.host.reload_fail = True
+        self.host.fail_write = v.WEB
         with self.assertRaisesRegex(v.Error, 'wiederhergestellt'):
             self.apply({'fax_send', 'fax_receive', 'share:scan-eingang', 'web'})
         for path, value in before.items():
@@ -523,12 +510,6 @@ class ManagementTests(unittest.TestCase):
             self.manager.plan({'printer:fax1'})
         self.assertFalse(self.host.writes)
 
-    def test_open_smb_connection_refuses(self):
-        self.host.connected.add('scan-eingang')
-        with self.assertRaisesRegex(v.Error, 'Verbindung'):
-            self.manager.plan({'share:scan-eingang'})
-        self.assertFalse(self.host.writes)
-
     def test_web_file_is_backed_up_removed_and_restored_without_apache(self):
         self.host.files[v.WEB].update(mode=0o640, uid=33, gid=33)
         original = self.host.snapshot(v.WEB)
@@ -538,7 +519,6 @@ class ManagementTests(unittest.TestCase):
         self.assertLess(self.host.writes.index(v.PENDING), self.host.writes.index(v.WEB))
         self.assertEqual(self.host.snapshot(v.STATE_FILE)['mode'], 0o600)
         self.assertIn('web', self.manager.inventory())
-        v.Host.reload(self.host, [v.WEB], ['web'])
         self.apply(set())
         self.assertEqual(self.host.snapshot(v.WEB), original)
         self.assertFalse(any(command[0] in ('apache2ctl', 'curl', 'systemctl') for command in self.host.commands))
@@ -697,18 +677,11 @@ class ManagementTests(unittest.TestCase):
             self.manager.plan({'phone'})
         self.assertFalse(self.host.writes)
 
-    def test_runtime_dialplan_verification_requires_first_priority(self):
-        with patch.object(self.host, 'ast', return_value="'12345' => 1. NoOp(original)\n 5. Hangup(17)"):
-            with self.assertRaises(v.Error):
-                self.apply({'fax_receive'})
-        self.assertEqual(v.snapshot_text(self.host.snapshot(v.EXT)), EXT)
-
-    def test_runtime_service_change_after_preview_refused(self):
-        plan = self.manager.plan({'scan_ocr'})
-        self.host.units['scan-ocr.service']['active'] = False
-        with self.assertRaisesRegex(v.Error, 'seit Vorschau'):
-            self.manager.apply(plan)
-        self.assertFalse(self.host.writes)
+    def test_runtime_service_change_after_preview_does_not_block_saving(self):
+        plan = self.manager.plan({'fax_send'})
+        self.host.units['kienzlefax-worker.service'].update(active=False, frozen=True)
+        self.manager.apply(plan)
+        self.assertIsNotNone(self.host.snapshot(v.dropin('kienzlefax-worker.service')))
 
     def test_dry_run_interactive_has_no_writes(self):
         values = ['d' if key == 'web' else 'u' for key in self.manager.inventory()]
@@ -736,59 +709,26 @@ class ManagementTests(unittest.TestCase):
 
 
 class HostTests(unittest.TestCase):
-    def test_service_waits_for_transition_then_returns_stable_state(self):
-        host = v.Host()
-        def status(active, sub):
-            return ('LoadState=loaded\nUnitFileState=enabled\nFreezerState=running\n'
-                    'ActiveState=' + active + '\nSubState=' + sub + '\n', 0)
-        for transition in (('activating', 'auto-restart'), ('deactivating', 'stop-sigterm')):
-            with self.subTest(transition=transition), \
-                    patch.object(host, 'run', side_effect=[status(*transition), status('inactive', 'dead')]), \
-                    patch.object(v.time, 'sleep'):
-                self.assertEqual(host.service('scan-ocr-fax.service'),
-                                 {'active': False, 'enabled': 'enabled', 'frozen': False})
+    def test_command_error_names_systemctl_operation_and_unit_without_outputs(self):
+        result = v.subprocess.CompletedProcess([], 1, stdout='private output', stderr='private diagnostic')
+        with patch.object(v.subprocess, 'run', return_value=result):
+            with self.assertRaises(v.Error) as caught:
+                v.Host().run('systemctl', 'start', 'scan-ocr-fax.service')
+        message = str(caught.exception)
+        self.assertIn('systemctl start scan-ocr-fax.service', message)
+        self.assertIn('Exit-Code 1', message)
+        self.assertNotIn('private', message)
 
-    def test_service_persistent_transition_fails_with_specific_status(self):
-        host = v.Host()
-        status = ('LoadState=loaded\nUnitFileState=enabled\nFreezerState=running\n'
-                  'ActiveState=activating\nSubState=auto-restart\n', 0)
-        with patch.object(host, 'run', return_value=status) as run, patch.object(v.time, 'sleep'):
-            with self.assertRaisesRegex(v.Error, 'scan-ocr-fax.service.*activating/auto-restart'):
-                host.service('scan-ocr-fax.service')
-        self.assertLessEqual(run.call_count, 21)
-
-    def test_thaw_during_stop_does_not_wait_for_active_state(self):
+    def test_inventory_reads_frozen_queued_restart_without_waiting(self):
         host = v.Host()
         status = ('LoadState=loaded\nUnitFileState=enabled\nFreezerState=frozen\n'
-                  'ActiveState=deactivating\nSubState=stop-sigterm\n', 0)
-        with patch.object(host, 'run', side_effect=[status, ('', 0)]) as run:
-            host.thaw('scan-ocr-fax.service')
-        self.assertEqual(run.call_args_list[-1].args, ('systemctl', 'thaw', 'scan-ocr-fax.service'))
-
-    def test_stop_queues_term_before_thaw(self):
-        host = v.Host()
-        with patch.object(host, 'service', side_effect=[{'active': True, 'frozen': True}, {'active': False}]), \
-                patch.object(host, 'run', return_value=('', 0)) as run:
-            host.service_active('scan-ocr.service', False)
-        self.assertEqual(run.call_args_list[0].args,
-                         ('systemctl', 'kill', '--signal=SIGTERM', '--kill-who=all', 'scan-ocr.service'))
-        self.assertEqual(run.call_args_list[1].args, ('systemctl', 'stop', 'scan-ocr.service'))
-
-    def test_samba_live_denial_requires_bad_network_name(self):
-        host = v.Host()
-        def replies(*args, **kwargs):
-            if args[0] == 'testparm' and any('parameter-name' in a for a in args):
-                return 'No\n', 0
-            if args[0] == 'smbclient':
-                return 'tree connect failed: NT_STATUS_BAD_NETWORK_NAME\n', 1
-            return '', 0
-        with patch.object(host, 'service', return_value={'active': True}), patch.object(host, 'run', side_effect=replies):
-            host.reload([v.SMB], ['share:scan-eingang'])
-        with patch.object(host, 'service', return_value={'active': True}), \
-                patch.object(host, 'run', side_effect=lambda *args, **kw: ('No\n', 0) if args[0] == 'testparm'
-                             else ('NT_STATUS_LOGON_FAILURE\n', 1)):
-            with self.assertRaises(v.Error):
-                host.reload([v.SMB], ['share:scan-eingang'])
+                  'ActiveState=activating\nSubState=auto-restart-queued\n', 0)
+        with patch.object(host, 'run', return_value=status) as run, patch.object(v.time, 'sleep') as sleep:
+            self.assertEqual(host.service('scan-ocr-fax.service'),
+                             {'active': False, 'enabled': 'enabled', 'frozen': True})
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[:2], ('systemctl', 'show'))
+        sleep.assert_not_called()
 
     def test_atomic_write_preserves_permissions_and_never_follows_symlink(self):
         import os
@@ -820,19 +760,6 @@ class HostTests(unittest.TestCase):
         with patch.object(host, 'run', side_effect=[('printer fax1 is printing fax1-42. enabled since today\n', 0),
                                                   ('fax1 accepting requests since today\n', 0)]):
             self.assertEqual(host.printer('fax1'), {'enabled': True, 'accepting': True})
-
-    def test_asterisk_output_failure_even_if_exit_zero(self):
-        host = v.Host()
-        with patch.object(host, 'run', return_value=('No such command pjsip reload', 0)):
-            with self.assertRaises(v.Error):
-                host.ast('pjsip reload')
-
-    def test_unknown_channel_count_fails_closed(self):
-        host = v.Host()
-        with patch.object(host, 'service', return_value={'active': True}), \
-                patch.object(host, 'ast', return_value='unexpected output'):
-            with self.assertRaises(v.Error):
-                host.idle_calls()
 
     def test_symlink_and_hardlink_snapshots_refused(self):
         with tempfile.TemporaryDirectory() as temp:

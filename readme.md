@@ -39,10 +39,11 @@ kann außerdem ein separater WireGuard-Telefonie-Installer für die Ausführung 
 
 ## Bestehende Installation pausieren oder wieder aktivieren
 
-Der separate Assistent **`kienzlefax-verwalten.sh` (0.1.4)** schaltet Faxversand,
+Der separate Assistent **`kienzlefax-verwalten.sh` (0.2.0)** schaltet Faxversand,
 Faxempfang, Telefonie, Webinterface, Scan-/Fax-OCR, einzelne Netzwerkfreigaben und
 Faxdrucker gezielt um. Dokumente und Konfigurationen bleiben zur Wiederherstellung
-erhalten. Er zeigt zuerst eine Vorschau; die letzte Änderung lässt sich zurücknehmen.
+erhalten. Er zeigt zuerst eine Vorschau und speichert die Auswahl für den nächsten
+Neustart; die letzte Änderung lässt sich zurücknehmen.
 
 [Download, Bedienung und Grenzen des Verwaltungsassistenten](README-verwalten.md)
 

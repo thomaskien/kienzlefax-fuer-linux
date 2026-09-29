@@ -3,187 +3,139 @@
 IMMER verwenden wenn einzelne KienzleFax-Funktionen auf einem bestehenden Gerät
 pausiert oder wieder freigegeben werden sollen.
 
-**Werkzeug:** `kienzlefax-verwalten.sh` · **Version:** 0.1.4 · **Stand:** 29.09.2026
+**Werkzeug:** `kienzlefax-verwalten.sh` · **Version:** 0.2.0 · **Stand:** 29.09.2026
 
-Der separate Terminal-Assistent verändert die bestehende Installation gezielt.
-Dokumente, wartende Faxe, Benutzer, Zugangsdaten und installierte Pakete bleiben
-erhalten. Er lädt keine weiteren Skripte nach und startet keinen Installer.
+**Auswählen → sichern und speichern → neu starten.** Der Assistent setzt die
+Konfiguration für den nächsten Neustart. Dokumente, Faxwarteschlangen, Benutzer,
+Zugangsdaten und Pakete bleiben erhalten.
 
 ## Herunterladen und starten
-
-Auf dem **betroffenen Linux-Gerät** in einem eigenen Arbeitsverzeichnis:
 
 ```bash
 curl -fL https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/main/kienzlefax-verwalten.sh -o kienzlefax-verwalten.sh
 sudo bash kienzlefax-verwalten.sh
+sudo reboot
 ```
 
-Den Startbefehl erst nach einem erfolgreichen Download ausführen. Python 3 und die
-jeweiligen Werkzeuge der vorhandenen KienzleFax-Installation werden benötigt.
-Für das sichere Anhalten laufender Worker/OCR-Dienste ist systemd mit cgroup v2
-erforderlich; ohne diese Unterstützung verweigert der Assistent deren Stopp.
-Es werden keine fehlenden Pakete automatisch installiert.
+Nur nach erfolgreichem Speichern neu starten. Der Assistent führt selbst keinen
+Neustart aus. Bis dahin können die Dienste mit ihrer bisherigen Konfiguration
+weiterlaufen. Webdatei und Druckereinstellungen werden bereits beim Speichern
+angepasst. Aktive Gespräche und Arbeiten vor dem Neustart abschließen lassen.
+
+Python 3 und die Werkzeuge der vorhandenen Installation werden benötigt. Der
+Assistent lädt keine Module nach und installiert keine Pakete.
+
+## Auswahl
+
+Jeder Bereich wird einzeln abgefragt: **u** unverändert, **a** Sperre aufheben,
+**d** deaktivieren. Standard ist unverändert. Vor dem Speichern erscheinen eine
+Vorschau und eine Bestätigung.
+
+| Bereich | Gespeicherte Änderung |
+| --- | --- |
+| Faxversand | systemd-Sperre für `kienzlefax-worker.service`; nach dem Neustart läuft der Worker nicht. |
+| Faxempfang | Fax-Dialplaneinstiege weisen Anrufe vor dem Annehmen ab. |
+| Telefonie/Warteschlange | Telefonie-Dialplaneinstiege werden gesperrt, zugehörige PJSIP-Endpunkte und Registrierungen aus der Konfiguration entfernt. |
+| Webinterface | `/var/www/html/kienzlefax.php` geschützt sichern und entfernen. Aktivieren stellt Inhalt, Besitzer und Rechte wieder her. |
+| Scanner-OCR | systemd-Sperre für `scan-ocr.service`, unabhängig von den Scan-Freigaben. |
+| Fax-OCR | systemd-Sperre für `scan-ocr-fax.service`; nur zusammen mit deaktiviertem Faxempfang. |
+| Netzwerkfreigaben | Jede ausgewählte KienzleFax-Freigabe erhält `available = no`. |
+| Faxdrucker | Jeder ausgewählte Faxdrucker wird über CUPS angehalten und nimmt keine neuen Aufträge an. Die Einstellungen bleiben über den Neustart erhalten. |
+
+Die Dienstsperren sind zusätzliche systemd-Dateien. Beim Aktivieren werden sie
+wieder entfernt; die bisherigen Autostarteinstellungen bleiben erhalten. Ein vor
+der Änderung nur manuell gestoppter, aber für den Autostart aktivierter Dienst
+kann nach dem Neustart wieder laufen.
+
+Sind Faxversand und Faxempfang gemeinsam deaktiviert, wird auch die
+Fax-Providerregistrierung aus der Konfiguration entfernt. Der Assistent führt
+keine Live-Abmeldung beim Provider aus. Vor einem Gerätewechsel nach dem Neustart
+prüfen, dass das alte Gerät nicht mehr registriert ist.
+
+Einzelne Freigaben: `hierhin-scannen-fuer-ocr`, `scan-eingang`, `fax-eingang`,
+`sendeberichte`, `sendefehler-eingang`, `sendefehler-berichte` und
+`pdf-zu-fax` beziehungsweise `pdf-zu-faxN`. Fremdfreigaben, fremde Drucker und
+wiederholte Samba-`[global]`-Abschnitte bleiben erhalten.
+
+Zum Abschalten von Fax bei weiter nutzbarem Scannen: Faxversand, Faxempfang,
+Fax-OCR, Webinterface, Faxdrucker und Faxfreigaben deaktivieren. Scanner-OCR,
+`hierhin-scannen-fuer-ocr` und `scan-eingang` unverändert lassen. Telefonie separat
+wählen. Freigabesperren löschen keine Ordner; `sources.json` bleibt unverändert.
+
+## Wieder aktivieren oder zurücknehmen
+
+Für einzelne Bereiche den Assistenten erneut starten, **a** wählen und danach
+neu starten. Die letzte Änderung als Ganzes wird so zurückgenommen:
+
+```bash
+sudo bash kienzlefax-verwalten.sh --restore
+sudo reboot
+```
+
+Auch **offene Transaktionen aus Version 0.1.x** können mit `--restore`
+zurückgeschrieben werden. Ein eingefrorener oder neu startender Dienst verhindert
+das nicht. Soll anschließend eine andere Auswahl gelten, erst `--restore`, dann
+den Assistenten erneut ausführen und zum Schluss einmal neu starten.
+
+Beim Freigeben des Faxversands mit wartenden Aufträgen fragt der Assistent nach,
+ob deren Versand beim nächsten Start erlaubt ist.
 
 Weitere Aufrufe:
 
 ```bash
-# Zustand anzeigen; schreibt keine Verwaltungsdateien
 sudo bash kienzlefax-verwalten.sh --status
-
-# Alle Fragen durchgehen und den Plan prüfen; keine Änderungen anwenden
 sudo bash kienzlefax-verwalten.sh --dry-run
-
-# Letzte Änderung oder unterbrochene Transaktion zurücknehmen
-sudo bash kienzlefax-verwalten.sh --restore
 ```
 
-`--help` und `--version` funktionieren auch ohne root und auf dem Entwicklungsrechner.
-`--status` liefert Exit-Code 2 bei erkannten Abweichungen oder einer offenen
-Transaktion, sonst 0. Fehler und Abbrüche liefern Exit-Code 1.
+`--status` zeigt die gespeicherte Auswahl und den momentanen Dienststatus.
+Laufende Dienste gelten vor dem Neustart nicht als Konfigurationsfehler.
+`--dry-run` zeigt nur den Dialog und die Vorschau. `--help` und `--version`
+funktionieren ohne root. Erkannte Abweichungen/offene Transaktionen liefern bei
+`--status` Exit-Code 2, sonst 0; Fehler und Abbrüche liefern Exit-Code 1.
 
-## Auswahl im Assistenten
+## Sicherungen und Grenzen
 
-Nur vorhandene Komponenten werden angeboten. Jede Frage hat den Standard
-**unverändert**. Am Ende stehen eine Vorschau und eine gesonderte Bestätigung.
-Ein Eingabeabbruch vor der Bestätigung verändert keine Konfigurationen oder Dienste.
+Die geschützten Sicherungen liegen unter `/var/lib/kienzlefax-verwalten/`:
+Verzeichnisse `0700`, Zustandsdateien `0600`. `state.json` hält Originale und
+Auswahl, `pending.json` eine offene Transaktion, `last.json` die letzte Änderung,
+`history/` die Historie. Die Dateien enthalten Base64-codierte Konfigurationen,
+**keine Verschlüsselung**. Sie können Zugangsdaten enthalten und dürfen nicht
+öffentlich geteilt werden. Im Webroot wird keine PHP-Sicherung abgelegt.
 
-| Bereich | Wirkung von „deaktivieren“ |
-| --- | --- |
-| Faxversand | Pausiert den Faxworker und verhindert dessen erneuten Start durch systemd. Wartende Aufträge bleiben erhalten. |
-| Faxempfang | Sperrt neue Anrufe im Faxeingang vor `Answer()` mit `Hangup(17)`. Telefonie kann weiterlaufen. |
-| Telefonie/Warteschlange | Sperrt die Telefonieeinstiege und entfernt die Telefonie-Endpunkte und -Registrierungen aus der geladenen PJSIP-Konfiguration. Gemeinsame Transporte und Fax bleiben erhalten. |
-| Webinterface | Sichert `/var/www/html/kienzlefax.php` geschützt außerhalb des Webroots und entfernt die Datei. Beim Aktivieren wird sie mit ursprünglichem Inhalt, Besitzer und Rechten wiederhergestellt. |
-| Scanner-OCR | Pausiert `scan-ocr.service`. Dies ist unabhängig von den Scan-Freigaben und der Fax-OCR. |
-| Fax-OCR | Pausiert `scan-ocr-fax.service`. Nur zulässig, wenn auch Faxempfang deaktiviert ist. |
-| Netzwerkfreigaben | Schaltet jede erkannte KienzleFax-Freigabe einzeln mit `available = no` ab. Samba und fremde Freigaben laufen weiter. |
-| Faxdrucker | Stoppt jeden ausgewählten Drucker und lehnt neue Aufträge ab. Drucker werden anhand des KienzleFax-Backends erkannt und nicht gelöscht. |
+Extern geänderte Dateien werden nicht überschrieben. Das gilt auch für eine nach
+der Pause neu angelegte `kienzlefax.php`. Bei einem Schreibfehler versucht der
+Assistent, die vorherige Konfiguration zurückzuschreiben; bei unvollständiger
+Rücknahme bleibt die Sicherung für `--restore` erhalten.
 
-Einzeln auswählbar sind die vorhandenen Freigaben `hierhin-scannen-fuer-ocr`,
-`scan-eingang`, `fax-eingang`, `sendeberichte`, `sendefehler-eingang`,
-`sendefehler-berichte` sowie `pdf-zu-fax` beziehungsweise `pdf-zu-faxN`.
+Samba-Konfigurationen werden vor dem Schreiben mit `testparm` geprüft. Individuelle
+PJSIP-/Dialplan-Konfigurationen oder Samba-Includes werden weiterhin konservativ
+behandelt. Der bekannte Telefonie-Datei-Include des Installers wird unterstützt.
+Druckeränderungen setzen eine leere Druckwarteschlange voraus und löschen keine
+Aufträge. Dienststart/-stopp, Freeze/Thaw, Asterisk-Reloads sowie lokale HTTP-/SMB-
+Zugriffsprüfungen gehören nicht mehr zum Ablauf.
 
-Mehrere `[global]`-Abschnitte, beispielsweise durch eine zusätzliche
-Terminzettel-Anwendung, werden akzeptiert und unverändert erhalten. Fremde
-Freigaben und Drucker werden nicht als KienzleFax-Freigaben behandelt. Mehrfach
-definierte Freigaben mit demselben Namen bleiben vorerst von der automatischen
-Verwaltung ausgeschlossen.
+Installerläufe können verwaltete Dateien erneut ändern. Danach `--status` nutzen.
+Die tatsächliche Wirkung auf dem Gerät ist nach dessen Neustart zu kontrollieren.
 
-Wenn **Faxversand und Faxempfang gemeinsam aus** sind, wird zusätzlich die
-Fax-Providerregistrierung aus der aktiven Konfiguration entfernt und abgemeldet.
-Bei einer nur einseitigen Faxpause bleibt sie für die andere Richtung bestehen.
-Eine providerseitige Abmeldung kann verzögert wirksam werden; vor einem Umzug
-auf ein anderes Gerät den Registrierungsstatus beim Provider prüfen.
+## Prüfung
 
-### Beispiel: Fax abschalten, Scannen behalten
-
-- Faxversand, Faxempfang, Webinterface und Faxdrucker deaktivieren.
-- Die nicht mehr benötigten Fax-/Berichts-/PDF-zu-Fax-Freigaben einzeln deaktivieren.
-- Scanner-OCR, `hierhin-scannen-fuer-ocr` und `scan-eingang` unverändert lassen.
-- Fax-OCR kann ebenfalls pausiert werden, sobald deren Eingang abgearbeitet ist.
-- Telefonie nach Bedarf weiterbetreiben oder separat deaktivieren.
-
-Eine Freigabesperre betrifft **nur den Netzwerkzugriff**. Sie löscht keine Ordner
-und verhindert keinen lokalen Zugriff. Vorhandene Dokumente können bei weiterhin
-aktivem Webinterface dort sichtbar bleiben. `sources.json` wird nicht verändert.
-Eine Websperre stoppt keinen Faxversand. Ein pausierter Worker verhindert nicht,
-dass über ein weiterlaufendes Webinterface zusätzliche Sendeaufträge angelegt werden.
-
-## Wieder aktivieren und Änderungen zurücknehmen
-
-Erneut starten und bei den gewünschten Bereichen **„a – Sperre aufheben“** wählen.
-Der Assistent stellt deren vorherigen Zustand wieder her. Bereits vor der Pause
-gestoppte Dienste bleiben gestoppt; ursprüngliche Autostart- und Druckerflags
-werden nicht pauschal auf „ein“ gesetzt. Extern abgeschaltete Komponenten ohne
-eine gespeicherte Assistentenpause werden durch „a“ nicht eigenmächtig gestartet.
-
-Auch einzelne Bereiche einer größeren Abschaltung lassen sich wieder freigeben.
-Andere, weiterhin gewählte Sperren in gemeinsam verwendeten Dateien bleiben bestehen.
-Vor dem Wiederanlaufen des Faxworkers fragt der Assistent bei wartenden Aufträgen
-zusätzlich nach einer ausdrücklichen Versandfreigabe. OCR kann nach dem Aufheben
-der Pause neu eingegangene Dateien weiterverarbeiten.
-
-`--restore` nimmt die **letzte Transaktion als Ganzes** zurück. Die Funktion ist
-kein beliebiges Zurückspringen durch die gesamte Historie. Auch eine unterbrochene
-Wiederherstellung wird protokolliert und kann erneut mit `--restore` versucht werden.
-
-## Schutzmaßnahmen und Grenzen
-
-- Vor relevanten Änderungen werden aktive Telefonate/Faxe geprüft. Asterisk wird
-  nicht neu gestartet. Die Faxsperre ersetzt nur den ersten Dialplanschritt;
-  nachfolgende Schritte bleiben erhalten.
-- Vor dem Stoppen eines laufenden OCR-Dienstes müssen Eingang und Arbeitsverzeichnis
-  leer sein. Beim Faxworker darf keine Verarbeitung laufen. Die Dienste werden
-  für die abschließende Prüfung kurz eingefroren und bei Abbruch wieder freigegeben.
-  Kurze Start-/Stoppübergänge werden mit bis zu zehn Sekunden Wartezeit erneut
-  geprüft. Ein dauerhaft instabiler Dienst führt zu einer Meldung mit dem konkreten
-  Status. Ein eingefrorener Dienst wird auch während eines Stoppübergangs freigegeben.
-- Offene Verbindungen zu ausgewählten Samba-Freigaben sowie noch nicht abgeschlossene
-  Druckaufträge verhindern eine Änderung. Am Client zuerst die Verbindung trennen
-  beziehungsweise die Druckverarbeitung abschließen lassen.
-- Samba wird mit `testparm` geprüft; Abschaltungen werden zusätzlich durch einen
-  lokalen `smbclient`-Zugriff kontrolliert.
-- Das Webinterface wird durch Entfernen von `/var/www/html/kienzlefax.php` deaktiviert.
-  Inhalt, Besitzer und Rechte liegen vorher in der geschützten Transaktionssicherung
-  unter `/var/lib/kienzlefax-verwalten/` (Dateien `0600`). Es entsteht keine PHP-Kopie
-  im Webroot. Apache-Konfiguration und -Dienst werden dabei nicht geändert; HTTP-
-  Prüfungen sind nicht erforderlich. Eine zwischenzeitlich neu angelegte PHP-Datei
-  wird bei der Wiederherstellung nicht überschrieben. Nur bei der Rücknahme einer
-  gespeicherten Apache-Sperre aus Version 0.1.0–0.1.2 muss deren alte Regel entfernt
-  und Apache nachgeladen werden.
-- Laufende Asterisk-Konfigurationen werden nachgeladen und die gesperrten
-  Dialplaneinstiege, entfernten Telefonie-Endpunkte und SIP-Registrierungen geprüft.
-  Bei vorher gestoppten Diensten kann nur die persistente Konfiguration geändert
-  werden; deren tatsächliche Laufzeitwirkung ist beim nächsten Start zu prüfen.
-- Manuelle/ungewöhnliche PJSIP-Konfigurationen, zusätzliche Registrierungen in
-  `pjsip.conf`, komplexe Dialplan-Includes sowie Samba-Includes/Registry-Konfiguration
-  werden konservativ abgelehnt. Dafür werden keine Konfigurationen geraten.
-  Der vom Installer angehängte `#tryinclude` für `extensions-kfx-telefonie.conf`
-  ist ausdrücklich erlaubt und bleibt auch am Ende des Fax-Kontexts unverändert.
-  Andere Datei-Includes, `#exec` und Kontext-Includes (`include =>`) werden dadurch
-  nicht freigegeben.
-- **Installerläufe berücksichtigen diese Verwaltung noch nicht.** Sie können
-  Dateien neu schreiben oder Dienste aktivieren. Danach `--status` ausführen.
-  Erkannte Änderungen an verwalteten Dateien verhindern automatisches Überschreiben
-  und Wiederherstellen. Das gilt auch für legitime manuelle Änderungen: diese müssen
-  anhand der Sicherung bewusst zusammengeführt werden.
-
-Status und Sicherungen liegen unter `/var/lib/kienzlefax-verwalten/` mit
-Verzeichnisrechten `0700` und Zustandsdateien `0600`. `state.json` hält die aktiven
-Sperren und Originale, `pending.json` eine offene Transaktion, `last.json` die letzte
-Transaktion; `history/` enthält die Historie. Konfigurationsinhalte sind im JSON
-Base64-codiert gespeichert, **nicht verschlüsselt**. Die Sicherungen können
-Zugangsdaten enthalten und dürfen nicht öffentlich geteilt werden. Der Assistent
-gibt diese Inhalte nicht aus.
-
-Bei einem Fehler versucht er die Rücknahme. Ist diese wegen neuer Arbeit oder
-externer Änderungen nicht sicher möglich, bleibt die geschützte Transaktion erhalten
-und der Assistent meldet ausdrücklich eine unvollständige Rücknahme. Dann die genannte
-Ursache beheben und `--restore` erneut ausführen; nicht durch einen Installerlauf
-über die Situation hinwegschreiben.
-
-## Prüfung dieser Version
-
-Automatisierte Tests laufen in isolierten Fake-Systemen ohne Zugriff auf echte
-Dienste. Sie prüfen unter anderem Teilreaktivierung, exakte Dateiwiederherstellung,
-ursprüngliche Dienst-/Druckerzustände, laufende Arbeit, Änderungen nach der Vorschau,
-fremde Konfigurationsänderungen, Fehler beim Reload und Wiederaufnahme unterbrochener
-Transaktionen. Zusätzlich werden die Shellsyntax und die eingebettete Python-Syntax geprüft.
-Ein Live-Test auf einem Debian-/Raspberry-Pi-Gerät ist damit nicht ersetzt.
+Die automatisierten Prüfungen verwenden isolierte Dateien und simulierte
+Systembefehle. Sie decken insbesondere Sicherung, Schreibfehler, Wiederherstellung,
+fremde Änderungen und alte offene Transaktionen ab. Sie ersetzen keinen Neustart
+des Zielgeräts.
 
 ```bash
 bash -n kienzlefax-verwalten.sh
-bash kienzlefax-verwalten.sh --help
-python3 -m unittest discover -s tests -p 'test_verwalten.py' -v
+python3 -m unittest discover -s tests -p 'test_verwalten.py'
 git diff --check
 ```
 
-Technische Referenzen:
-[systemd freeze/thaw](https://manpages.debian.org/trixie/systemd/systemctl.1.en.html),
-[Asterisk-Registrierungen](https://docs.asterisk.org/Configuration/Channel-Drivers/SIP/Configuring-res_pjsip/Configuring-Outbound-Registrations/),
-[Samba-Steuerung](https://www.samba.org/samba/docs/current/man-html/smbcontrol.1.html),
-[CUPS-Druckersteuerung](https://www.cups.org/doc/man-cupsenable.html).
-
 ## Changelog
+
+- **0.2.0 – 29.09.2026:** Vereinfachter Ablauf für den nächsten Neustart: Auswahl
+  sichern und Konfiguration schreiben. Live-Dienststeuerung, Freeze/Thaw und
+  Laufzeit-Reloads entfallen. Alte offene Transaktionen bleiben rücknehmbar,
+  auch bei eingefrorenen Diensten. Fehler nennen die betroffene systemctl-Aktion.
 
 - **0.1.4 – 29.09.2026:** Kurze systemd-Start-/Stoppübergänge führen nicht mehr sofort
   zum Abbruch. Die Statusprüfung wartet begrenzt und nennt bei dauerhaftem Übergang

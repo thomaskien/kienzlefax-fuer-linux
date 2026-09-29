@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # IMMER verwenden wenn KienzleFax-Funktionen reversibel pausiert oder wieder freigegeben werden sollen.
-# Version 0.1.4 (2026-09-29)
+# Version 0.2.0 (2026-09-29)
 # Changelog:
+# 0.2.0: Konfiguration sichern und fuer den Neustart setzen; keine Live-Dienststeuerung mehr.
 # 0.1.4: Kurze Dienstuebergaenge abwarten und eingefrorene Dienste auch beim Stoppen freigeben.
 # 0.1.3: Webinterface durch gesicherte Entfernung der PHP-Datei reversibel deaktivieren.
 # 0.1.2: Den freigegebenen Telefonie-Datei-Include auch am Dialplan-Ende erhalten.
@@ -26,7 +27,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = '0.1.4'
+VERSION = '0.2.0'
 STATE_DIR = '/var/lib/kienzlefax-verwalten'
 STATE_FILE = STATE_DIR + '/state.json'
 PENDING = STATE_DIR + '/pending.json'
@@ -224,6 +225,14 @@ class Host:
         return Path(path)
 
     def run(self, *args, check=True, timeout=30):
+        command = args[0]
+        if command == 'systemctl' and len(args) > 1:
+            # These operations and fixed unit names cannot contain credentials.
+            # Keep stdout/stderr private, but identify the actual failing action.
+            if args[1] in ('start', 'stop', 'reload', 'daemon-reload', 'freeze', 'thaw', 'kill', 'show'):
+                command += ' ' + args[1]
+            units = set(SERVICES.values()) | {'apache2.service', 'asterisk.service', 'smbd.service'}
+            command += ''.join(' ' + arg for arg in args[2:] if arg in units)
         env = dict(os.environ, LC_ALL='C', LANG='C')
         # Do not let root commands use a caller's PATH, CUPS server or Python path.
         env['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
@@ -232,11 +241,14 @@ class Host:
         try:
             result = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     env=env, timeout=timeout, check=False)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise Error('Systemwerkzeug nicht verfuegbar/Timeout: ' + args[0]) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise Error('Zeitlimit bei ' + command + ' (' + str(timeout) + ' Sekunden).') from exc
+        except OSError as exc:
+            raise Error('Systemwerkzeug nicht verfuegbar: ' + command) from exc
         if check and result.returncode:
             # Outputs can contain SIP credentials or document names. Never echo them.
-            raise Error('Systempruefung fehlgeschlagen: ' + args[0] + ' (Details lokal pruefen).')
+            raise Error('Systempruefung fehlgeschlagen: ' + command +
+                        ' (Exit-Code ' + str(result.returncode) + '; Details lokal pruefen).')
         return result.stdout, result.returncode
 
     def snapshot(self, path):
@@ -292,33 +304,12 @@ class Host:
         return values
 
     def service(self, unit):
-        # systemd may briefly report activating/deactivating around start/stop.
-        # A pending restart is not a stopped service; wait for a stable snapshot.
-        for attempt in range(21):
-            values = self.service_properties(unit)
-            if values is None:
-                return None
-            if values.get('ActiveState') in ('active', 'inactive', 'failed'):
-                return {'active': values['ActiveState'] == 'active', 'enabled': values['UnitFileState'],
-                        'frozen': values.get('FreezerState', 'running') not in ('running', '')}
-            if attempt < 20:
-                time.sleep(0.5)
-        raise Error('Dienst bleibt im Uebergang: ' + unit + ' (' + values.get('ActiveState', '?') +
-                    '/' + values.get('SubState', '?') + '). Dienststatus bitte pruefen.')
-
-    def ast(self, command):
-        out, _ = self.run('asterisk', '-rx', command)
-        require(not re.search(r'No such command|Unable to connect|No such module|Error|Failed', out, re.I),
-                'Asterisk-CLI-Pruefung fehlgeschlagen (keine Konfigurationsdetails im Log).')
-        return out
-
-    def idle_calls(self):
-        svc = self.service('asterisk.service')
-        if svc and svc['active']:
-            out = self.ast('core show channels count')
-            match = re.search(r'^\s*(\d+) active channels\s*$', out, re.M)
-            require(match is not None, 'Aktive Asterisk-Kanaele nicht sicher ermittelbar.')
-            require(int(match.group(1)) == 0, 'Telefonat oder Fax aktiv. Bitte spaeter erneut starten.')
+        values = self.service_properties(unit)
+        if values is None:
+            return None
+        # Runtime transitions do not block configuration for the next boot.
+        return {'active': values.get('ActiveState') == 'active', 'enabled': values['UnitFileState'],
+                'frozen': values.get('FreezerState', 'running') not in ('running', '')}
 
     def printer(self, name):
         require(SAFE_NAME.fullmatch(name), 'Ungueltiger Druckername.')
@@ -350,61 +341,6 @@ class Host:
         out, _ = self.run('lpstat', '-W', 'not-completed', '-o', name)
         require(not out.strip(), 'Druckauftraege vorhanden: ' + name + '. Bitte erst verarbeiten oder manuell zurueckstellen.')
 
-    def idle_share(self, name):
-        svc = self.service('smbd.service')
-        if not svc or not svc['active']:
-            return
-        out, _ = self.run('smbstatus', '-S')
-        require('Service' in out and 'pid' in out.lower(), 'Samba-Verbindungen nicht sicher ermittelbar.')
-        require(not any(line.split() and line.split()[0].lower() == name.lower() for line in out.splitlines()),
-                'Noch eine Verbindung zur Freigabe ' + name + ' offen. Bitte am Client trennen.')
-
-    def idle_processing(self, key):
-        directories = {'fax_send': ('/srv/kienzlefax/processing',),
-                       'scan_ocr': ('/srv/scan/eingang', '/var/tmp/scan-ocr'),
-                       'fax_ocr': ('/srv/scan/fax-eingang', '/var/tmp/scan-ocr-fax')}
-        for directory in directories[key]:
-            path = self.path(directory)
-            require(not path.is_dir() or not any(path.iterdir()),
-                    label(key) + ': Eingang/Arbeitsverzeichnis nicht leer. Verarbeitung erst abschliessen lassen.')
-
-    def can_freeze(self, unit):
-        current = self.service(unit)
-        if current and current['active']:
-            require(self.path('/sys/fs/cgroup/cgroup.controllers').exists(),
-                    'Sicheres Pausieren benoetigt systemd mit cgroup v2. Dienst vorher kontrolliert anhalten: ' + unit)
-
-    def freeze(self, unit):
-        svc = self.service(unit)
-        require(svc and not svc['frozen'], 'Dienst fehlt oder ist bereits eingefroren: ' + unit)
-        if svc['active']:
-            try:
-                self.run('systemctl', 'freeze', unit)
-                require(self.service(unit)['frozen'], 'Dienst konnte nicht sicher angehalten werden: ' + unit)
-            except BaseException:
-                self.thaw(unit)
-                raise
-            return True
-        return False
-
-    def thaw(self, unit):
-        # A frozen process can be in the middle of stopping. Waiting for a stable
-        # ActiveState here could prevent precisely the thaw needed to finish it.
-        svc = self.service_properties(unit)
-        if svc and svc.get('FreezerState', 'running') not in ('running', ''):
-            self.run('systemctl', 'thaw', unit)
-
-    def service_active(self, unit, active):
-        if not active:
-            current = self.service(unit)
-            if current and current['active'] and current['frozen']:
-                # Queue SIGTERM while frozen, before systemd thaws the unit for StopUnit.
-                # This prevents an idle worker from claiming another job on thaw.
-                self.run('systemctl', 'kill', '--signal=SIGTERM', '--kill-who=all', unit)
-        self.run('systemctl', 'start' if active else 'stop', unit)
-        current = self.service(unit)
-        require(current is not None and current['active'] == active, 'Dienstzustand nicht erreicht: ' + unit)
-
     def queue_count(self):
         return sum(sum(1 for _ in self.path(path).iterdir()) if self.path(path).is_dir() else 0
                    for path in ('/srv/kienzlefax/queue', '/srv/kienzlefax/processing', '/srv/kienzlefax/staging'))
@@ -415,41 +351,6 @@ class Host:
             path.write_text(text, encoding='utf-8')
             path.chmod(0o600)
             self.run('testparm', '-s', str(path))
-
-    def reload(self, paths, disabled, verify=True):
-        paths = set(paths)
-        if any(path.startswith('/etc/systemd/system/') for path in paths):
-            self.run('systemctl', 'daemon-reload')
-        # Only an explicitly saved Apache rule from 0.1.0–0.1.2 needs a reload
-        # when restoring/removing that old rule. New web pauses only remove PHP.
-        if LEGACY_WEB in paths:
-            self.run('apache2ctl', 'configtest')
-            svc = self.service('apache2.service')
-            if svc and svc['active']:
-                self.run('systemctl', 'reload', 'apache2.service')
-        if SMB in paths:
-            self.run('testparm', '-s')
-            svc = self.service('smbd.service')
-            if svc and svc['active']:
-                self.run('smbcontrol', 'all', 'reload-config')
-                for key in disabled:
-                    if key.startswith('share:'):
-                        name = key.split(':', 1)[1]
-                        self.run('smbcontrol', 'smbd', 'close-share', name)
-                        value, _ = self.run('testparm', '-s', '--section-name=' + name, '--parameter-name=available')
-                        require(value.strip().lower() in ('no', 'false', '0'), 'Samba-Sperre nicht geladen: ' + name)
-                        # An authentication failure alone does not prove that the share is unavailable.
-                        result, rc = self.run('smbclient', '//127.0.0.1/' + name, '-N', '-U', '%',
-                                              '-t', '5', '-c', 'quit', check=False)
-                        require(rc != 0 and 'NT_STATUS_BAD_NETWORK_NAME' in result,
-                                'Samba-Sperre im lokalen Zugriff nicht bestaetigt: ' + name)
-        if paths & {EXT, PHONE_EXT, PJSIP, PHONE_PJSIP}:
-            svc = self.service('asterisk.service')
-            if svc and svc['active']:
-                if paths & {EXT, PHONE_EXT}:
-                    self.ast('dialplan reload')
-                if paths & {PJSIP, PHONE_PJSIP}:
-                    self.ast('pjsip reload')
 
 
 class Manager:
@@ -506,8 +407,8 @@ class Manager:
                 problems.append('Konfiguration extern geaendert: ' + path)
         for key, original in self.state['services'].items():
             current = self.host.service(SERVICES[key])
-            if not current or current['enabled'] != original['enabled'] or current['active'] or current['frozen']:
-                problems.append('Pausierter Dienst extern geaendert/gestartet: ' + SERVICES[key])
+            if not current or current['enabled'] != original['enabled']:
+                problems.append('Dienst/Autostart extern geaendert: ' + SERVICES[key])
         for name in self.state['printers']:
             if self.host.printer(name) != {'accepting': False, 'enabled': False}:
                 problems.append('Pausierter Drucker extern geaendert: ' + name)
@@ -531,11 +432,11 @@ class Manager:
                 'Fax-OCR darf bei aktivem Faxempfang nicht pausiert werden. Faxempfang ebenfalls deaktivieren.')
         if 'fax_receive' in previous - desired and 'fax_ocr' in known:
             svc = self.host.service(SERVICES['fax_ocr'])
-            will_run = (self.state['services'].get('fax_ocr', {}).get('active')
-                        if 'fax_ocr' in previous else svc and svc['active'])
+            will_run = svc and svc['enabled'] in ('enabled', 'static', 'indirect')
             require(will_run and 'fax_ocr' not in desired,
-                    'Vor Faxempfang muss Fax-OCR laufen; sonst bleiben empfangene PDFs im Roh-Eingang.')
+                    'Fax-OCR muss fuer den Neustart aktiviert sein; sonst bleiben PDFs im Roh-Eingang.')
         after = copy.deepcopy(self.state)
+        after['version'] = VERSION
         after['disabled'] = sorted(desired)
         after['files'] = {}
         files = {}
@@ -581,7 +482,7 @@ class Manager:
                 render(dropin(unit), service_block(unit))
                 if key not in previous:
                     current = self.host.service(unit)
-                    require(current and not current['frozen'], 'Dienst fehlt oder ist eingefroren: ' + unit)
+                    require(current, 'Dienst fehlt: ' + unit)
                     after['services'][key] = current
             else:
                 after['services'].pop(key, None)
@@ -619,110 +520,23 @@ class Manager:
         return plan
 
     def preflight(self, plan):
-        changed = set(plan['changed'])
-        if changed & {'fax_send', 'fax_receive', 'fax_ocr', 'phone'}:
-            self.host.idle_calls()
-        for key in changed & SERVICES.keys():
-            if plan['before_services'][key]['active']:
-                self.host.idle_processing(key)
-            if not plan['after_services'][key] and plan['before_services'][key]['active']:
-                self.host.can_freeze(SERVICES[key])
         for name in plan['after_printers']:
             self.host.idle_printer(name)
-        for key in changed:
-            if key.startswith('share:'):
-                self.host.idle_share(key.split(':', 1)[1])
         if SMB in plan['after_files']:
             self.host.validate_samba(snapshot_text(plan['after_files'][SMB]))
-        if LEGACY_WEB in plan['after_files']:
-            self.host.run('apache2ctl', 'configtest')
-
-    def verify_asterisk(self, plan):
-        paths = set(plan['after_files'])
-        if not paths & {EXT, PHONE_EXT, PJSIP, PHONE_PJSIP}:
-            return
-        svc = self.host.service('asterisk.service')
-        if not svc or not svc['active']:
-            return
-        disabled = set(plan['after_state']['disabled'])
-        blocked_contexts = ({'fax-in'} if 'fax_receive' in disabled else set())
-        if 'phone' in disabled:
-            blocked_contexts |= PHONE_CONTEXTS
-        for path in paths & {EXT, PHONE_EXT}:
-            text = snapshot_text(plan['after_files'][path])
-            lines, parts = sections(text, asterisk=True)
-            for context, start, end in parts:
-                if context not in ({'fax-in'} if path == EXT else PHONE_CONTEXTS):
-                    continue
-                out = self.host.ast('dialplan show ' + context)
-                entries = re.findall(r'^\s*exten\s*=>\s*([^,]+),\s*1(?:\([^)]*\))?\s*,\s*([A-Za-z_]+)\(',
-                                     ''.join(lines[start:end]), re.M)
-                require(entries, 'Keine Dialplaneinstiege gefunden: ' + context)
-                for extension, application in entries:
-                    arguments = r'\('
-                    if context in blocked_contexts and extension.strip() != 'h':
-                        require(application == 'Hangup', 'Dialplan-Sperre ist unvollstaendig: ' + context)
-                        arguments = r'\(17\)'
-                    pattern = r"'" + re.escape(extension.strip()) + r"'\s*=>\s*1\.\s*" + application + arguments
-                    require(re.search(pattern, out, re.I), 'Dialplan-Einstieg nicht wie vorgesehen geladen: ' + context)
-        for path in paths & {PJSIP, PHONE_PJSIP}:
-            wanted = pjsip_objects(plan['after_files'][path], 'registration')
-            removed = pjsip_objects(plan['before_files'][path], 'registration') - wanted
-            for attempt in range(15):
-                out = self.host.ast('pjsip show registrations')
-                active = {line.strip().split('/', 1)[0] for line in out.splitlines()
-                          if '/' in line and not re.search(r'\b(Unregistered|Stopped)\b', line)}
-                present = {line.strip().split('/', 1)[0] for line in out.splitlines()
-                           if '/' in line and not re.search(r'\bStopped\b', line)}
-                if wanted <= present and not removed & active:
-                    break
-                time.sleep(1)
-            else:
-                raise Error('SIP-Registrierung nach Reload nicht im vorgesehenen Zustand.')
-            if path == PHONE_PJSIP:
-                out = self.host.ast('pjsip show endpoints')
-                present = set(re.findall(r'^\s*Endpoint:\s+([^/\s]+)', out, re.M))
-                wanted = pjsip_objects(plan['after_files'][path], 'endpoint')
-                removed = pjsip_objects(plan['before_files'][path], 'endpoint') - wanted
-                require(wanted <= present and not removed & present, 'Telefonie-Endpunkte nach Reload nicht im vorgesehenen Zustand.')
 
     def apply(self, plan):
         self.assert_clean()
         require(self.state == plan['before_state'], 'Zustand seit Vorschau geaendert.')
         self.check_files(plan['before_files'])
-        for key, original in plan['before_services'].items():
-            require(self.host.service(SERVICES[key]) == original, 'Dienstzustand seit Vorschau geaendert: ' + SERVICES[key])
         for name, original in plan['before_printers'].items():
             require(self.host.printer(name) == original, 'Druckerzustand seit Vorschau geaendert: ' + name)
         self.preflight(plan)
         self.save(PENDING, plan)
-        frozen = []
         try:
-            # Freeze known workers to close the check/stop race. A busy worker is thawed unchanged.
-            for key, active in plan['after_services'].items():
-                if not active and self.host.freeze(SERVICES[key]):
-                    frozen.append(SERVICES[key])
-                    self.host.idle_processing(key)
             for path, value in plan['after_files'].items():
                 self.host.write(path, value)
-            if plan['after_services'].get('fax_ocr'):
-                self.host.run('systemctl', 'daemon-reload')
-                self.host.service_active(SERVICES['fax_ocr'], True)
-            if plan['registration_off']:
-                svc = self.host.service('asterisk.service')
-                if svc and svc['active']:
-                    for name in plan['registration_off']:
-                        self.host.ast('pjsip send unregister ' + name)
-            self.host.reload(plan['after_files'], plan['after_state']['disabled'])
-            self.verify_asterisk(plan)
-            # Entry gates are now in place. Check again before stopping processing.
-            if (set(plan['changed']) & {'fax_send', 'fax_receive', 'fax_ocr', 'phone'} and
-                    any(not active for active in plan['after_services'].values())):
-                self.host.idle_calls()
-            for key, active in plan['after_services'].items():
-                self.host.service_active(SERVICES[key], active)
             for name, flags in plan['after_printers'].items():
-                # Reject first to prevent new jobs during the final idle check.
                 self.host.run('cupsreject', name)
                 self.host.idle_printer(name)
                 self.host.printer_set(name, flags)
@@ -735,13 +549,10 @@ class Manager:
         except BaseException as exc:
             try:
                 self.rollback(plan, pending=True)
-            except BaseException:
-                raise Error('Aenderung fehlgeschlagen; Ruecknahme unvollstaendig. '
-                            'Nicht neu installieren. Erneut --restore ausfuehren; Sicherung: ' + PENDING) from exc
-            raise Error('Aenderung abgebrochen und vorheriger Zustand wiederhergestellt: ' + str(exc)) from exc
-        finally:
-            for unit in frozen:
-                self.host.thaw(unit)
+            except BaseException as restore_error:
+                raise Error('Speichern fehlgeschlagen: ' + str(exc) + '; Ruecknahme unvollstaendig: ' +
+                            str(restore_error) + '. Erneut --restore ausfuehren; Sicherung: ' + PENDING) from exc
+            raise Error('Aenderung abgebrochen und vorherige Konfiguration wiederhergestellt: ' + str(exc)) from exc
 
     def check_files(self, expected, alternatives=None):
         for path, value in expected.items():
@@ -750,56 +561,18 @@ class Manager:
                     'Datei seit Vorschau/Transaktion extern geaendert: ' + path + '. Keine Ueberschreibung.')
 
     def rollback(self, transaction, pending=False):
-        frozen = []
-        try:
-            self.check_files(transaction['after_files'], transaction['before_files'] if pending else None)
-            self._rollback(transaction, pending, frozen)
-        finally:
-            # A crash can leave a previously running processor frozen. Never strand it
-            # when recovery must wait for an active call or external correction.
-            for key, original in transaction['before_services'].items():
-                unit = SERVICES[key]
-                if unit in frozen or (pending and original['active']):
-                    self.host.thaw(unit)
-
-    def _rollback(self, transaction, pending, frozen):
-        # Runtime safety is required for manual recovery too, including a crash after start.
-        if set(transaction['changed']) & {'fax_send', 'fax_receive', 'fax_ocr', 'phone'}:
-            self.host.idle_calls()
+        # Also accepts incomplete transactions from the former live-control versions.
+        # Frozen/stopped/restarting services are left for the subsequent reboot.
+        self.check_files(transaction['after_files'], transaction['before_files'] if pending else None)
         for name in transaction['before_printers']:
             self.host.idle_printer(name)
-        for key in transaction['changed']:
-            if key.startswith('share:'):
-                self.host.idle_share(key.split(':', 1)[1])
-        for key, original in transaction['before_services'].items():
-            current = self.host.service(SERVICES[key])
-            require(current and current['enabled'] == original['enabled'],
-                    'Autostartstatus extern veraendert: ' + SERVICES[key])
-            if current['active'] and not original['active']:
-                self.host.idle_processing(key)
-                self.host.can_freeze(SERVICES[key])
-        # Journal the restore too, so power loss during restore can be recovered.
+        if transaction['before_files'].get(SMB) is not None:
+            self.host.validate_samba(snapshot_text(transaction['before_files'][SMB]))
         recovering = copy.deepcopy(transaction)
         recovering['status'] = 'restoring'
         self.save(PENDING, recovering)
-        for key, original in transaction['before_services'].items():
-            unit = SERVICES[key]
-            if not original['active'] and self.host.freeze(unit):
-                frozen.append(unit)
-                self.host.idle_processing(key)
         for path, value in transaction['before_files'].items():
             self.host.write(path, value)
-        if transaction['before_services'].get('fax_ocr', {}).get('active'):
-            self.host.run('systemctl', 'daemon-reload')
-            self.host.service_active(SERVICES['fax_ocr'], True)
-        self.host.reload(transaction['before_files'], transaction['before_state']['disabled'])
-        self.verify_asterisk({'after_files': transaction['before_files'],
-                              'before_files': transaction['after_files'],
-                              'after_state': transaction['before_state']})
-        for key, original in transaction['before_services'].items():
-            if original['active']:
-                self.host.thaw(SERVICES[key])
-            self.host.service_active(SERVICES[key], original['active'])
         for name, flags in transaction['before_printers'].items():
             self.host.run('cupsreject', name)
             self.host.idle_printer(name)
@@ -829,7 +602,7 @@ def answer(prompt, allowed, default):
 def confirm_queue(host):
     count = host.queue_count()
     if count:
-        print(str(count) + ' Eintraege in Fax-Warteschlange/Verarbeitung/Staging. Beim Start kann Versand erfolgen.')
+        print(str(count) + ' Eintraege in Fax-Warteschlange/Verarbeitung/Staging. Nach dem Neustart kann Versand erfolgen.')
         require(answer('Versand dieser wartenden Auftraege ausdruecklich zulassen? [ja/NEIN] ',
                        {'ja', 'nein'}, 'nein') == 'ja', 'Versandfreigabe abgebrochen.')
 
@@ -865,11 +638,12 @@ def show_status(manager):
     for problem in problems:
         print('ABWEICHUNG: ' + problem)
     for key in manager.inventory():
-        status = 'durch Assistent pausiert' if key in manager.state['disabled'] else 'keine Assistentensperre'
+        status = 'Pause fuer Neustart konfiguriert' if key in manager.state['disabled'] else 'keine Assistentensperre'
         if key in SERVICES:
             svc = manager.host.service(SERVICES[key])
             status += '; Dienst ' + ('laeuft' if svc and svc['active'] else 'laeuft nicht')
         print('  ' + label(key) + ': ' + status)
+    print('Gespeicherte Einstellungen gelten vollstaendig nach einem Neustart.')
     print('Installerlaeufe koennen Konfigurationen/Dienste erneut aktivieren. Danach Status pruefen.')
     return bool(problems or pending)
 
@@ -901,7 +675,7 @@ def main(argv=None):
             print('Letzte ' + ('unvollstaendige ' if pending else '') + 'Aenderung zuruecknehmen:')
             for key in transaction['changed']:
                 print('  ' + label(key))
-            if transaction['before_services'].get('fax_send', {}).get('active'):
+            if 'fax_send' in transaction['changed'] and 'fax_send' not in transaction['before_state']['disabled']:
                 confirm_queue(host)
             require(answer('Vorherigen Zustand wiederherstellen? [ja/NEIN] ', {'ja', 'nein'}, 'nein') == 'ja', 'Abgebrochen.')
             with locked(host):
@@ -912,12 +686,12 @@ def main(argv=None):
                 if not latest_pending:
                     current.assert_clean()
                 current.rollback(transaction, pending=bool(pending))
-            print('Vorheriger Zustand wiederhergestellt. Dokumente und Warteschlangen bleiben erhalten.')
+            print('Vorherige Konfiguration wiederhergestellt. Jetzt neu starten: sudo reboot')
             return 0
         manager.assert_clean()
         show_status(manager)
-        print('\nJede Auswahl gilt dauerhaft, auch nach Neustart. [u] unveraendert, [a] Sperre aufheben, [d] deaktivieren.')
-        print('Aktivieren stellt den Zustand vor der Pause wieder her; vorher gestoppte Dienste bleiben gestoppt.')
+        print('\nAuswahl fuer den naechsten Neustart: [u] unveraendert, [a] Sperre aufheben, [d] deaktivieren.')
+        print('Aktivieren stellt die gesicherte Konfiguration wieder her. Danach das Geraet neu starten.')
         print('Freigaben sperren nur den Netzwerkzugriff. Dateien bleiben lokal und ggf. im Web erreichbar.')
         print('Web aus stoppt keinen Versand. Versand aus verhindert nicht das Anlegen weiterer Web-Auftraege.')
         print('Fax-OCR kann nur zusammen mit deaktiviertem Faxempfang pausieren.')
@@ -936,17 +710,19 @@ def main(argv=None):
         for key in plan['changed']:
             print('  ' + label(key) + ': ' + ('DEAKTIVIEREN' if key in desired else 'VORHERIGEN ZUSTAND FREIGEBEN'))
         if plan['registration_off']:
-            print('  Zugehoerige SIP-Registrierungen werden dauerhaft entfernt und abgemeldet.')
+            print('  Zugehoerige SIP-Registrierungen werden bis zur Wiederaktivierung aus der Konfiguration entfernt.')
         print('  Konfigurationen werden geschuetzt gesichert; keine Dokumente, Queues oder Pakete werden geloescht.')
+        print('  Dienste uebernehmen die Einstellungen beim Neustart. Webdatei und Drucker werden sofort angepasst.')
         if args.dry_run:
             print('Vorschau beendet. Keine Aenderungen vorgenommen.')
             return 0
-        if plan['after_services'].get('fax_send'):
+        if 'fax_send' in plan['changed'] and 'fax_send' not in desired:
             confirm_queue(host)
         require(answer('Diese Aenderungen jetzt anwenden? [ja/NEIN] ', {'ja', 'nein'}, 'nein') == 'ja', 'Abgebrochen.')
         with locked(host):
             Manager(host).apply(plan)
-        print('Aenderungen angewendet. Ruecknahme: sudo bash kienzlefax-verwalten.sh --restore')
+        print('Einstellungen gespeichert. Jetzt neu starten: sudo reboot')
+        print('Ruecknahme: sudo bash kienzlefax-verwalten.sh --restore (danach ebenfalls neu starten)')
         return 0
 
 
