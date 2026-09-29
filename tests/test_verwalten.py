@@ -11,6 +11,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+WEB_PHP = '<?php echo "synthetic web interface";\n'
+
 SCRIPT = Path(__file__).resolve().parents[1] / 'kienzlefax-verwalten.sh'
 SOURCE = SCRIPT.read_text().split("<<'KFX_PYTHON'\n", 1)[1].split('\nKFX_PYTHON\n', 1)[0]
 spec = importlib.util.spec_from_loader('verwalten', loader=None)
@@ -167,6 +169,7 @@ class FakeHost(v.Host):
         self.put(v.PHONE_PJSIP, PHONE, 0o640)
         self.put(v.PHONE_EXT, PHONE_EXT, 0o640)
         self.put(v.SMB, SMB)
+        self.put(v.WEB, WEB_PHP)
         self.path('/var/www/html/kienzlefax.php').parent.mkdir(parents=True)
         self.path('/var/www/html/kienzlefax.php').touch()
 
@@ -312,7 +315,7 @@ class ManagementTests(unittest.TestCase):
         second = self.apply({'share:scan-eingang', 'web'})
         self.manager.rollback(second)
         self.assertEqual(self.manager.state['disabled'], ['share:scan-eingang'])
-        self.assertIsNone(self.host.snapshot(v.WEB))
+        self.assertEqual(v.snapshot_text(self.host.snapshot(v.WEB)), WEB_PHP)
         self.assertIn('available = no', v.snapshot_text(self.host.snapshot(v.SMB)))
 
     def test_service_roundtrip_restores_original_runtime_without_enable(self):
@@ -379,7 +382,7 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual(pending['status'], 'restoring')
         self.manager.rollback(pending, pending=True)
         self.assertEqual(v.snapshot_text(self.host.snapshot(v.SMB)), SMB)
-        self.assertIsNone(self.host.snapshot(v.WEB))
+        self.assertEqual(v.snapshot_text(self.host.snapshot(v.WEB)), WEB_PHP)
 
     def test_active_call_blocks_before_write(self):
         self.host.calls = True
@@ -487,7 +490,7 @@ class ManagementTests(unittest.TestCase):
             self.apply({'fax_send', 'fax_receive', 'share:scan-eingang', 'web'})
         for path, value in before.items():
             self.assertEqual(self.host.snapshot(path), value)
-        self.assertIsNone(self.host.snapshot(v.WEB))
+        self.assertEqual(v.snapshot_text(self.host.snapshot(v.WEB)), WEB_PHP)
         self.assertIsNone(self.host.snapshot(v.PENDING))
         self.assertTrue(self.host.units['kienzlefax-worker.service']['active'])
         self.assertFalse(self.manager.state['disabled'])
@@ -498,7 +501,7 @@ class ManagementTests(unittest.TestCase):
         self.host.write(v.WEB, plan['after_files'][v.WEB])
         self.manager.rollback(plan, pending=True)
         self.assertEqual(v.snapshot_text(self.host.snapshot(v.SMB)), SMB)
-        self.assertIsNone(self.host.snapshot(v.WEB))
+        self.assertEqual(v.snapshot_text(self.host.snapshot(v.WEB)), WEB_PHP)
         self.assertIsNone(self.host.snapshot(v.PENDING))
 
     def test_pending_crash_blocks_other_operations(self):
@@ -526,13 +529,37 @@ class ManagementTests(unittest.TestCase):
             self.manager.plan({'share:scan-eingang'})
         self.assertFalse(self.host.writes)
 
-    def test_web_block_covers_path_info_and_never_replaces_php(self):
+    def test_web_file_is_backed_up_removed_and_restored_without_apache(self):
+        self.host.files[v.WEB].update(mode=0o640, uid=33, gid=33)
+        original = self.host.snapshot(v.WEB)
         self.apply({'web'})
-        text = v.snapshot_text(self.host.snapshot(v.WEB))
-        self.assertIn('<Files "kienzlefax.php">', text)
-        self.assertIn('^/kienzlefax[.]php(?:/|$)', text)
-        self.assertTrue(self.host.path('/var/www/html/kienzlefax.php').exists())
-        self.assertFalse(any(path.endswith('.php') for path in self.host.writes))
+        self.assertIsNone(self.host.snapshot(v.WEB))
+        self.assertEqual(self.manager.state['files'][v.WEB]['original'], original)
+        self.assertLess(self.host.writes.index(v.PENDING), self.host.writes.index(v.WEB))
+        self.assertEqual(self.host.snapshot(v.STATE_FILE)['mode'], 0o600)
+        self.assertIn('web', self.manager.inventory())
+        v.Host.reload(self.host, [v.WEB], ['web'])
+        self.apply(set())
+        self.assertEqual(self.host.snapshot(v.WEB), original)
+        self.assertFalse(any(command[0] in ('apache2ctl', 'curl', 'systemctl') for command in self.host.commands))
+        self.assertFalse(any(path.startswith('/etc/apache2/') for path in self.host.writes))
+
+    def test_web_reactivation_never_overwrites_a_new_php_file(self):
+        self.apply({'web'})
+        self.host.put(v.WEB, '<?php // newer installation\n')
+        replacement = self.host.snapshot(v.WEB)
+        with self.assertRaisesRegex(v.Error, 'extern geaendert'):
+            self.manager.plan(set())
+        self.assertEqual(self.host.snapshot(v.WEB), replacement)
+
+    def test_legacy_apache_web_pause_can_still_be_restored(self):
+        self.host.put(v.LEGACY_WEB, '# old wizard block\nRequire all denied\n')
+        self.manager.state['disabled'] = ['web']
+        self.manager.state['files'][v.LEGACY_WEB] = {
+            'original': None, 'applied': self.host.snapshot(v.LEGACY_WEB)}
+        self.apply(set())
+        self.assertIsNone(self.host.snapshot(v.LEGACY_WEB))
+        self.assertEqual(v.snapshot_text(self.host.snapshot(v.WEB)), WEB_PHP)
 
     def test_secret_contents_never_printed_in_status(self):
         self.apply({'fax_send', 'fax_receive'})
@@ -589,7 +616,7 @@ class ManagementTests(unittest.TestCase):
         plan = self.apply({'share:scan-eingang', 'web'})
         self.manager.rollback(plan)
         self.assertEqual(self.host.snapshot(v.SMB), before)
-        self.assertIsNone(self.host.snapshot(v.WEB))
+        self.assertEqual(v.snapshot_text(self.host.snapshot(v.WEB)), WEB_PHP)
 
     def test_repeated_global_is_case_insensitive(self):
         self.host.put(v.SMB, SMB + '\n[ GLOBAL ]\nlog level = 0\n')

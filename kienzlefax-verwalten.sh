@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # IMMER verwenden wenn KienzleFax-Funktionen reversibel pausiert oder wieder freigegeben werden sollen.
-# Version 0.1.2 (2026-09-29)
+# Version 0.1.3 (2026-09-29)
 # Changelog:
+# 0.1.3: Webinterface durch gesicherte Entfernung der PHP-Datei reversibel deaktivieren.
 # 0.1.2: Den freigegebenen Telefonie-Datei-Include auch am Dialplan-Ende erhalten.
 # 0.1.1: Wiederholte Samba-[global]-Abschnitte zulassen und unveraendert erhalten.
 # 0.1.0: Separater Verwaltungsassistent mit Vorschau, Einzelschaltern und Ruecknahme.
@@ -24,7 +25,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = '0.1.2'
+VERSION = '0.1.3'
 STATE_DIR = '/var/lib/kienzlefax-verwalten'
 STATE_FILE = STATE_DIR + '/state.json'
 PENDING = STATE_DIR + '/pending.json'
@@ -35,7 +36,8 @@ PJSIP = '/etc/asterisk/pjsip.conf'
 PHONE_EXT = '/etc/asterisk/extensions-kfx-telefonie.conf'
 PHONE_PJSIP = '/etc/asterisk/pjsip-kfx-telefonie.conf'
 PHONE_DIALPLAN_INCLUDE = '#tryinclude "/etc/asterisk/extensions-kfx-telefonie.conf"'
-WEB = '/etc/apache2/conf-enabled/zz-kienzlefax-verwalten.conf'
+WEB = '/var/www/html/kienzlefax.php'
+LEGACY_WEB = '/etc/apache2/conf-enabled/zz-kienzlefax-verwalten.conf'
 SERVICES = {'fax_send': 'kienzlefax-worker.service',
             'scan_ocr': 'scan-ocr.service', 'fax_ocr': 'scan-ocr-fax.service'}
 LABELS = {'fax_send': 'Faxversand (Worker)', 'fax_receive': 'Faxempfang',
@@ -205,19 +207,6 @@ def pjsip_objects(snapshot, kind):
     lines, parts = sections(snapshot_text(snapshot), asterisk=True)
     return {name for name, start, end in parts
             if re.search(r'^\s*type\s*=\s*' + kind + r'\s*$', ''.join(lines[start:end]), re.M)}
-
-
-def web_block():
-    return '''# KienzleFax Verwaltung: nur KienzleFax sperren, Apache weiterbetreiben.
-<Directory "/var/www/html">
-    <Files "kienzlefax.php">
-        Require all denied
-    </Files>
-</Directory>
-<LocationMatch "^/kienzlefax[.]php(?:/|$)">
-    Require all denied
-</LocationMatch>
-'''
 
 
 def dropin(unit):
@@ -416,18 +405,13 @@ class Host:
         paths = set(paths)
         if any(path.startswith('/etc/systemd/system/') for path in paths):
             self.run('systemctl', 'daemon-reload')
-        if WEB in paths:
+        # Only an explicitly saved Apache rule from 0.1.0–0.1.2 needs a reload
+        # when restoring/removing that old rule. New web pauses only remove PHP.
+        if LEGACY_WEB in paths:
             self.run('apache2ctl', 'configtest')
             svc = self.service('apache2.service')
             if svc and svc['active']:
                 self.run('systemctl', 'reload', 'apache2.service')
-                if verify and 'web' in disabled:
-                    for url in ('http://127.0.0.1/kienzlefax.php?ajax=status',
-                                'https://127.0.0.1/kienzlefax.php/verwaltung-test'):
-                        code, rc = self.run('curl', '--noproxy', '*', '-k', '-s', '-L',
-                                            '--max-time', '10', '-o', '/dev/null', '-w', '%{http_code}', url, check=False)
-                        require(rc == 0 and code == '403',
-                                'Websperre auf HTTP/HTTPS nicht bestaetigt. Eigene VirtualHosts bitte manuell pruefen.')
         if SMB in paths:
             self.run('testparm', '-s')
             svc = self.service('smbd.service')
@@ -489,7 +473,7 @@ class Manager:
             keys.append('fax_receive')
         if self.base(PHONE_PJSIP) and 'type=endpoint' in self.base_text(PHONE_PJSIP):
             keys.append('phone')
-        if self.host.path('/var/www/html/kienzlefax.php').is_file():
+        if self.base(WEB) is not None:
             keys.append('web')
         smb = self.base(SMB)
         if smb:
@@ -552,8 +536,11 @@ class Manager:
         if any(key.startswith('share:') for key in desired):
             render(SMB, samba_render(self.base_text(SMB), desired))
         if 'web' in desired:
-            require(self.base(WEB) is None, 'Eigene Apache-Sperrdatei existiert bereits ohne passende Sicherung.')
-            render(WEB, web_block())
+            original = self.base(WEB)
+            require(original is not None, 'Webinterface fehlt; keine gesicherte PHP-Datei zur Wiederherstellung.')
+            # apply() persists the protected transaction before unlinking this file.
+            after['files'][WEB] = {'original': original, 'applied': None}
+            files[WEB] = None
         if 'fax_receive' in desired:
             text = self.base_text(EXT)
             require('ReceiveFAX(' in text, 'Kein bekannter ReceiveFAX-Dialplan vorhanden.')
@@ -632,7 +619,7 @@ class Manager:
                 self.host.idle_share(key.split(':', 1)[1])
         if SMB in plan['after_files']:
             self.host.validate_samba(snapshot_text(plan['after_files'][SMB]))
-        if WEB in plan['after_files']:
+        if LEGACY_WEB in plan['after_files']:
             self.host.run('apache2ctl', 'configtest')
 
     def verify_asterisk(self, plan):

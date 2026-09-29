@@ -3,7 +3,7 @@
 IMMER verwenden wenn einzelne KienzleFax-Funktionen auf einem bestehenden Gerät
 pausiert oder wieder freigegeben werden sollen.
 
-**Werkzeug:** `kienzlefax-verwalten.sh` · **Version:** 0.1.2 · **Stand:** 29.09.2026
+**Werkzeug:** `kienzlefax-verwalten.sh` · **Version:** 0.1.3 · **Stand:** 29.09.2026
 
 Der separate Terminal-Assistent verändert die bestehende Installation gezielt.
 Dokumente, wartende Faxe, Benutzer, Zugangsdaten und installierte Pakete bleiben
@@ -52,7 +52,7 @@ Ein Eingabeabbruch vor der Bestätigung verändert keine Konfigurationen oder Di
 | Faxversand | Pausiert den Faxworker und verhindert dessen erneuten Start durch systemd. Wartende Aufträge bleiben erhalten. |
 | Faxempfang | Sperrt neue Anrufe im Faxeingang vor `Answer()` mit `Hangup(17)`. Telefonie kann weiterlaufen. |
 | Telefonie/Warteschlange | Sperrt die Telefonieeinstiege und entfernt die Telefonie-Endpunkte und -Registrierungen aus der geladenen PJSIP-Konfiguration. Gemeinsame Transporte und Fax bleiben erhalten. |
-| Webinterface | Sperrt ausschließlich KienzleFax per Apache-Konfiguration, einschließlich der API-Aufrufe und zusätzlicher Pfadteile. Apache und andere Websites laufen weiter. |
+| Webinterface | Sichert `/var/www/html/kienzlefax.php` geschützt außerhalb des Webroots und entfernt die Datei. Beim Aktivieren wird sie mit ursprünglichem Inhalt, Besitzer und Rechten wiederhergestellt. |
 | Scanner-OCR | Pausiert `scan-ocr.service`. Dies ist unabhängig von den Scan-Freigaben und der Fax-OCR. |
 | Fax-OCR | Pausiert `scan-ocr-fax.service`. Nur zulässig, wenn auch Faxempfang deaktiviert ist. |
 | Netzwerkfreigaben | Schaltet jede erkannte KienzleFax-Freigabe einzeln mit `available = no` ab. Samba und fremde Freigaben laufen weiter. |
@@ -118,9 +118,15 @@ Wiederherstellung wird protokolliert und kann erneut mit `--restore` versucht we
   Druckaufträge verhindern eine Änderung. Am Client zuerst die Verbindung trennen
   beziehungsweise die Druckverarbeitung abschließen lassen.
 - Samba wird mit `testparm` geprüft; Abschaltungen werden zusätzlich durch einen
-  lokalen `smbclient`-Zugriff kontrolliert. Die Websperre wird bei laufendem Apache
-  auf HTTP und HTTPS auf Antwort 403 geprüft. Andere Webserver oder individuelle
-  VirtualHosts sind kein automatisch unterstütztes Ziel.
+  lokalen `smbclient`-Zugriff kontrolliert.
+- Das Webinterface wird durch Entfernen von `/var/www/html/kienzlefax.php` deaktiviert.
+  Inhalt, Besitzer und Rechte liegen vorher in der geschützten Transaktionssicherung
+  unter `/var/lib/kienzlefax-verwalten/` (Dateien `0600`). Es entsteht keine PHP-Kopie
+  im Webroot. Apache-Konfiguration und -Dienst werden dabei nicht geändert; HTTP-
+  Prüfungen sind nicht erforderlich. Eine zwischenzeitlich neu angelegte PHP-Datei
+  wird bei der Wiederherstellung nicht überschrieben. Nur bei der Rücknahme einer
+  gespeicherten Apache-Sperre aus Version 0.1.0–0.1.2 muss deren alte Regel entfernt
+  und Apache nachgeladen werden.
 - Laufende Asterisk-Konfigurationen werden nachgeladen und die gesperrten
   Dialplaneinstiege, entfernten Telefonie-Endpunkte und SIP-Registrierungen geprüft.
   Bei vorher gestoppten Diensten kann nur die persistente Konfiguration geändert
@@ -176,6 +182,10 @@ Technische Referenzen:
 
 ## Changelog
 
+- **0.1.3 – 29.09.2026:** Der Webschalter sichert und entfernt ausschließlich
+  `kienzlefax.php`; die Aktivierung stellt die Datei samt Besitzer und Rechten wieder
+  her. Apache-Sperrkonfiguration und HTTP-/HTTPS-Prüfungen entfallen für neue Pausen.
+  Gespeicherte Sperren früherer Versionen bleiben rücknehmbar.
 - **0.1.2 – 29.09.2026:** Die Faxabschaltung akzeptiert den bereits freigegebenen
   Telefonie-Datei-Include auch nach dem letzten Dialplan-Kontext. Tests verwenden
   den vollständigen Installer-Dialplan einschließlich angehängter Abschlusszeile
