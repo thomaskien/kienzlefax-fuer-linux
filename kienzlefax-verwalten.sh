@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # IMMER verwenden wenn KienzleFax-Funktionen reversibel pausiert oder wieder freigegeben werden sollen.
-# Version 0.1.3 (2026-09-29)
+# Version 0.1.4 (2026-09-29)
 # Changelog:
+# 0.1.4: Kurze Dienstuebergaenge abwarten und eingefrorene Dienste auch beim Stoppen freigeben.
 # 0.1.3: Webinterface durch gesicherte Entfernung der PHP-Datei reversibel deaktivieren.
 # 0.1.2: Den freigegebenen Telefonie-Datei-Include auch am Dialplan-Ende erhalten.
 # 0.1.1: Wiederholte Samba-[global]-Abschnitte zulassen und unveraendert erhalten.
@@ -25,7 +26,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = '0.1.3'
+VERSION = '0.1.4'
 STATE_DIR = '/var/lib/kienzlefax-verwalten'
 STATE_FILE = STATE_DIR + '/state.json'
 PENDING = STATE_DIR + '/pending.json'
@@ -278,7 +279,7 @@ class Host:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-    def service(self, unit):
+    def service_properties(self, unit):
         out, rc = self.run('systemctl', 'show', unit, '--no-pager',
                            '--property=LoadState,ActiveState,SubState,UnitFileState,FreezerState', check=False)
         values = dict(line.split('=', 1) for line in out.splitlines() if '=' in line)
@@ -287,11 +288,23 @@ class Host:
             return None
         require(rc == 0, 'systemd-Dienststatus konnte nicht gelesen werden: ' + unit)
         require(values['LoadState'] in ('loaded', 'masked'), 'systemd-Dienst ist nicht korrekt geladen: ' + unit)
-        require(values.get('ActiveState') in ('active', 'inactive', 'failed'),
-                'Dienst befindet sich im Uebergang: ' + unit)
         require(values.get('UnitFileState'), 'Autostartstatus nicht ermittelbar: ' + unit)
-        return {'active': values['ActiveState'] == 'active', 'enabled': values['UnitFileState'],
-                'frozen': values.get('FreezerState', 'running') not in ('running', '')}
+        return values
+
+    def service(self, unit):
+        # systemd may briefly report activating/deactivating around start/stop.
+        # A pending restart is not a stopped service; wait for a stable snapshot.
+        for attempt in range(21):
+            values = self.service_properties(unit)
+            if values is None:
+                return None
+            if values.get('ActiveState') in ('active', 'inactive', 'failed'):
+                return {'active': values['ActiveState'] == 'active', 'enabled': values['UnitFileState'],
+                        'frozen': values.get('FreezerState', 'running') not in ('running', '')}
+            if attempt < 20:
+                time.sleep(0.5)
+        raise Error('Dienst bleibt im Uebergang: ' + unit + ' (' + values.get('ActiveState', '?') +
+                    '/' + values.get('SubState', '?') + '). Dienststatus bitte pruefen.')
 
     def ast(self, command):
         out, _ = self.run('asterisk', '-rx', command)
@@ -375,8 +388,10 @@ class Host:
         return False
 
     def thaw(self, unit):
-        svc = self.service(unit)
-        if svc and svc['active'] and svc['frozen']:
+        # A frozen process can be in the middle of stopping. Waiting for a stable
+        # ActiveState here could prevent precisely the thaw needed to finish it.
+        svc = self.service_properties(unit)
+        if svc and svc.get('FreezerState', 'running') not in ('running', ''):
             self.run('systemctl', 'thaw', unit)
 
     def service_active(self, unit, active):

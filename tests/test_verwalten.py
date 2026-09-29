@@ -736,6 +736,35 @@ class ManagementTests(unittest.TestCase):
 
 
 class HostTests(unittest.TestCase):
+    def test_service_waits_for_transition_then_returns_stable_state(self):
+        host = v.Host()
+        def status(active, sub):
+            return ('LoadState=loaded\nUnitFileState=enabled\nFreezerState=running\n'
+                    'ActiveState=' + active + '\nSubState=' + sub + '\n', 0)
+        for transition in (('activating', 'auto-restart'), ('deactivating', 'stop-sigterm')):
+            with self.subTest(transition=transition), \
+                    patch.object(host, 'run', side_effect=[status(*transition), status('inactive', 'dead')]), \
+                    patch.object(v.time, 'sleep'):
+                self.assertEqual(host.service('scan-ocr-fax.service'),
+                                 {'active': False, 'enabled': 'enabled', 'frozen': False})
+
+    def test_service_persistent_transition_fails_with_specific_status(self):
+        host = v.Host()
+        status = ('LoadState=loaded\nUnitFileState=enabled\nFreezerState=running\n'
+                  'ActiveState=activating\nSubState=auto-restart\n', 0)
+        with patch.object(host, 'run', return_value=status) as run, patch.object(v.time, 'sleep'):
+            with self.assertRaisesRegex(v.Error, 'scan-ocr-fax.service.*activating/auto-restart'):
+                host.service('scan-ocr-fax.service')
+        self.assertLessEqual(run.call_count, 21)
+
+    def test_thaw_during_stop_does_not_wait_for_active_state(self):
+        host = v.Host()
+        status = ('LoadState=loaded\nUnitFileState=enabled\nFreezerState=frozen\n'
+                  'ActiveState=deactivating\nSubState=stop-sigterm\n', 0)
+        with patch.object(host, 'run', side_effect=[status, ('', 0)]) as run:
+            host.thaw('scan-ocr-fax.service')
+        self.assertEqual(run.call_args_list[-1].args, ('systemctl', 'thaw', 'scan-ocr-fax.service'))
+
     def test_stop_queues_term_before_thaw(self):
         host = v.Host()
         with patch.object(host, 'service', side_effect=[{'active': True, 'frozen': True}, {'active': False}]), \

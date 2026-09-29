@@ -3,7 +3,7 @@
 IMMER verwenden wenn einzelne KienzleFax-Funktionen auf einem bestehenden Gerät
 pausiert oder wieder freigegeben werden sollen.
 
-**Werkzeug:** `kienzlefax-verwalten.sh` · **Version:** 0.1.3 · **Stand:** 29.09.2026
+**Werkzeug:** `kienzlefax-verwalten.sh` · **Version:** 0.1.4 · **Stand:** 29.09.2026
 
 Der separate Terminal-Assistent verändert die bestehende Installation gezielt.
 Dokumente, wartende Faxe, Benutzer, Zugangsdaten und installierte Pakete bleiben
@@ -114,6 +114,9 @@ Wiederherstellung wird protokolliert und kann erneut mit `--restore` versucht we
 - Vor dem Stoppen eines laufenden OCR-Dienstes müssen Eingang und Arbeitsverzeichnis
   leer sein. Beim Faxworker darf keine Verarbeitung laufen. Die Dienste werden
   für die abschließende Prüfung kurz eingefroren und bei Abbruch wieder freigegeben.
+  Kurze Start-/Stoppübergänge werden mit bis zu zehn Sekunden Wartezeit erneut
+  geprüft. Ein dauerhaft instabiler Dienst führt zu einer Meldung mit dem konkreten
+  Status. Ein eingefrorener Dienst wird auch während eines Stoppübergangs freigegeben.
 - Offene Verbindungen zu ausgewählten Samba-Freigaben sowie noch nicht abgeschlossene
   Druckaufträge verhindern eine Änderung. Am Client zuerst die Verbindung trennen
   beziehungsweise die Druckverarbeitung abschließen lassen.
@@ -182,6 +185,10 @@ Technische Referenzen:
 
 ## Changelog
 
+- **0.1.4 – 29.09.2026:** Kurze systemd-Start-/Stoppübergänge führen nicht mehr sofort
+  zum Abbruch. Die Statusprüfung wartet begrenzt und nennt bei dauerhaftem Übergang
+  den Haupt- und Unterstatus. Das Freigeben eingefrorener Dienste bleibt auch während
+  des Stoppens möglich.
 - **0.1.3 – 29.09.2026:** Der Webschalter sichert und entfernt ausschließlich
   `kienzlefax.php`; die Aktivierung stellt die Datei samt Besitzer und Rechten wieder
   her. Apache-Sperrkonfiguration und HTTP-/HTTPS-Prüfungen entfallen für neue Pausen.
