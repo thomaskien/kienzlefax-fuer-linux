@@ -1,0 +1,47 @@
+; Fonial Cloud-Telefonanlage
+; IP-Endgeraet Kienzlefon, Nebenstelle 90
+; Vorlage vom 17.11.2026; Platzhalter mit den Fonial-SIP-Zugangsdaten ersetzen.
+; Voraussetzung: transport-udp und der Dialplan-Kontext kfx-phone-in existieren.
+; kfx-phone-in-endpoint darf nicht gleichzeitig anderswo definiert sein.
+; Das maskierte Semikolon gehoert zum SIP-URI-Parameter lr (Loose Routing).
+
+[fonial-registration]
+type=registration
+transport=transport-udp
+outbound_auth=fonial-auth
+server_uri=sip:sip.plusnet.de
+client_uri=sip:CHANGE_ME_FONIAL_CLIENT_USER@sip.plusnet.de
+outbound_proxy=sip:sbc.sip.plusnet.de\;lr
+contact_user=inbound-calls
+expiration=300
+retry_interval=60
+forbidden_retry_interval=600
+line=yes
+endpoint=kfx-phone-in-endpoint
+
+[fonial-auth]
+type=auth
+auth_type=userpass
+username=CHANGE_ME_FONIAL_AUTH_USERNAME
+password=CHANGE_ME_FONIAL_AUTH_PASSWORD
+
+[fonial-aor]
+type=aor
+contact=sip:sip.plusnet.de
+outbound_proxy=sip:sbc.sip.plusnet.de\;lr
+
+[kfx-phone-in-endpoint]
+type=endpoint
+transport=transport-udp
+context=kfx-phone-in
+disallow=all
+allow=alaw,ulaw
+outbound_auth=fonial-auth
+aors=fonial-aor
+from_user=CHANGE_ME_FONIAL_FROM_USER
+from_domain=sip.plusnet.de
+outbound_proxy=sip:sbc.sip.plusnet.de\;lr
+direct_media=no
+rewrite_contact=yes
+rtp_symmetric=yes
+force_rport=yes

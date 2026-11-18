@@ -346,6 +346,7 @@ exten => s,1,NoOp(kfx_sendfax_hangup | jobid=${ARG1} chan=${CHANNEL(name)} FAXST
 ;   trotz identischer identify-Netze sicher anhand ihrer DID verteilt werden.
 ; =============================================================================
 [kfx-provider-in]
+exten => _+X.,1,Goto(kfx-provider-in,${EXTEN:1},1)
 exten => __KFX_FAX_DID__,1,Goto(fax-in,__KFX_FAX_DID__,1)
 __KFX_PHONE_ROUTE__
 

@@ -589,6 +589,8 @@ normalize_provider(){
     5|1und1-tls|1und1tls|und1tls|ionostls|11-tls|11tls) echo "1und1-tls";;
     2|telekom|deutschetelekom|tkom|t-online|tonline) echo "telekom";;
     3|sipgate) echo "sipgate";;
+    6|voip2gsm) echo "voip2gsm";;
+    7|fonial|plusnet) echo "fonial";;
     4|manual|manuell|manuellkonfiguration) echo "manual";;
     *) echo "";;
   esac
@@ -600,6 +602,8 @@ provider_label(){
     1und1-tls) echo "1&1 Deutschland (TLS)";;
     telekom) echo "Deutsche Telekom";;
     sipgate) echo "sipgate";;
+    voip2gsm) echo "VOIP2GSM";;
+    fonial) echo "Fonial / Plusnet";;
     manual) echo "Manuelle Konfiguration";;
     *) echo "${1:-unbekannt}";;
   esac
@@ -621,6 +625,12 @@ provider_defaults(){
       domain="sipgate.de"
       expiration="600"
       ;;
+    voip2gsm)
+      domain="b.vsip.eu"
+      ;;
+    fonial)
+      domain="sip.plusnet.de"
+      ;;
     manual)
       ;;
   esac
@@ -635,7 +645,7 @@ collect_phone_provider_config(){
   local provider_in="" provider="" label=""
   local user="" number_raw="" number="" password=""
   local domain_default="" identify_default="" expiration_default=""
-  local domain="" outbound_proxy="" identify_match="" expiration=""
+  local domain="" outbound_proxy="" identify_match="" expiration="" proxy_default=""
 
   echo
   echo "Provider-Auswahl fuer ${description}:"
@@ -644,11 +654,13 @@ collect_phone_provider_config(){
   echo "  3 = sipgate (Template; Felder bitte pruefen)"
   echo "  4 = manuell (Provider-Trunk wird nicht automatisch geschrieben)"
   echo "  5 = 1&1 Deutschland ueber TLS 1.2 und SDES-SRTP"
+  echo "  6 = VOIP2GSM (Registrar aus dem Kundencenter)"
+  echo "  7 = Fonial / Plusnet"
   while true; do
     ask_default provider_in "Provider fuer ${description}" "1und1"
     provider="$(normalize_provider "$provider_in")"
     [[ -n "$provider" ]] && break
-    echo "Bitte 1und1, 1und1-tls, telekom, sipgate oder manuell eingeben."
+    echo "Bitte 1und1, 1und1-tls, telekom, sipgate, voip2gsm, fonial oder manuell eingeben."
   done
   label="$(provider_label "$provider")"
 
@@ -673,8 +685,10 @@ collect_phone_provider_config(){
   if [[ "$provider" != "manual" ]]; then
     ask_default domain "SIP Registrar/Domain fuer ${description} (${label})" "$domain_default"
     [[ -n "$domain" ]] || die "SIP Registrar/Domain darf nicht leer sein."
-    ask_default outbound_proxy "SIP Outbound Proxy fuer ${description} (Enter = keiner)" ""
-    ask_default identify_match "PJSIP identify match fuer ${description} (IP/Netz; Enter = keiner)" "$identify_default"
+    [[ "$provider" != "fonial" ]] || proxy_default="sbc.sip.plusnet.de"
+    [[ "$provider" != "voip2gsm" ]] || identify_default="$domain"
+    ask_default outbound_proxy "SIP Outbound Proxy fuer ${description}" "$proxy_default"
+    ask_default identify_match "PJSIP identify match fuer ${description} (Host/IP/Netz)" "$identify_default"
     ask_default expiration "SIP Registration Expiration Sekunden fuer ${description}" "$expiration_default"
     [[ "$expiration" =~ ^[0-9]+$ ]] || die "SIP Registration Expiration ungueltig."
   else
@@ -1220,6 +1234,8 @@ echo "  2 = Deutsche Telekom (Template; Felder bitte pruefen)"
 echo "  3 = sipgate (Template; Felder bitte pruefen)"
 echo "  4 = manuell (pjsip.conf wird nicht automatisch geschrieben)"
 echo "  5 = 1&1 Deutschland ueber TLS 1.2 und SDES-SRTP"
+echo "  6 = VOIP2GSM (Registrar aus dem Kundencenter)"
+echo "  7 = Fonial / Plusnet"
 while true; do
   ask_default PROVIDER_IN "Provider" "1und1"
   KFX_PROVIDER="$(normalize_provider "$PROVIDER_IN")"
@@ -1275,6 +1291,9 @@ case "$KFX_PROVIDER" in
     PROVIDER_IDENTIFY_DEFAULT=""
     PROVIDER_EXPIRATION_DEFAULT="600"
     ;;
+  voip2gsm|fonial)
+    provider_defaults "$KFX_PROVIDER" PROVIDER_DOMAIN_DEFAULT PROVIDER_IDENTIFY_DEFAULT PROVIDER_EXPIRATION_DEFAULT
+    ;;
   manual)
     PROVIDER_DOMAIN_DEFAULT=""
     PROVIDER_IDENTIFY_DEFAULT=""
@@ -1285,8 +1304,11 @@ esac
 if [[ "$KFX_PROVIDER" != "manual" ]]; then
   ask_default KFX_SIP_DOMAIN "SIP Registrar/Domain fuer ${KFX_PROVIDER_LABEL}" "$PROVIDER_DOMAIN_DEFAULT"
   [[ -n "$KFX_SIP_DOMAIN" ]] || die "SIP Registrar/Domain darf nicht leer sein."
-  ask_default KFX_SIP_OUTBOUND_PROXY "SIP Outbound Proxy (Enter = keiner)" ""
-  ask_default KFX_SIP_IDENTIFY_MATCH "PJSIP identify match (IP/Netz; Enter = keiner)" "$PROVIDER_IDENTIFY_DEFAULT"
+  PROVIDER_PROXY_DEFAULT=""
+  [[ "$KFX_PROVIDER" != "fonial" ]] || PROVIDER_PROXY_DEFAULT="sbc.sip.plusnet.de"
+  [[ "$KFX_PROVIDER" != "voip2gsm" ]] || PROVIDER_IDENTIFY_DEFAULT="$KFX_SIP_DOMAIN"
+  ask_default KFX_SIP_OUTBOUND_PROXY "SIP Outbound Proxy" "$PROVIDER_PROXY_DEFAULT"
+  ask_default KFX_SIP_IDENTIFY_MATCH "PJSIP identify match (Host/IP/Netz)" "$PROVIDER_IDENTIFY_DEFAULT"
   ask_default KFX_SIP_EXPIRATION "SIP Registration Expiration Sekunden" "$PROVIDER_EXPIRATION_DEFAULT"
   [[ "$KFX_SIP_EXPIRATION" =~ ^[0-9]+$ ]] || die "SIP Registration Expiration ungueltig."
 else

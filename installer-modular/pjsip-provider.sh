@@ -194,6 +194,14 @@ case "$KFX_PROVIDER" in
   sipgate)
     PROVIDER_DOMAIN="${PROVIDER_DOMAIN:-sipgate.de}"
     ;;
+  voip2gsm)
+    PROVIDER_DOMAIN="${PROVIDER_DOMAIN:-b.vsip.eu}"
+    PJSIP_IDENTIFY_MATCH="${PJSIP_IDENTIFY_MATCH:-$PROVIDER_DOMAIN}"
+    ;;
+  fonial)
+    PROVIDER_DOMAIN="${PROVIDER_DOMAIN:-sip.plusnet.de}"
+    PJSIP_OUTBOUND_PROXY="${PJSIP_OUTBOUND_PROXY:-sbc.sip.plusnet.de}"
+    ;;
 esac
 
 PJSIP_SERVER_URI="${PJSIP_SERVER_URI:-sip:${PROVIDER_DOMAIN}}"
@@ -204,6 +212,12 @@ AUTH_NAME="${KFX_PJSIP_AUTH:-kfx-provider-auth}"
 AOR_NAME="${KFX_PJSIP_AOR:-kfx-provider-aor}"
 ENDPOINT_NAME="${KFX_PJSIP_ENDPOINT:-kfx-provider-endpoint}"
 IDENTIFY_NAME="${KFX_PJSIP_IDENTIFY:-kfx-provider-identify}"
+CONTACT_USER="$PJSIP_USER"
+LINE_CONFIG=""
+if [[ "$KFX_PROVIDER" == "voip2gsm" || "$KFX_PROVIDER" == "fonial" ]]; then
+  CONTACT_USER="${KFX_FAX_DID:-${KFX_SIP_NUMBER:-$PJSIP_USER}}"
+  LINE_CONFIG="$(printf 'line=yes\nendpoint=%s' "$ENDPOINT_NAME")"
+fi
 
 PJSIP_CLIENT_URI="${PJSIP_CLIENT_URI:-${KFX_PJSIP_CLIENT_URI:-}}"
 if [ -z "$PJSIP_CLIENT_URI" ]; then
@@ -394,7 +408,8 @@ transport=${PROVIDER_TRANSPORT}
 outbound_auth=${AUTH_NAME}
 server_uri=${PJSIP_SERVER_URI}
 client_uri=${PJSIP_CLIENT_URI}
-contact_user=${PJSIP_USER}
+contact_user=${CONTACT_USER}
+${LINE_CONFIG}
 retry_interval=60
 forbidden_retry_interval=600
 expiration=${PJSIP_EXPIRATION}
@@ -409,6 +424,7 @@ password=${PJSIP_PASS_CFG}
 [${AOR_NAME}]
 type=aor
 contact=${PJSIP_AOR_CONTACT}
+${OUTBOUND_PROXY_LINE}
 
 [${ENDPOINT_NAME}]
 type=endpoint

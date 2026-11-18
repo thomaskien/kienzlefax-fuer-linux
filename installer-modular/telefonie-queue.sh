@@ -287,7 +287,13 @@ append_provider(){
     || die "Providerdaten fuer Telefonie-${role} sind unvollstaendig."
   [[ "$expiration" =~ ^[0-9]+$ ]] || die "Ungueltige Registration Expiration fuer Telefonie-${role}."
 
-  local password_cfg proxy_line=""
+  local password_cfg proxy_line="" line_config="" contact_user="$user" codecs="g722,alaw,ulaw"
+  if [[ "$provider" == "voip2gsm" || "$provider" == "fonial" ]]; then
+    line_config="$(printf 'line=yes\nendpoint=%s' "$endpoint")"
+    contact_user="$(env_value "${prefix}_SIP_NUMBER")"
+    codecs="alaw,ulaw"
+    [[ "$provider" != "fonial" ]] || proxy="${proxy:-sbc.sip.plusnet.de}"
+  fi
   password_cfg="$(ast_cfg_value "$password")"
   if [[ -n "$proxy" ]]; then
     if [[ "$proxy" == sip:* ]]; then
@@ -305,7 +311,8 @@ transport=${provider_transport}
 outbound_auth=${object_prefix}-auth
 server_uri=${server_uri}
 client_uri=sip:${user}@${domain}
-contact_user=${user}
+contact_user=${contact_user}
+${line_config}
 retry_interval=60
 forbidden_retry_interval=600
 expiration=${expiration}
@@ -320,13 +327,14 @@ password=${password_cfg}
 [${object_prefix}-aor]
 type=aor
 contact=${aor_contact}
+${proxy_line}
 
 [${endpoint}]
 type=endpoint
 transport=${provider_transport}
 context=${endpoint_context}
 disallow=all
-allow=g722,alaw,ulaw
+allow=${codecs}
 ${endpoint_media_security}
 outbound_auth=${object_prefix}-auth
 aors=${object_prefix}-aor
