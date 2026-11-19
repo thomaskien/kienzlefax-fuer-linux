@@ -37,6 +37,30 @@ erhalten; neue Passwörter werden nur nach expliziter Rückfrage erzeugt.
 Für 1&1 stehen getrennte UDP- und TLS-Templates zur Verfügung. Bei aktivierter Telefoniewarteschlange
 kann außerdem ein separater WireGuard-Telefonie-Installer für die Ausführung im Anschluss gewählt werden.
 
+### Fonial/Plusnet und voip2gsm
+
+Die Auswahl gilt je Leitung für Fax, eingehende Telefonie und eine separate
+Telefonie-Ausgangsleitung. Bei einer Neukonfiguration bietet der Installer die
+gespeicherten Werte desselben Providers wieder an. Enter übernimmt sie, bei Proxy
+und Identify löscht `-` die Vorgabe. Beim ersten regulären Update auf diese Vorlagen
+`extensions.sh`, `pjsip-provider.sh` und `telefonie-queue.sh` aktualisieren.
+
+- **Fonial/Plusnet (7)** verwendet `sip.plusnet.de` und den Proxy
+  `sbc.sip.plusnet.de`. Auth-ID, vollständige Client-URI und From-User können
+  voneinander abweichen. Registrierung, AOR und Endpunkt enthalten jeweils
+  `outbound_proxy=sip:sbc.sip.plusnet.de\;lr`. Für die gemeinsame DID-Verteilung
+  setzt der Installer die Zielnummer der Leitung als `contact_user`.
+  [Vereinbarte Fonial-Vorlage](docs/provider/pjsip-fonial.conf.example)
+- **voip2gsm (6)** verwendet den im Kundencenter zugewiesenen Registrar, Vorgabe
+  `b.vsip.eu`. Fax- und Telefoniekonto erhalten eigene Endpunkte. Eingehend
+  führen `+49…` und `49…` auf dieselbe konfigurierte DID. Ausgehend wird ein
+  deutsches Ziel über diesen Provider als `0…` gewählt. Bei
+  `404 Invalid phone number` die tatsächlich gewählte Zielnummer und den
+  verwendeten Endpunkt im SIP-Protokoll prüfen. Kienzlefon 2.6.0 liest
+  `KFX_PHONE_IN_PROVIDER` und `KFX_PHONE_OUT_PROVIDER` aus der Installer-ENV
+  und übernimmt für `voip2gsm` das Zielformat `national` als Vorgabe.
+  [voip2gsm-Vorlage](docs/provider/pjsip-voip2gsm.conf.example)
+
 ### Lokales Paket für den Kombi-Installer
 
 Im Kienzlefax-Arbeitsverzeichnis auf macOS oder Linux packen.

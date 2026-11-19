@@ -214,6 +214,8 @@
 # Unveröffentlicht:
 # - --kombi installiert Fax und Praxisqueue aus einem vollständigen lokalen Paket.
 #   Modulcache und GitHub-Updates werden dabei übersprungen.
+# - Fonial/Plusnet und voip2gsm fuer Fax und Telefonie. Vorhandene SIP-Daten
+#   bleiben bei erneuter Auswahl desselben Providers als Vorgaben erhalten.
 # ==============================================================================
 
 set -euo pipefail
@@ -616,6 +618,8 @@ normalize_provider(){
     5|1und1-tls|1und1tls|und1tls|ionostls|11-tls|11tls) echo "1und1-tls";;
     2|telekom|deutschetelekom|tkom|t-online|tonline) echo "telekom";;
     3|sipgate) echo "sipgate";;
+    6|voip2gsm) echo "voip2gsm";;
+    7|fonial|plusnet|fonialplusnet) echo "fonial";;
     4|manual|manuell|manuellkonfiguration) echo "manual";;
     *) echo "";;
   esac
@@ -627,6 +631,8 @@ provider_label(){
     1und1-tls) echo "1&1 Deutschland (TLS)";;
     telekom) echo "Deutsche Telekom";;
     sipgate) echo "sipgate";;
+    voip2gsm) echo "VOIP2GSM";;
+    fonial) echo "Fonial / Plusnet";;
     manual) echo "Manuelle Konfiguration";;
     *) echo "${1:-unbekannt}";;
   esac
@@ -648,6 +654,12 @@ provider_defaults(){
       domain="sipgate.de"
       expiration="600"
       ;;
+    voip2gsm)
+      domain="b.vsip.eu"
+      ;;
+    fonial)
+      domain="sip.plusnet.de"
+      ;;
     manual)
       ;;
   esac
@@ -656,14 +668,40 @@ provider_defaults(){
   printf -v "$expiration_var" '%s' "$expiration"
 }
 
-collect_phone_provider_config(){
-  # usage: collect_phone_provider_config PREFIX "Beschreibung"
-  local prefix="$1" description="$2"
-  local provider_in="" provider="" label=""
-  local user="" number_raw="" number="" password=""
-  local domain_default="" identify_default="" expiration_default=""
-  local domain="" outbound_proxy="" identify_match="" expiration=""
+# Ein gesetzter leerer Wert (z.B. kein Proxy/Identify) ist eine gueltige Vorgabe.
+provider_value(){
+  local prefix="$1" name="${1}_${2}"
+  if [[ -n "$prefix" ]]; then
+    printf '%s' "${!name-$3}"
+  else
+    printf '%s' "$3"
+  fi
+}
 
+ask_optional(){
+  ask_default "$1" "$2 (- = leer)" "$3"
+  [[ "${!1}" != "-" ]] || printf -v "$1" '%s' ""
+}
+
+read_provider_password(){
+  local name="$1" description="$2" change="y"
+  if [[ -n "${!name}" ]]; then
+    ask_yes_no change "Gespeichertes SIP-Passwort fuer ${description} aendern?" "n"
+  fi
+  if [[ "$change" == "y" ]]; then
+    read_secret_twice "$name" "SIP Passwort fuer ${description}"
+  fi
+}
+
+collect_provider_config(){
+  local prefix="$1" description="$2" saved_prefix="$3"
+  local provider_in="" provider="" previous label=""
+  local user="" number_raw="" number="" password=""
+  local domain_default="" identify_default="" expiration_default="" proxy_default=""
+  local domain="" outbound_proxy="" identify_match="" expiration="" client_uri="" from_user=""
+
+  previous="$(provider_value "$saved_prefix" PROVIDER "")"
+  previous="$(normalize_provider "$previous")"
   echo
   echo "Provider-Auswahl fuer ${description}:"
   echo "  1 = 1&1 Deutschland (bisher getesteter Standard)"
@@ -671,38 +709,51 @@ collect_phone_provider_config(){
   echo "  3 = sipgate (Template; Felder bitte pruefen)"
   echo "  4 = manuell (Provider-Trunk wird nicht automatisch geschrieben)"
   echo "  5 = 1&1 Deutschland ueber TLS 1.2 und SDES-SRTP"
+  echo "  6 = VOIP2GSM (Registrar aus dem Kundencenter)"
+  echo "  7 = Fonial / Plusnet"
   while true; do
-    ask_default provider_in "Provider fuer ${description}" "1und1"
+    ask_default provider_in "Provider fuer ${description}" "${previous:-1und1}"
     provider="$(normalize_provider "$provider_in")"
     [[ -n "$provider" ]] && break
-    echo "Bitte 1und1, 1und1-tls, telekom, sipgate oder manuell eingeben."
+    echo "Bitte 1und1, 1und1-tls, telekom, sipgate, voip2gsm, fonial oder manuell eingeben."
   done
   label="$(provider_label "$provider")"
 
+  # Eine deaktivierte Leitung enthaelt leere ENV-Felder. Beim Aktivieren
+  # gelten die Providerdefaults. Aeltere Konten ohne Kennung koennen Daten haben.
+  if [[ -n "$previous" && "$provider" != "$previous" ]] ||
+     [[ -z "$previous" && -z "$(provider_value "$saved_prefix" SIP_USER "")" ]]; then
+    saved_prefix=""
+  fi
+  if [[ "$prefix" == KFX ]]; then
+    echo "DynDNS / Public FQDN ist optional, zur optimalen Stabilitaet aber unbedingt empfohlen."
+    ask_optional PUBLIC_FQDN "DynDNS / Public FQDN" "${KFX_PUBLIC_FQDN:-}"
+  fi
   while true; do
-    ask_default user "SIP Benutzername/Auth-ID fuer ${description}" ""
+    ask_default user "SIP Benutzername/Auth-ID fuer ${description}" "$(provider_value "$saved_prefix" SIP_USER "")"
     [[ -n "$user" ]] && break
     echo "SIP Benutzername/Auth-ID darf nicht leer sein."
   done
 
   while true; do
-    read -r -p "SIP Rufnummer / CallerID fuer ${description} (nur Ziffern; Enter = Benutzername falls nur Ziffern): " number_raw
-    [[ -n "$number_raw" ]] || number_raw="$user"
+    ask_default number_raw "SIP Rufnummer / CallerID fuer ${description}" "$(provider_value "$saved_prefix" SIP_NUMBER "$user")"
     number="$(sanitize_digits "$number_raw")"
     [[ -n "$number" ]] && break
     echo "Bitte eine Rufnummer/CallerID mit Ziffern eingeben."
   done
 
-  echo "SIP Passwort fuer ${description} eingeben (sichtbar aus = nein)."
-  read_secret_twice password "SIP Passwort"
+  password="$(provider_value "$saved_prefix" SIP_PASSWORD "")"
+  read_provider_password password "$description"
 
   provider_defaults "$provider" domain_default identify_default expiration_default
   if [[ "$provider" != "manual" ]]; then
-    ask_default domain "SIP Registrar/Domain fuer ${description} (${label})" "$domain_default"
+    ask_default domain "SIP Registrar/Domain fuer ${description} (${label})" "$(provider_value "$saved_prefix" SIP_DOMAIN "$domain_default")"
     [[ -n "$domain" ]] || die "SIP Registrar/Domain darf nicht leer sein."
-    ask_default outbound_proxy "SIP Outbound Proxy fuer ${description} (Enter = keiner)" ""
-    ask_default identify_match "PJSIP identify match fuer ${description} (IP/Netz; Enter = keiner)" "$identify_default"
-    ask_default expiration "SIP Registration Expiration Sekunden fuer ${description}" "$expiration_default"
+    [[ "$provider" != "fonial" ]] || proxy_default="sbc.sip.plusnet.de"
+    [[ "$provider" != "voip2gsm" ]] || identify_default="$domain"
+    ask_optional outbound_proxy "SIP Outbound Proxy fuer ${description}" "$(provider_value "$saved_prefix" SIP_OUTBOUND_PROXY "$proxy_default")"
+    ask_optional identify_match "PJSIP identify match fuer ${description} (Host/IP/Netz)" "$(provider_value "$saved_prefix" SIP_IDENTIFY_MATCH "$identify_default")"
+    ask_default expiration "SIP Registration Expiration Sekunden fuer ${description}" "$(provider_value "$saved_prefix" SIP_EXPIRATION "$expiration_default")"
     [[ "$expiration" =~ ^[0-9]+$ ]] || die "SIP Registration Expiration ungueltig."
   else
     domain=""
@@ -711,6 +762,14 @@ collect_phone_provider_config(){
     expiration="$expiration_default"
   fi
 
+  client_uri="$(provider_value "$saved_prefix" PJSIP_CLIENT_URI "")"
+  from_user="$(provider_value "$saved_prefix" PJSIP_FROM_USER "")"
+  if [[ "$provider" == "fonial" ]]; then
+    ask_optional client_uri "Client-URI fuer ${description} (leer = sip:${user}@${domain})" "$client_uri"
+    ask_optional from_user "From-User fuer ${description} (leer = ${user})" "$from_user"
+  fi
+  printf -v "${prefix}_PJSIP_CLIENT_URI" '%s' "$client_uri"
+  printf -v "${prefix}_PJSIP_FROM_USER" '%s' "$from_user"
   printf -v "${prefix}_PROVIDER" '%s' "$provider"
   printf -v "${prefix}_PROVIDER_LABEL" '%s' "$label"
   printf -v "${prefix}_SIP_USER" '%s' "$user"
@@ -725,7 +784,7 @@ collect_phone_provider_config(){
 copy_phone_provider_config(){
   # usage: copy_phone_provider_config SOURCE_PREFIX TARGET_PREFIX
   local source_prefix="$1" target_prefix="$2" suffix="" source_var=""
-  for suffix in PROVIDER PROVIDER_LABEL SIP_USER SIP_NUMBER SIP_PASSWORD SIP_DOMAIN SIP_OUTBOUND_PROXY SIP_IDENTIFY_MATCH SIP_EXPIRATION; do
+  for suffix in PROVIDER PROVIDER_LABEL SIP_USER SIP_NUMBER SIP_PASSWORD SIP_DOMAIN SIP_OUTBOUND_PROXY SIP_IDENTIFY_MATCH SIP_EXPIRATION PJSIP_CLIENT_URI PJSIP_FROM_USER; do
     source_var="${source_prefix}_${suffix}"
     printf -v "${target_prefix}_${suffix}" '%s' "${!source_var-}"
   done
@@ -781,7 +840,7 @@ PY
 collect_phone_options(){
   PHONE_QUEUE_ENABLED="n"
   PHONE_COUNT="0"
-  PHONE_FIRST_EXTENSION="201"
+  PHONE_FIRST_EXTENSION="${KFX_PHONE_FIRST_EXTENSION:-201}"
   PHONE_INTERNAL_PORT="${DEFAULT_PHONE_INTERNAL_PORT:-5060}"
   PHONE_BIND_IFACE=""
   PHONE_BIND_IP=""
@@ -800,7 +859,7 @@ collect_phone_options(){
   SIPGATE_OVERFLOW_SIP_PASSWORD=""
   SIPGATE_OVERFLOW_DID=""
   SIPGATE_OVERFLOW_DOMAIN="sipconnect.sipgate.de"
-  SIPGATE_OVERFLOW_IDENTIFY_MATCH="217.10.68.150"
+  SIPGATE_OVERFLOW_IDENTIFY_MATCH="${KFX_SIPGATE_OVERFLOW_IDENTIFY_MATCH-217.10.68.150}"
 
   if [[ "${KFX_QUEUE_ONLY:-${QUEUE_ONLY:-n}}" == "y" ]]; then
     PHONE_QUEUE_ENABLED="y"
@@ -810,7 +869,7 @@ collect_phone_options(){
     PHONE_QUEUE_ENABLED="y"
     echo "[INFO] Kombi-Installation: Die Praxisqueue wird für Kienzlefon eingerichtet."
   else
-    ask_yes_no PHONE_QUEUE_ENABLED "Warteschlange fuer Telefonie erstellen?" "n"
+    ask_yes_no PHONE_QUEUE_ENABLED "Warteschlange fuer Telefonie erstellen?" "${KFX_PHONE_QUEUE_ENABLED:-n}"
   fi
 
   echo
@@ -823,18 +882,22 @@ collect_phone_options(){
     echo "Empfohlene und erprobte Defaults fuer 1&1: insgesamt 4, Telefonie 3, Fax 3, Wartende 5."
     echo "Telefonie- und Faxgrenze sind Teilgrenzen; zusaetzlich gilt immer die Gesamtgrenze."
   fi
-  ask_int_range PROVIDER_CHANNEL_LIMIT "Maximale gleichzeitige Kanaele der Haupt-SIP-Leitung" "4" "1" "100"
-  ask_int_range PROVIDER_PHONE_LIMIT "Davon maximal fuer Telefonie" "3" "1" "$PROVIDER_CHANNEL_LIMIT"
+  ask_int_range PROVIDER_CHANNEL_LIMIT "Maximale gleichzeitige Kanaele der Haupt-SIP-Leitung" "${KFX_PROVIDER_CHANNEL_LIMIT:-4}" "1" "100"
+  ask_int_range PROVIDER_PHONE_LIMIT "Davon maximal fuer Telefonie" "${KFX_PROVIDER_PHONE_LIMIT:-3}" "1" "$PROVIDER_CHANNEL_LIMIT"
   if [[ "${KFX_QUEUE_ONLY:-${QUEUE_ONLY:-n}}" != "y" ]]; then
-    ask_int_range PROVIDER_FAX_LIMIT "Davon maximal fuer Fax (eingehend und ausgehend)" "3" "1" "$PROVIDER_CHANNEL_LIMIT"
+    local fax_limit="${KFX_PROVIDER_FAX_LIMIT:-3}"
+    [[ "$fax_limit" != 0 ]] || fax_limit=3
+    ask_int_range PROVIDER_FAX_LIMIT "Davon maximal fuer Fax (eingehend und ausgehend)" "$fax_limit" "1" "$PROVIDER_CHANNEL_LIMIT"
   fi
-  ask_int_range QUEUE_MAX_WAITING "Maximale Zahl wartender Anrufer in der Warteschlange" "5" "1" "100"
+  ask_int_range QUEUE_MAX_WAITING "Maximale Zahl wartender Anrufer in der Warteschlange" "${KFX_QUEUE_MAX_WAITING:-5}" "1" "100"
 
   if [[ "$PHONE_QUEUE_ENABLED" != "y" ]]; then
     copy_phone_provider_config EMPTY PHONE_IN
     copy_phone_provider_config EMPTY PHONE_OUT
   else
-    ask_int_range PHONE_COUNT "Zahl der Telefone in der Warteschlange" "2" "1" "100"
+    local count_default="${KFX_PHONE_COUNT:-2}"
+    [[ "$count_default" != 0 ]] || count_default=2
+    ask_int_range PHONE_COUNT "Zahl der Telefone in der Warteschlange" "$count_default" "1" "100"
 
     local detected="" detected_iface="" detected_ip="" detected_cidr=""
     detected="$(detect_default_ipv4_network || true)"
@@ -870,16 +933,16 @@ collect_phone_options(){
       PHONE_ALLOWED_CIDR="$PHONE_LOCAL_CIDR"
     fi
 
-    collect_phone_provider_config PHONE_IN "die eingehende Telefonieleitung"
+    collect_provider_config PHONE_IN "die eingehende Telefonieleitung" KFX_PHONE_IN
     local fax_did="${FAX_DID:-${KFX_FAX_DID:-}}"
     [[ -z "$fax_did" || "${PHONE_IN_SIP_NUMBER}" != "$fax_did" ]] \
       || die "Telefonie-DID und Fax-DID muessen verschieden sein, damit eingehende Anrufe eindeutig geroutet werden."
 
-    ask_yes_no PHONE_SEPARATE_OUTBOUND "Fuer ausgehende Telefonate eine andere SIP-Leitung verwenden?" "n"
+    ask_yes_no PHONE_SEPARATE_OUTBOUND "Fuer ausgehende Telefonate eine andere SIP-Leitung verwenden?" "${KFX_PHONE_SEPARATE_OUTBOUND:-n}"
     if [[ "$PHONE_SEPARATE_OUTBOUND" == "y" ]]; then
-      collect_phone_provider_config PHONE_OUT "die ausgehende Telefonieleitung"
+      collect_provider_config PHONE_OUT "die ausgehende Telefonieleitung" KFX_PHONE_OUT
       ask_yes_no PHONE_OUT_COUNTS_PROVIDER_LIMIT \
-        "Ausgehende Telefonate dieser Leitung zur Haupt-Kanalgrenze zaehlen? (empfohlen)" "y"
+        "Ausgehende Telefonate dieser Leitung zur Haupt-Kanalgrenze zaehlen? (empfohlen)" "${KFX_PHONE_OUT_COUNTS_PROVIDER_LIMIT:-y}"
     else
       copy_phone_provider_config PHONE_IN PHONE_OUT
       PHONE_OUT_COUNTS_PROVIDER_LIMIT="y"
@@ -888,19 +951,20 @@ collect_phone_options(){
     echo
     echo "EXPERIMENTELL: Optional kann sipgate trunking als zusaetzlicher Eingangsweg fuer Ueberlauf-Anrufe eingerichtet werden."
     echo "Diese Funktion muss vor einem produktiven Einsatz mit Registrierung, Audio und Busy-Verhalten getestet werden."
-    ask_yes_no SIPGATE_OVERFLOW_ENABLED "Experimentellen Sipgate-Ueberlauf ueber sipconnect.sipgate.de einrichten?" "n"
+    ask_yes_no SIPGATE_OVERFLOW_ENABLED "Experimentellen Sipgate-Ueberlauf ueber sipconnect.sipgate.de einrichten?" "${KFX_SIPGATE_OVERFLOW_ENABLED:-n}"
     if [[ "$SIPGATE_OVERFLOW_ENABLED" == "y" ]]; then
       echo "[WARN] Der Sipgate-Ueberlauf ist experimentell und noch nicht fuer jeden Anschluss validiert."
       while [[ ! "$SIPGATE_OVERFLOW_SIP_ID" =~ ^[A-Za-z0-9._-]+$ ]]; do
-        ask_default SIPGATE_OVERFLOW_SIP_ID "Sipgate trunking SIP-ID" ""
+        ask_default SIPGATE_OVERFLOW_SIP_ID "Sipgate trunking SIP-ID" "${KFX_SIPGATE_OVERFLOW_SIP_ID:-}"
         [[ "$SIPGATE_OVERFLOW_SIP_ID" =~ ^[A-Za-z0-9._-]+$ ]] || echo "Bitte nur Buchstaben, Ziffern, Punkt, Unterstrich oder Bindestrich verwenden."
       done
-      read_secret_twice SIPGATE_OVERFLOW_SIP_PASSWORD "Sipgate trunking SIP-Passwort"
+      SIPGATE_OVERFLOW_SIP_PASSWORD="${KFX_SIPGATE_OVERFLOW_SIP_PASSWORD:-}"
+      read_provider_password SIPGATE_OVERFLOW_SIP_PASSWORD "Sipgate trunking"
       while [[ -z "$SIPGATE_OVERFLOW_DID" ]]; do
-        ask_default SIPGATE_OVERFLOW_DID "Sipgate-Ueberlauf-DID im internationalen Format (nur Ziffern)" ""
+        ask_default SIPGATE_OVERFLOW_DID "Sipgate-Ueberlauf-DID im internationalen Format (nur Ziffern)" "${KFX_SIPGATE_OVERFLOW_DID:-}"
         SIPGATE_OVERFLOW_DID="$(sanitize_digits "$SIPGATE_OVERFLOW_DID")"
       done
-      ask_int_range SIPGATE_OVERFLOW_CHANNEL_LIMIT "Maximale gleichzeitige Sipgate-Ueberlaufkanaele" "2" "1" "100"
+      ask_int_range SIPGATE_OVERFLOW_CHANNEL_LIMIT "Maximale gleichzeitige Sipgate-Ueberlaufkanaele" "${KFX_SIPGATE_OVERFLOW_CHANNEL_LIMIT:-2}" "1" "100"
     fi
 
     local index ext password_var existing_password_var existing_password
@@ -1015,7 +1079,7 @@ PY
     printf 'KFX_SIPGATE_OVERFLOW_DOMAIN=%s\n' "$(quote_env_value "${SIPGATE_OVERFLOW_DOMAIN:-sipconnect.sipgate.de}")"
     printf 'KFX_SIPGATE_OVERFLOW_IDENTIFY_MATCH=%s\n' "$(quote_env_value "${SIPGATE_OVERFLOW_IDENTIFY_MATCH:-217.10.68.150}")"
     for prefix in PHONE_IN PHONE_OUT; do
-      for suffix in PROVIDER PROVIDER_LABEL SIP_USER SIP_NUMBER SIP_PASSWORD SIP_DOMAIN SIP_OUTBOUND_PROXY SIP_IDENTIFY_MATCH SIP_EXPIRATION; do
+      for suffix in PROVIDER PROVIDER_LABEL SIP_USER SIP_NUMBER SIP_PASSWORD SIP_DOMAIN SIP_OUTBOUND_PROXY SIP_IDENTIFY_MATCH SIP_EXPIRATION PJSIP_CLIENT_URI PJSIP_FROM_USER; do
         source_var="${prefix}_${suffix}"
         printf 'KFX_%s_%s=%s\n' "$prefix" "$suffix" "$(quote_env_value "${!source_var-}")"
       done
@@ -1077,6 +1141,12 @@ ask_file_refresh(){
 
 collect_run_options(){
   local cache_dir="/usr/local/lib/kienzlefax-installer/cache" phone_enabled=""
+  if [[ -z "$package_root" ]]; then
+    case "|${KFX_PROVIDER:-}|${PHONE_IN_PROVIDER:-${KFX_PHONE_IN_PROVIDER:-}}|${PHONE_OUT_PROVIDER:-${KFX_PHONE_OUT_PROVIDER:-}}|" in
+      *'|fonial|'*|*'|voip2gsm|'*)
+        echo "Fuer Fonial/voip2gsm bitte beim ersten Update die folgenden drei Provider- und Dialplanmodule aktualisieren." ;;
+    esac
+  fi
   ask_file_refresh REMOTE_REFRESH_EXTENSIONS "${cache_dir}/extensions.sh" "Remote-Datei extensions.sh holen/aktualisieren?"
   ask_file_refresh REMOTE_REFRESH_PJSIP_PROVIDER "${cache_dir}/pjsip-provider.sh" "Remote-Datei pjsip-provider.sh holen/aktualisieren?"
   ask_file_refresh REMOTE_REFRESH_TELEFONIE_QUEUE "${cache_dir}/telefonie-queue.sh" "Remote-Datei telefonie-queue.sh holen/aktualisieren?"
@@ -1236,7 +1306,7 @@ if [[ "$RESET_OPTS" == "n" ]]; then
   fi
 fi
 
-read -r -p "Hostname für diese Maschine (z.B. fax): " KFX_HOSTNAME
+ask_default KFX_HOSTNAME "Hostname für diese Maschine (z.B. fax)" "${KFX_HOSTNAME:-}"
 [[ -n "${KFX_HOSTNAME}" ]] || die "Hostname darf nicht leer sein."
 hostnamectl set-hostname "${KFX_HOSTNAME}"
 
@@ -1250,7 +1320,7 @@ fi
 if [[ -n "$package_root" ]]; then
   QUEUE_ONLY="n"
 else
-  ask_yes_no QUEUE_ONLY "Nur Telefoniewarteschlange installieren (ohne Fax, Faxdrucker, OCR, Web und Samba)?" "n"
+  ask_yes_no QUEUE_ONLY "Nur Telefoniewarteschlange installieren (ohne Fax, Faxdrucker, OCR, Web und Samba)?" "${KFX_QUEUE_ONLY:-n}"
 fi
 KFX_QUEUE_ONLY="$QUEUE_ONLY"
 if [[ "$QUEUE_ONLY" == "y" ]]; then
@@ -1259,101 +1329,37 @@ if [[ "$QUEUE_ONLY" == "y" ]]; then
 fi
 
 if [[ "$QUEUE_ONLY" != "y" ]]; then
-echo
-echo "Provider-Auswahl:"
-echo "  1 = 1&1 Deutschland (bisher getesteter Standard)"
-echo "  2 = Deutsche Telekom (Template; Felder bitte pruefen)"
-echo "  3 = sipgate (Template; Felder bitte pruefen)"
-echo "  4 = manuell (pjsip.conf wird nicht automatisch geschrieben)"
-echo "  5 = 1&1 Deutschland ueber TLS 1.2 und SDES-SRTP"
-while true; do
-  ask_default PROVIDER_IN "Provider" "1und1"
-  KFX_PROVIDER="$(normalize_provider "$PROVIDER_IN")"
-  if [[ -n "$KFX_PROVIDER" ]]; then
-    break
-  fi
-  echo "Bitte 1und1, 1und1-tls, telekom, sipgate oder manuell eingeben."
-done
-KFX_PROVIDER_LABEL="$(provider_label "$KFX_PROVIDER")"
-echo "[OK] Provider: ${KFX_PROVIDER_LABEL}"
-
-echo "DynDNS / Public FQDN ist optional, zur optimalen Stabilitaet aber unbedingt empfohlen."
-read -r -p "DynDNS / Public FQDN (Enter = leer lassen): " PUBLIC_FQDN
-
-echo
-echo "==== SIP Zugangsdaten ===="
-while true; do
-  ask_default SIP_USER "SIP Benutzername/Auth-ID" ""
-  [[ -n "$SIP_USER" ]] && break
-  echo "SIP Benutzername/Auth-ID darf nicht leer sein."
-done
-
-while true; do
-  read -r -p "SIP Rufnummer / CallerID (nur Ziffern; Enter = SIP Benutzername falls nur Ziffern): " SIP_NUMBER_RAW
-  if [[ -z "$SIP_NUMBER_RAW" ]]; then
-    SIP_NUMBER_RAW="$SIP_USER"
-  fi
-  SIP_NUMBER="$(sanitize_digits "${SIP_NUMBER_RAW}")"
-  if [[ -n "$SIP_NUMBER" ]]; then
-    break
-  fi
-  echo "Bitte eine Rufnummer/CallerID mit Ziffern eingeben."
-done
-unset SIP_NUMBER_RAW
-
-echo
-echo "==== SIP Passwort eingeben (sichtbar aus = nein) ===="
-read_secret_twice SIP_PASSWORD "SIP Passwort"
-
-case "$KFX_PROVIDER" in
-  1und1|1und1-tls)
-    PROVIDER_DOMAIN_DEFAULT="sip.1und1.de"
-    PROVIDER_IDENTIFY_DEFAULT="212.227.0.0/16"
-    PROVIDER_EXPIRATION_DEFAULT="300"
-    ;;
-  telekom)
-    PROVIDER_DOMAIN_DEFAULT="tel.t-online.de"
-    PROVIDER_IDENTIFY_DEFAULT=""
-    PROVIDER_EXPIRATION_DEFAULT="300"
-    ;;
-  sipgate)
-    PROVIDER_DOMAIN_DEFAULT="sipgate.de"
-    PROVIDER_IDENTIFY_DEFAULT=""
-    PROVIDER_EXPIRATION_DEFAULT="600"
-    ;;
-  manual)
-    PROVIDER_DOMAIN_DEFAULT=""
-    PROVIDER_IDENTIFY_DEFAULT=""
-    PROVIDER_EXPIRATION_DEFAULT="300"
-    ;;
-esac
-
-if [[ "$KFX_PROVIDER" != "manual" ]]; then
-  ask_default KFX_SIP_DOMAIN "SIP Registrar/Domain fuer ${KFX_PROVIDER_LABEL}" "$PROVIDER_DOMAIN_DEFAULT"
-  [[ -n "$KFX_SIP_DOMAIN" ]] || die "SIP Registrar/Domain darf nicht leer sein."
-  ask_default KFX_SIP_OUTBOUND_PROXY "SIP Outbound Proxy (Enter = keiner)" ""
-  ask_default KFX_SIP_IDENTIFY_MATCH "PJSIP identify match (IP/Netz; Enter = keiner)" "$PROVIDER_IDENTIFY_DEFAULT"
-  ask_default KFX_SIP_EXPIRATION "SIP Registration Expiration Sekunden" "$PROVIDER_EXPIRATION_DEFAULT"
-  [[ "$KFX_SIP_EXPIRATION" =~ ^[0-9]+$ ]] || die "SIP Registration Expiration ungueltig."
-else
-  KFX_SIP_DOMAIN=""
-  KFX_SIP_OUTBOUND_PROXY=""
-  KFX_SIP_IDENTIFY_MATCH=""
-  KFX_SIP_EXPIRATION="$PROVIDER_EXPIRATION_DEFAULT"
-fi
+# Bisher wirksame Legacy-Werte beim Neuschreiben in die KFX-Felder uebernehmen.
+KFX_SIP_USER="${PJSIP_USER:-${KFX_SIP_USER:-${KFX_SIP_NUMBER:-}}}"
+KFX_SIP_PASSWORD="${PJSIP_PASS:-${KFX_SIP_PASSWORD:-}}"
+KFX_PJSIP_CLIENT_URI="${PJSIP_CLIENT_URI:-${KFX_PJSIP_CLIENT_URI:-}}"
+[[ -z "${PJSIP_OUTBOUND_PROXY:-}" ]] || KFX_SIP_OUTBOUND_PROXY="$PJSIP_OUTBOUND_PROXY"
+[[ -z "${PJSIP_IDENTIFY_MATCH:-}" ]] || KFX_SIP_IDENTIFY_MATCH="$PJSIP_IDENTIFY_MATCH"
+[[ -z "${PJSIP_EXPIRATION:-}" ]] || KFX_SIP_EXPIRATION="$PJSIP_EXPIRATION"
+collect_provider_config KFX "die Faxleitung" KFX
+SIP_USER="$KFX_SIP_USER"
+SIP_NUMBER="$KFX_SIP_NUMBER"
+SIP_PASSWORD="$KFX_SIP_PASSWORD"
 
 echo
 echo "==== Admin-Passwort (Linux admin + Samba admin) ===="
-ask_yes_no ADMIN_PASSWORD_GENERATE "Sicheres Admin-Passwort automatisch generieren?" "y"
-if [[ "$ADMIN_PASSWORD_GENERATE" == "y" ]]; then
-  ADMIN_PASSWORD="$(generate_secure_password)"
-  echo "[OK] Admin-Passwort wurde generiert. Es steht im Installationsbericht und root-only in ${ENVFILE}."
-else
-  echo "Admin-Passwort manuell eingeben (sichtbar aus = nein)."
-  read_secret_twice ADMIN_PASSWORD "Admin-Passwort"
+ADMIN_PASSWORD="${KFX_ADMIN_PASSWORD:-}"
+CHANGE_ADMIN_PASSWORD="y"
+if [[ -n "$ADMIN_PASSWORD" ]]; then
+  ask_yes_no CHANGE_ADMIN_PASSWORD "Gespeichertes Admin-Passwort aendern?" "n"
+fi
+if [[ "$CHANGE_ADMIN_PASSWORD" == "y" ]]; then
+  ask_yes_no ADMIN_PASSWORD_GENERATE "Sicheres Admin-Passwort automatisch generieren?" "y"
+  if [[ "$ADMIN_PASSWORD_GENERATE" == "y" ]]; then
+    ADMIN_PASSWORD="$(generate_secure_password)"
+    echo "[OK] Admin-Passwort wurde generiert. Es steht im Installationsbericht und root-only in ${ENVFILE}."
+  else
+    echo "Admin-Passwort manuell eingeben (sichtbar aus = nein)."
+    read_secret_twice ADMIN_PASSWORD "Admin-Passwort"
+  fi
 fi
 
-read -r -p "FAX DID (Enter = ${SIP_NUMBER}): " FAX_DID_IN
+ask_default FAX_DID_IN "FAX DID" "${KFX_FAX_DID:-$SIP_NUMBER}"
 FAX_DID="$(sanitize_digits "${FAX_DID_IN:-$SIP_NUMBER}")"
 [[ -n "${FAX_DID}" ]] || die "FAX_DID darf nicht leer sein."
 unset FAX_DID_IN
@@ -1366,7 +1372,7 @@ else
   KFX_PROVIDER="none"
   KFX_PROVIDER_LABEL="Nicht verwendet (Queue-only)"
   echo "DynDNS / Public FQDN ist optional, zur optimalen Provider-Stabilitaet aber empfohlen."
-  read -r -p "DynDNS / Public FQDN (Enter = leer lassen): " PUBLIC_FQDN
+  ask_optional PUBLIC_FQDN "DynDNS / Public FQDN" "${KFX_PUBLIC_FQDN:-}"
   SIP_USER=""
   SIP_NUMBER=""
   SIP_PASSWORD=""
@@ -1374,6 +1380,8 @@ else
   KFX_SIP_OUTBOUND_PROXY=""
   KFX_SIP_IDENTIFY_MATCH=""
   KFX_SIP_EXPIRATION="300"
+  KFX_PJSIP_CLIENT_URI=""
+  KFX_PJSIP_FROM_USER=""
   ADMIN_PASSWORD=""
   FAX_DID=""
   KFX_PRACTICE_NAME=""
@@ -1381,11 +1389,11 @@ else
   PDF_INPUT_COUNT="0"
 fi
 
-ask_default SIP_BIND_PORT "SIP Bind Port (PJSIP extern; Provider-Config)" "${DEFAULT_SIP_BIND_PORT}"
+ask_default SIP_BIND_PORT "SIP Bind Port (PJSIP extern; Provider-Config)" "${KFX_SIP_BIND_PORT:-$DEFAULT_SIP_BIND_PORT}"
 [[ "$SIP_BIND_PORT" =~ ^[0-9]+$ ]] || die "SIP_BIND_PORT ungültig"
 
-ask_default RTP_START "RTP Start-Port" "${DEFAULT_RTP_START}"
-ask_default RTP_END   "RTP End-Port"   "${DEFAULT_RTP_END}"
+ask_default RTP_START "RTP Start-Port" "${KFX_RTP_START:-$DEFAULT_RTP_START}"
+ask_default RTP_END   "RTP End-Port"   "${KFX_RTP_END:-$DEFAULT_RTP_END}"
 [[ "$RTP_START" =~ ^[0-9]+$ ]] || die "RTP_START ungültig"
 [[ "$RTP_END" =~ ^[0-9]+$ ]] || die "RTP_END ungültig"
 [ "$RTP_START" -lt "$RTP_END" ] || die "RTP_START muss < RTP_END sein"
@@ -1419,17 +1427,19 @@ KFX_SIP_IDENTIFY_MATCH_ENV="$(quote_env_value "$KFX_SIP_IDENTIFY_MATCH")"
 SIP_PASSWORD_ENV="$(quote_env_value "$SIP_PASSWORD")"
 ADMIN_PASSWORD_ENV="$(quote_env_value "$ADMIN_PASSWORD")"
 KFX_PRACTICE_NAME_ENV="$(quote_env_value "$KFX_PRACTICE_NAME")"
-KFX_CALLERID_NAME_ENV="$(quote_env_value "Fax")"
+KFX_CALLERID_NAME_ENV="$(quote_env_value "${KFX_CALLERID_NAME:-Fax}")"
 REMOVE_USER_NAME_ENV="$(quote_env_value "$REMOVE_USER_NAME")"
 
 # AMI Secret NICHT interaktiv (lokal). Konfigurierbar via DEFAULT_AMI_SECRET oder später in ENVFILE.
-AMI_SECRET="${DEFAULT_AMI_SECRET}"
+AMI_SECRET="${KFX_AMI_SECRET:-$DEFAULT_AMI_SECRET}"
 AMI_SECRET_ENV="$(quote_env_value "$AMI_SECRET")"
 
 ask_default AST_REF "Asterisk Git-Ref (Branch/Tag/Commit) für Build" "${ASTERISK_GIT_REF_DEFAULT}"
 AST_REF_ENV="$(quote_env_value "$AST_REF")"
 
-cat >"$ENVFILE" <<EENV
+env_tmp="$(mktemp "${ENVFILE}.XXXXXX")"
+trap 'rm -f -- "$env_tmp"' EXIT
+cat >"$env_tmp" <<EENV
 # generated by kienzlefax installer
 KFX_QUEUE_ONLY=${QUEUE_ONLY}
 KFX_HOSTNAME=${KFX_HOSTNAME_ENV}
@@ -1441,7 +1451,9 @@ KFX_SIP_DOMAIN=${KFX_SIP_DOMAIN_ENV}
 KFX_SIP_OUTBOUND_PROXY=${KFX_SIP_OUTBOUND_PROXY_ENV}
 KFX_SIP_IDENTIFY_MATCH=${KFX_SIP_IDENTIFY_MATCH_ENV}
 KFX_SIP_EXPIRATION=${KFX_SIP_EXPIRATION}
-KFX_PJSIP_ENDPOINT=kfx-provider-endpoint
+KFX_PJSIP_CLIENT_URI=$(quote_env_value "${KFX_PJSIP_CLIENT_URI:-}")
+KFX_PJSIP_FROM_USER=$(quote_env_value "${KFX_PJSIP_FROM_USER:-}")
+KFX_PJSIP_ENDPOINT=$(quote_env_value "${KFX_PJSIP_ENDPOINT:-kfx-provider-endpoint}")
 KFX_SIP_NUMBER=${SIP_NUMBER}
 KFX_SIP_PASSWORD=${SIP_PASSWORD_ENV}
 KFX_ADMIN_PASSWORD=${ADMIN_PASSWORD_ENV}
@@ -1477,8 +1489,15 @@ KFX_CALLERID_NAME=${KFX_CALLERID_NAME_ENV}
 # PDF header used by /usr/local/bin/pdf_with_header.sh
 KFX_PRACTICE_NAME=${KFX_PRACTICE_NAME_ENV}
 EENV
-write_phone_options_to_env "$ENVFILE"
-chmod 0600 "$ENVFILE"
+for key in KFX_PJSIP_REGISTRATION KFX_PJSIP_AUTH KFX_PJSIP_AOR KFX_PJSIP_IDENTIFY KFX_CALLERID_NUM; do
+  if [[ -n "${!key-}" ]]; then
+    printf '%s=%s\n' "$key" "$(quote_env_value "${!key}")" >>"$env_tmp"
+  fi
+done
+write_phone_options_to_env "$env_tmp"
+bash -n "$env_tmp"
+mv -f -- "$env_tmp" "$ENVFILE"
+trap - EXIT
 
 log "[OK] Optionen neu gesetzt in ${ENVFILE}"
 EOF
@@ -3162,6 +3181,13 @@ if [[ -z "$package_root" ]]; then
     maybe_fetch_one "pdf_with_header.sh"  "$URL_PDF_WITH_HEADER"  "${MOD_CACHE}/pdf_with_header.sh"  "${KFX_REMOTE_REFRESH_PDF_WITH_HEADER:-n}"
     maybe_fetch_one "scan_ocr.sh"         "$URL_SCAN_OCR"         "${MOD_CACHE}/scan_ocr.sh"         "${KFX_REMOTE_REFRESH_SCAN_OCR:-n}"
   fi
+  case "|${KFX_PROVIDER:-}|${KFX_PHONE_IN_PROVIDER:-}|${KFX_PHONE_OUT_PROVIDER:-}|" in
+    *'|fonial|'*|*'|voip2gsm|'*)
+      for module in extensions.sh pjsip-provider.sh telefonie-queue.sh; do
+        grep -Fxq '# KFX_PROVIDER_PROFILES=fonial-voip2gsm-v1' "${MOD_CACHE}/$module" ||
+          die "Modulcache: $module unterstuetzt diesen Providerstand nicht. Installer erneut starten und diese Datei aktualisieren."
+      done ;;
+  esac
 elif [[ "${KFX_QUEUE_ONLY:-n}" != n || "${KFX_PHONE_QUEUE_ENABLED:-n}" != y ]]; then
   die "Die Kombi-Installation benötigt die Fax-Vollinstallation mit aktivierter Praxisqueue."
 fi

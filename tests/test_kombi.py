@@ -1,5 +1,6 @@
 """Paketabnahme ohne Root, Netzwerkzugriffe oder laufende Linux-Dienste."""
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -200,6 +201,170 @@ echo "$*" >>"$TEST_BLOCKED"; exit 90''')
         self.assertEqual((self.web / "kienzlefax.php").read_text(), "ALT\n")
         self.assertEqual((self.web / "faxton.mp3").read_text(), "Faxton-Testantwort\n")
 
+    def prepare_regular_provider_install(self):
+        self.pack()
+        self.prepare_host()
+        self.env["TEST_MODULES"] = str(self.package / MOD)
+        self.stub("curl", '''
+case "$*" in
+  *raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/*)
+    case "${2##*/}" in
+      pjsip-provider.sh|extensions.sh|telefonie-queue.sh) exec cp "$TEST_MODULES/${2##*/}" "$4" ;;
+    esac ;;
+  *faxton.mp3) echo "Testton" > "$3"; exit 0 ;;
+esac
+echo "$*" >> "$TEST_BLOCKED"; exit 90''')
+        for script in self.cache.glob("*.sh"):
+            if script.name in ("pjsip-provider.sh", "extensions.sh", "telefonie-queue.sh"):
+                script.unlink()
+            else:
+                script.write_text("exit 0\n")
+
+    def assert_trunk(self, filename, registration, endpoint, domain, user, number, *,
+                     proxy="", client="", from_user="", password, expiration="300", identify=""):
+        text = (self.host / "etc/asterisk" / filename).read_text()
+
+        def section(name):
+            blocks = re.findall(r"^\[" + re.escape(name) + r"\]\n((?:[^\[\n][^\n]*\n|\n)*)", text, re.M)
+            self.assertEqual(len(blocks), 1, name)
+            return dict(line.split("=", 1) for line in blocks[0].splitlines()
+                        if "=" in line and not line.startswith(";"))
+
+        reg = section(registration)
+        ep = section(endpoint)
+        auth = section(reg["outbound_auth"])
+        aor = section(ep["aors"])
+        self.assertEqual([reg["type"], auth["type"], aor["type"], ep["type"]],
+                         ["registration", "auth", "aor", "endpoint"])
+        self.assertEqual(reg["endpoint"], endpoint)
+        self.assertEqual(reg["line"], "yes")
+        self.assertEqual(ep["outbound_auth"], reg["outbound_auth"])
+        self.assertEqual(reg["server_uri"], "sip:" + domain)
+        self.assertEqual(aor["contact"], reg["server_uri"])
+        self.assertEqual(reg["client_uri"], client or f"sip:{user}@{domain}")
+        self.assertEqual(reg["contact_user"], number)
+        self.assertEqual(reg["expiration"], expiration)
+        self.assertEqual(auth["username"], user)
+        self.assertEqual(auth["password"], password.replace("\\", "\\\\").replace(";", "\\;"))
+        self.assertEqual(ep["from_user"], from_user or user)
+        self.assertEqual(ep["from_domain"], domain)
+        self.assertEqual(ep["context"], "kfx-provider-in")
+        for obj in (reg, ep, aor):
+            self.assertEqual(obj.get("outbound_proxy", ""), proxy)
+        identify_name = reg["outbound_auth"].removesuffix("-auth") + "-identify"
+        if identify:
+            match = section(identify_name)
+            self.assertEqual((match["endpoint"], match["match"]), (endpoint, identify))
+        else:
+            self.assertNotIn(f"\n[{identify_name}]\n", text)
+
+    def regular_provider_roundtrip(self, fax_provider, phone_provider, separate_provider=None):
+        self.prepare_regular_provider_install()
+        secret = r'Test$mit;"A\B`'
+        fax_did, phone_did, out_did = "49305550101", "49305550102", "49305550103"
+        # In- und Ausgang unterscheiden, damit ein vertauschter Provider auffaellt.
+
+        def inputs(provider, role, number):
+            if provider == "fonial":
+                return ["Plusnet", role, number, secret, secret, "", "", "", "420",
+                        f"sip:client-{role}@other.invalid", "from-" + role]
+            return ["6", role, number, secret, secret, "custom.invalid" if role == "out" else "",
+                    "", "-" if role == "out" else "", ""]
+
+        fax = inputs(fax_provider, "fax", fax_did)
+        phone = inputs(phone_provider, "phone", phone_did)
+        run_options = ["", "", "", "n", *([""] * 6), "n", "y", "n"]
+        answers = ["fax-test", "n", fax[0], "", *fax[1:], "y", "", "", "1", "1",
+                   "", "", "", "y", "", "", "", "", "1", "n", *phone]
+        if separate_provider:
+            answers += ["y", *inputs(separate_provider, "out", out_did), "y"]
+        else:
+            answers += ["n"]
+        output = self.shell(self.package / MAIN, answers=[*answers, "n", *run_options, ""])
+        self.assertNotIn(secret, output)
+        self.assertEqual(self.envfile.stat().st_mode & 0o777, 0o600)
+        self.assertIn(f'KFX_PHONE_IN_PROVIDER="{phone_provider}"', self.envfile.read_text())
+        out_provider = separate_provider or phone_provider
+        self.assertIn(f'KFX_PHONE_OUT_PROVIDER="{out_provider}"', self.envfile.read_text())
+
+        def check(provider, role, did, filename, reg, endpoint):
+            if provider == "fonial":
+                options = dict(domain="sip.plusnet.de", proxy=r"sip:sbc.sip.plusnet.de\;lr",
+                               expiration="420", client=f"sip:client-{role}@other.invalid",
+                               from_user="from-" + role)
+            else:
+                domain = "custom.invalid" if role == "out" else "b.vsip.eu"
+                options = dict(domain=domain, identify="" if role == "out" else domain)
+            self.assert_trunk(filename, reg, endpoint, user=role, number=did, password=secret, **options)
+
+        check(fax_provider, "fax", fax_did, "pjsip.conf", "kfx-provider", "kfx-provider-endpoint")
+        check(phone_provider, "phone", phone_did, "pjsip-kfx-telefonie.conf", "kfx-phone-in-registration",
+              "kfx-phone-in-endpoint")
+        if separate_provider:
+            check(separate_provider, "out", out_did, "pjsip-kfx-telefonie.conf", "kfx-phone-out-registration",
+                  "kfx-phone-out-endpoint")
+        etc = self.host / "etc/asterisk"
+        incoming = (etc / "extensions.conf").read_text()
+        self.assertIn('exten => _+X.,1,Goto(kfx-provider-in,${EXTEN:1},1)', incoming)
+        self.assertIn(f'exten => {fax_did},1,Goto(fax-in,{fax_did},1)', incoming)
+        self.assertIn(f'exten => {phone_did},1,Goto(kfx-phone-in,s,1)', incoming)
+        self.assertIn('Set(NORM=0${EXTEN:2})', incoming)
+        self.assertIn('Dial(PJSIP/${NORM}@kfx-provider-endpoint', incoming)
+        phone_dialplan = (etc / "extensions-kfx-telefonie.conf").read_text()
+        self.assertEqual('exten => _49X.,1,Goto(0${EXTEN:2},1)' in phone_dialplan, out_provider == "voip2gsm")
+        self.assertEqual('exten => _0049X.,1,Goto(0${EXTEN:4},1)' in incoming, fax_provider == "voip2gsm")
+        out_role = "out" if separate_provider else "in"
+        self.assertIn(f'Dial(PJSIP/${{EXTEN}}@kfx-phone-{out_role}-endpoint,120)', phone_dialplan)
+
+        generated = {path: path.read_bytes() for path in etc.glob("*.conf")}
+        # Eine aus Asterisk uebernommene vollstaendige Proxy-URI soll dasselbe
+        # Ergebnis haben wie der Hostname. Die ENV bleibt shell-quotiert.
+        settings = self.envfile.read_text()
+        self.assertIn('="sbc.sip.plusnet.de"', settings)
+        self.envfile.write_text(settings.replace('="sbc.sip.plusnet.de"', r"='sip:sbc.sip.plusnet.de\\;lr'"))
+        if separate_provider:
+            stale = self.cache / "telefonie-queue.sh"
+            stale.write_text("# alter Cache ohne Providerprofile\nexit 91\n")
+            output = self.shell(self.package / MAIN, answers=["n", *run_options], success=False)
+            self.assertIn("Modulcache: telefonie-queue.sh", output)
+            self.assertNotIn("Module ausführen", output)
+        # Regulärer Updatepfad mit separat bestätigtem Austausch der drei Generatoren.
+        self.shell(self.package / MAIN, answers=["n", "y", "y", "y", *run_options[3:]])
+        for path, data in generated.items():
+            self.assertEqual(path.read_bytes(), data, path.name)
+        # Alle Providerwerte beim erneuten Durchlaufen des Dialogs übernehmen.
+        # Erwartet: nur eine Bestätigung pro gespeichertem Passwort.
+        reset = [
+            "y", "", "",                      # neu setzen, Hostname, Vollinstallation
+            "", "", "", "", "",               # Faxprovider, FQDN, Auth-ID, Nummer, Passwort behalten
+            "", "", "", "",                   # Registrar, Proxy, Identify, Expiration
+        ]
+        if fax_provider == "fonial":
+            reset += ["", ""]                 # Client-URI, From-User
+        reset += [
+            "", "", "", "1", "1", "", "", "",  # Adminpasswort, DID, Kopfzeile, Drucker, SIP/RTP
+            "", "", "", "", "", "", "",       # Queue, Kanalgrenzen, Telefone, internes Netz
+            *([""] * 8),                      # Phone-IN inkl. Passwort behalten
+        ]
+        if phone_provider == "fonial":
+            reset += ["", ""]
+        reset += [""]                         # Wahl der Ausgangsleitung beibehalten
+        if separate_provider:
+            reset += [""] * (9 + (2 if separate_provider == "fonial" else 0))  # Phone-OUT und Kanalzählung
+        output = self.shell(self.package / MAIN, answers=[*reset, "", "", *run_options, ""])
+        self.assertNotIn(secret, output)
+        for path, data in generated.items():
+            self.assertEqual(path.read_bytes(), data, path.name)
+
+    def test_fonial_fax_and_voip2gsm_phone(self):
+        self.regular_provider_roundtrip("fonial", "voip2gsm")
+
+    def test_voip2gsm_fax_and_separate_phone_trunks(self):
+        self.regular_provider_roundtrip("voip2gsm", "fonial", separate_provider="voip2gsm")
+
+    def test_voip2gsm_fax_and_phone_on_same_registrar_with_fonial_outbound(self):
+        self.regular_provider_roundtrip("voip2gsm", "voip2gsm", separate_provider="fonial")
+
     def test_packaged_full_install_and_standalone_queue_only(self):
         # Neue, noch ungetrackte Programmdatei und unveröffentlichter Worker
         # sind nur in dieser Arbeitskopie vorhanden.
@@ -217,7 +382,9 @@ echo "$*" >>"$TEST_BLOCKED"; exit 90''')
         self.prepare_host()
         # Eine gespeicherte Queue-only-Konfiguration darf im Kombilauf keine
         # Faxstufe unterdrücken. Das bestehende Nebenstellenpasswort bleibt erhalten.
-        write(self.envfile, "KFX_QUEUE_ONLY=y\nKFX_PHONE_ENDPOINT_201_PASSWORD=test-bestand\n")
+        write(self.envfile, "KFX_QUEUE_ONLY=y\nKFX_PROVIDER=none\nKFX_SIP_USER=\nKFX_SIP_DOMAIN=\n"
+              "KFX_PHONE_IN_PROVIDER=\nKFX_PHONE_IN_SIP_DOMAIN=\nKFX_PHONE_IN_SIP_EXPIRATION=\n"
+              "KFX_PHONE_ENDPOINT_201_PASSWORD=test-bestand\n")
         self.shell(self.package / MAIN, "--kombi", answers=[
             "y", "n", *FAX_ANSWERS, *PHONE_ANSWERS, "n", "n", "y", "n", "",
         ])
@@ -245,7 +412,7 @@ echo "$*" >>"$TEST_BLOCKED"; exit 90''')
         # abgewähltem WireGuard ist dessen Quelldatei entbehrlich.
         self.envfile.write_text(settings.replace("KFX_PHONE_QUEUE_ENABLED=y", "KFX_PHONE_QUEUE_ENABLED=n"))
         (self.package / MOD / "wireguard-installer.sh").unlink()
-        self.shell(self.package / MAIN, "--kombi", answers=["n", "n", *PHONE_ANSWERS, "n", "n", "y", "n"])
+        self.shell(self.package / MAIN, "--kombi", answers=["n", "n", *PHONE_ANSWERS[:6], *([""] * 8), "n", "n", "n", "n", "y", "n"])
         self.assertIn("KFX_PHONE_QUEUE_ENABLED=y", self.envfile.read_text())
         self.assertIn('KFX_SIP_USER="1001"', self.envfile.read_text())
 

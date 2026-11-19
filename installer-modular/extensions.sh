@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # IMMER verwenden wenn der KienzleFax-Dialplan fuer Fax und den gemeinsamen Provider-Eingang geschrieben wird.
+# KFX_PROVIDER_PROFILES=fonial-voip2gsm-v1
 set -euo pipefail
 
 ENVFILE="/etc/kienzlefax-installer.env"
@@ -182,6 +183,12 @@ clearglobalvars=no
 ; FAX-OUT
 ; =============================================================================
 [fax-out]
+; BEGIN voip2gsm
+; Die Weboberflaeche speichert internationale Ziele ohne + bzw. 00.
+exten => _+X.,1,Goto(00${EXTEN:1},1)
+exten => _0049X.,1,Goto(0${EXTEN:4},1)
+exten => _[1-9]X.,1,Goto(00${EXTEN},1)
+; END voip2gsm
 
 exten => kfx_missing_file,1,NoOp(FAX OUT ERROR: missing KFX_FILE | jobid=${KFX_JOBID})
  same => n,AGI(kfx_update_status.agi,${KFX_JOBID},dial_end,CHANUNAVAIL,0)
@@ -346,6 +353,7 @@ exten => s,1,NoOp(kfx_sendfax_hangup | jobid=${ARG1} chan=${CHANNEL(name)} FAXST
 ;   trotz identischer identify-Netze sicher anhand ihrer DID verteilt werden.
 ; =============================================================================
 [kfx-provider-in]
+exten => _+X.,1,Goto(kfx-provider-in,${EXTEN:1},1)
 exten => __KFX_FAX_DID__,1,Goto(fax-in,__KFX_FAX_DID__,1)
 __KFX_PHONE_ROUTE__
 
@@ -400,6 +408,9 @@ exten => __KFX_FAX_DID__,1,NoOp(Inbound Fax)
 EOF
 
 # Replace placeholders with install-time values
+if [[ "${KFX_PROVIDER:-}" != "voip2gsm" ]]; then
+  sed -i '/^; BEGIN voip2gsm$/,/^; END voip2gsm$/d' "$EXT"
+fi
 if [ -n "${KFX_FAX_DID}" ]; then
   sed -i "s/__KFX_FAX_DID__/${KFX_FAX_DID}/g" "$EXT"
 else

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # IMMER verwenden wenn der ausgewaehlte Fax-Provider als PJSIP-Trunk eingerichtet oder aktualisiert wird.
+# KFX_PROVIDER_PROFILES=fonial-voip2gsm-v1
 set -euo pipefail
 
 ENVFILE="/etc/kienzlefax-installer.env"
@@ -178,11 +179,11 @@ ENDPOINT_MEDIA_SECURITY=""
 case "$KFX_PROVIDER" in
   1und1)
     PROVIDER_DOMAIN="${PROVIDER_DOMAIN:-sip.1und1.de}"
-    PJSIP_IDENTIFY_MATCH="${PJSIP_IDENTIFY_MATCH:-212.227.0.0/16}"
+    PJSIP_IDENTIFY_MATCH="${PJSIP_IDENTIFY_MATCH:-${KFX_SIP_IDENTIFY_MATCH-212.227.0.0/16}}"
     ;;
   1und1-tls)
     PROVIDER_DOMAIN="${PROVIDER_DOMAIN:-sip.1und1.de}"
-    PJSIP_IDENTIFY_MATCH="${PJSIP_IDENTIFY_MATCH:-212.227.0.0/16}"
+    PJSIP_IDENTIFY_MATCH="${PJSIP_IDENTIFY_MATCH:-${KFX_SIP_IDENTIFY_MATCH-212.227.0.0/16}}"
     PROVIDER_TRANSPORT="transport-1und1-tls"
     PJSIP_SERVER_URI='sip:tls-sip.1und1.de:5061\;transport=tls'
     PJSIP_AOR_CONTACT='sip:tls-sip.1und1.de:5061\;transport=tls'
@@ -194,6 +195,14 @@ case "$KFX_PROVIDER" in
   sipgate)
     PROVIDER_DOMAIN="${PROVIDER_DOMAIN:-sipgate.de}"
     ;;
+  voip2gsm)
+    PROVIDER_DOMAIN="${PROVIDER_DOMAIN:-b.vsip.eu}"
+    PJSIP_IDENTIFY_MATCH="${PJSIP_IDENTIFY_MATCH:-${KFX_SIP_IDENTIFY_MATCH-$PROVIDER_DOMAIN}}"
+    ;;
+  fonial)
+    PROVIDER_DOMAIN="${PROVIDER_DOMAIN:-sip.plusnet.de}"
+    PJSIP_OUTBOUND_PROXY="${PJSIP_OUTBOUND_PROXY:-${KFX_SIP_OUTBOUND_PROXY-sbc.sip.plusnet.de}}"
+    ;;
 esac
 
 PJSIP_SERVER_URI="${PJSIP_SERVER_URI:-sip:${PROVIDER_DOMAIN}}"
@@ -204,6 +213,12 @@ AUTH_NAME="${KFX_PJSIP_AUTH:-kfx-provider-auth}"
 AOR_NAME="${KFX_PJSIP_AOR:-kfx-provider-aor}"
 ENDPOINT_NAME="${KFX_PJSIP_ENDPOINT:-kfx-provider-endpoint}"
 IDENTIFY_NAME="${KFX_PJSIP_IDENTIFY:-kfx-provider-identify}"
+CONTACT_USER="$PJSIP_USER"
+LINE_CONFIG=""
+if [[ "$KFX_PROVIDER" == "voip2gsm" || "$KFX_PROVIDER" == "fonial" ]]; then
+  CONTACT_USER="${KFX_FAX_DID:-${KFX_SIP_NUMBER:-$PJSIP_USER}}"
+  LINE_CONFIG="$(printf 'line=yes\nendpoint=%s' "$ENDPOINT_NAME")"
+fi
 
 PJSIP_CLIENT_URI="${PJSIP_CLIENT_URI:-${KFX_PJSIP_CLIENT_URI:-}}"
 if [ -z "$PJSIP_CLIENT_URI" ]; then
@@ -321,11 +336,10 @@ cp -a "$PJSIP" "${PJSIP}.old.kienzlefax.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || t
 
 OUTBOUND_PROXY_LINE=""
 if [ -n "${PJSIP_OUTBOUND_PROXY}" ]; then
-  if [[ "${PJSIP_OUTBOUND_PROXY}" =~ ^sip: ]]; then
-    OUTBOUND_PROXY_LINE="outbound_proxy=${PJSIP_OUTBOUND_PROXY}\;lr"
-  else
-    OUTBOUND_PROXY_LINE="outbound_proxy=sip:${PJSIP_OUTBOUND_PROXY}\;lr"
-  fi
+  # Auch komplette Proxy-URIs aus bestehenden ENV-Dateien akzeptieren.
+  proxy_uri="$(printf '%s' "$PJSIP_OUTBOUND_PROXY" | sed -E 's/\\+;/;/g')"
+  case ";${proxy_uri};" in *';lr;'*) ;; *) proxy_uri+=";lr" ;; esac
+  OUTBOUND_PROXY_LINE="outbound_proxy=sip:$(ast_cfg_value "${proxy_uri#sip:}")"
 fi
 
 if [ -n "${PUBLIC_FQDN}" ]; then
@@ -393,8 +407,9 @@ type=registration
 transport=${PROVIDER_TRANSPORT}
 outbound_auth=${AUTH_NAME}
 server_uri=${PJSIP_SERVER_URI}
-client_uri=${PJSIP_CLIENT_URI}
-contact_user=${PJSIP_USER}
+client_uri=$(ast_cfg_value "${PJSIP_CLIENT_URI//\\;/;}")
+contact_user=${CONTACT_USER}
+${LINE_CONFIG}
 retry_interval=60
 forbidden_retry_interval=600
 expiration=${PJSIP_EXPIRATION}
@@ -403,12 +418,13 @@ ${OUTBOUND_PROXY_LINE}
 [${AUTH_NAME}]
 type=auth
 auth_type=userpass
-username=${PJSIP_USER}
+username=$(ast_cfg_value "$PJSIP_USER")
 password=${PJSIP_PASS_CFG}
 
 [${AOR_NAME}]
 type=aor
 contact=${PJSIP_AOR_CONTACT}
+${OUTBOUND_PROXY_LINE}
 
 [${ENDPOINT_NAME}]
 type=endpoint
@@ -426,7 +442,7 @@ force_rport=yes
 t38_udptl=no
 ;t38_udptl_ec=no
 t38_udptl_nat=no
-from_user=${PJSIP_USER}
+from_user=$(ast_cfg_value "${KFX_PJSIP_FROM_USER:-$PJSIP_USER}")
 from_domain=${PROVIDER_DOMAIN}
 send_pai=yes
 send_rpid=yes

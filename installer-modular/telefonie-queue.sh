@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # IMMER verwenden wenn die optionale Asterisk-Telefoniewarteschlange installiert, aktualisiert oder deaktiviert wird.
+# KFX_PROVIDER_PROFILES=fonial-voip2gsm-v1
 set -euo pipefail
 
 ENVFILE="${KFX_INSTALLER_ENVFILE:-/etc/kienzlefax-installer.env}"
@@ -118,7 +119,7 @@ ast_cfg_value(){
 
 env_value(){
   local name="$1"
-  printf '%s' "${!name-}"
+  printf '%s' "${!name-${2-}}"
 }
 
 validate_phone_settings(){
@@ -259,10 +260,19 @@ append_provider(){
   provider="$(env_value "${prefix}_PROVIDER")"
   user="$(env_value "${prefix}_SIP_USER")"
   password="$(env_value "${prefix}_SIP_PASSWORD")"
-  domain="$(env_value "${prefix}_SIP_DOMAIN")"
-  proxy="$(env_value "${prefix}_SIP_OUTBOUND_PROXY")"
-  identify="$(env_value "${prefix}_SIP_IDENTIFY_MATCH")"
-  expiration="$(env_value "${prefix}_SIP_EXPIRATION")"
+  local domain_default="" proxy_default="" identify_default="" client_uri from_user
+  case "$provider" in
+    fonial)  domain_default="sip.plusnet.de"; proxy_default="sbc.sip.plusnet.de" ;;
+    voip2gsm) domain_default="b.vsip.eu" ;;
+  esac
+  domain="$(env_value "${prefix}_SIP_DOMAIN" "$domain_default")"
+  [[ "$provider" != "voip2gsm" ]] || identify_default="$domain"
+  client_uri="$(env_value "${prefix}_PJSIP_CLIENT_URI")"
+  client_uri="${client_uri:-sip:${user}@${domain}}"
+  from_user="$(env_value "${prefix}_PJSIP_FROM_USER")"
+  proxy="$(env_value "${prefix}_SIP_OUTBOUND_PROXY" "$proxy_default")"
+  identify="$(env_value "${prefix}_SIP_IDENTIFY_MATCH" "$identify_default")"
+  expiration="$(env_value "${prefix}_SIP_EXPIRATION" 300)"
 
   if [[ "$provider" == "manual" ]]; then
     {
@@ -287,14 +297,19 @@ append_provider(){
     || die "Providerdaten fuer Telefonie-${role} sind unvollstaendig."
   [[ "$expiration" =~ ^[0-9]+$ ]] || die "Ungueltige Registration Expiration fuer Telefonie-${role}."
 
-  local password_cfg proxy_line=""
+  local password_cfg proxy_line="" line_config="" contact_user="$user" codecs="g722,alaw,ulaw"
+  if [[ "$provider" == "voip2gsm" || "$provider" == "fonial" ]]; then
+    line_config="$(printf 'line=yes\nendpoint=%s' "$endpoint")"
+    contact_user="$(env_value "${prefix}_SIP_NUMBER")"
+    codecs="alaw,ulaw"
+  fi
   password_cfg="$(ast_cfg_value "$password")"
   if [[ -n "$proxy" ]]; then
-    if [[ "$proxy" == sip:* ]]; then
-      proxy_line="outbound_proxy=${proxy}\\;lr"
-    else
-      proxy_line="outbound_proxy=sip:${proxy}\\;lr"
-    fi
+    local proxy_uri
+    # Auch komplette Proxy-URIs aus bestehenden ENV-Dateien akzeptieren.
+    proxy_uri="$(printf '%s' "$proxy" | sed -E 's/\\+;/;/g')"
+    case ";${proxy_uri};" in *';lr;'*) ;; *) proxy_uri+=";lr" ;; esac
+    proxy_line="outbound_proxy=sip:$(ast_cfg_value "${proxy_uri#sip:}")"
   fi
 
   cat >>"$PJSIP_TMP" <<EOF
@@ -304,8 +319,9 @@ type=registration
 transport=${provider_transport}
 outbound_auth=${object_prefix}-auth
 server_uri=${server_uri}
-client_uri=sip:${user}@${domain}
-contact_user=${user}
+client_uri=$(ast_cfg_value "${client_uri//\\;/;}")
+contact_user=${contact_user}
+${line_config}
 retry_interval=60
 forbidden_retry_interval=600
 expiration=${expiration}
@@ -314,19 +330,20 @@ ${proxy_line}
 [${object_prefix}-auth]
 type=auth
 auth_type=userpass
-username=${user}
+username=$(ast_cfg_value "$user")
 password=${password_cfg}
 
 [${object_prefix}-aor]
 type=aor
 contact=${aor_contact}
+${proxy_line}
 
 [${endpoint}]
 type=endpoint
 transport=${provider_transport}
 context=${endpoint_context}
 disallow=all
-allow=g722,alaw,ulaw
+allow=${codecs}
 ${endpoint_media_security}
 outbound_auth=${object_prefix}-auth
 aors=${object_prefix}-aor
@@ -336,7 +353,7 @@ rtp_symmetric=yes
 force_rport=yes
 t38_udptl=no
 t38_udptl_nat=no
-from_user=${user}
+from_user=$(ast_cfg_value "${from_user:-$user}")
 from_domain=${domain}
 send_pai=yes
 send_rpid=yes
@@ -446,9 +463,11 @@ EOF
   done
 
   append_provider IN "kfx-phone-in" "kfx-phone-in-endpoint"
+  OUT_PROVIDER="${KFX_PHONE_IN_PROVIDER:-}"
   OUT_ENDPOINT="kfx-phone-in-endpoint"
   if [[ "${KFX_PHONE_SEPARATE_OUTBOUND:-n}" == "y" ]]; then
     append_provider OUT "kfx-phone-out" "kfx-phone-out-endpoint"
+    OUT_PROVIDER="${KFX_PHONE_OUT_PROVIDER:-}"
     OUT_ENDPOINT="kfx-phone-out-endpoint"
   fi
   if [[ "$SIPGATE_OVERFLOW_ENABLED" == "y" ]]; then
@@ -497,6 +516,11 @@ exten => s,1,NoOp(KienzleFax Telefoniewarteschlange)
 
 [kfx-phone-local]
 __KFX_LOCAL_PHONE_ROUTES__
+; BEGIN voip2gsm
+exten => _+X.,1,Goto(00${EXTEN:1},1)
+exten => _0049X.,1,Goto(0${EXTEN:4},1)
+exten => _49X.,1,Goto(0${EXTEN:2},1)
+; END voip2gsm
 
 exten => _X.,1,NoOp(KienzleFax Telefonie ausgehend)
  same => n,GotoIf($["__KFX_PHONE_OUT_COUNTS_PROVIDER_LIMIT__"!="y"]?dial)
@@ -546,6 +570,9 @@ else:
     text = text[:start] + "; Sipgate-Ueberlauf deaktiviert.\n\n" + text[end:]
 path.write_text(text, encoding="utf-8")
 PY
+  if [[ "$OUT_PROVIDER" != "voip2gsm" ]]; then
+    sed -i '/^; BEGIN voip2gsm$/,/^; END voip2gsm$/d' "$EXTENSIONS_TMP"
+  fi
   sed -i "s/__KFX_QUEUE_MAX_WAITING__/${QUEUE_MAX_WAITING}/g" "$EXTENSIONS_TMP"
 
   if [[ "$QUEUE_ONLY" == "y" ]]; then

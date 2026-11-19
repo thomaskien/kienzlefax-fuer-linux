@@ -12,3 +12,5 @@ installer-modular/scan_ocr.sh
 installer-modular/wireguard-installer.sh
 kienzlefax.php
 faxton.mp3
+docs/provider/pjsip-fonial.conf.example
+docs/provider/pjsip-voip2gsm.conf.example
