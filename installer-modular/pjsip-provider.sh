@@ -194,6 +194,9 @@ case "$KFX_PROVIDER" in
   sipgate)
     PROVIDER_DOMAIN="${PROVIDER_DOMAIN:-sipgate.de}"
     ;;
+  voip2gsm)
+    PROVIDER_DOMAIN="${PROVIDER_DOMAIN:-b.vsip.eu}"
+    ;;
 esac
 
 PJSIP_SERVER_URI="${PJSIP_SERVER_URI:-sip:${PROVIDER_DOMAIN}}"
