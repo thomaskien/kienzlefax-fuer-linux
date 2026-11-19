@@ -37,6 +37,40 @@ erhalten; neue Passwörter werden nur nach expliziter Rückfrage erzeugt.
 Für 1&1 stehen getrennte UDP- und TLS-Templates zur Verfügung. Bei aktivierter Telefoniewarteschlange
 kann außerdem ein separater WireGuard-Telefonie-Installer für die Ausführung im Anschluss gewählt werden.
 
+### Lokales Paket für den Kombi-Installer
+
+Im Kienzlefax-Arbeitsverzeichnis auf macOS oder Linux packen.
+
+```bash
+bash scripts/pack.sh --output /absoluter/pfad/kienzlefax.tar.gz
+```
+
+Die Positivliste `installer-modular/package-files.txt` legt den Archivinhalt fest.
+Für eine neue Programmdatei den relativen Pfad ergänzen. Der Packbefehl liest die
+Dateien direkt aus dem Arbeitsverzeichnis und erfasst damit auch uncommittete und
+noch ungetrackte Änderungen.
+
+Auf dem Debian-Zielsystem in ein leeres Verzeichnis entpacken und den Hauptinstaller
+als `root` starten. Hier ist `/opt/kombi` das Entpackverzeichnis.
+
+```bash
+mkdir -p /opt/kombi
+tar -xzf /absoluter/pfad/kienzlefax.tar.gz -C /opt/kombi
+bash /opt/kombi/kienzlefax/installer-modular/kienzlefax-install-modular.sh --kombi
+```
+
+Der Aufruf funktioniert aus jedem Arbeitsverzeichnis. Aus dem entpackten Ordner
+`kienzlefax/` genügt `bash installer-modular/kienzlefax-install-modular.sh --kombi`.
+Dieser Modus installiert den vollständigen Faxworkflow und richtet die Praxisqueue
+für Kienzlefon ein. Fehlen Telefoniedaten, fragt der Installer sie ab. Bei einer
+bisherigen Queue-only-Konfiguration erfasst er auch die Fax-Grunddaten.
+
+Alle Kienzlefax-Module, die Weboberfläche und der Faxton stammen für diesen Lauf aus
+dem Paket. WireGuard ist mitgeliefert und wird auf Wunsch gestartet. APT-Pakete,
+deutsche Asterisk-Ansagen und ein gewählter Asterisk-Build nutzen die bisherigen
+externen Quellen. Nach erfolgreicher Prüfung der Praxisqueue kann der aufrufende
+Kombi-Installer mit Kienzlefon fortfahren.
+
 ## Bestehende Installation pausieren oder wieder aktivieren
 
 Der separate Assistent **`kienzlefax-verwalten.sh` (0.2.0)** schaltet Faxversand,

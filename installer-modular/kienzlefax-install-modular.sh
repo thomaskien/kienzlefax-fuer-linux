@@ -210,6 +210,10 @@
 #   und nach Abschluss der Hauptinstallation interaktiv ausgefuehrt werden.
 # - Eine gewaehlte WireGuard-Bindung wird dauerhaft in der Installer-ENV gespeichert;
 #   Asterisk wird nur ohne aktive Kanaele kontrolliert neu gestartet und danach geprueft.
+#
+# Unveröffentlicht:
+# - --kombi installiert Fax und Praxisqueue aus einem vollständigen lokalen Paket.
+#   Modulcache und GitHub-Updates werden dabei übersprungen.
 # ==============================================================================
 
 set -euo pipefail
@@ -226,11 +230,6 @@ URL_AGI="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs
 URL_PDF_WITH_HEADER="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/pdf_with_header.sh"
 URL_SCAN_OCR="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/scan_ocr.sh"
 URL_WIREGUARD_INSTALLER="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/refs/heads/main/installer-modular/wireguard-installer.sh"
-
-# Web bootstrap
-WEBROOT="/var/www/html"
-WEB_URL_RAW="https://raw.githubusercontent.com/thomaskien/kienzlefax-fuer-linux/main/kienzlefax.php"
-FAXTON_URL="https://github.com/thomaskien/kienzlefax-fuer-linux/raw/refs/heads/main/faxton.mp3"
 
 # Installer dirs
 MOD_BASE="/usr/local/lib/kienzlefax-installer"
@@ -266,6 +265,31 @@ log(){ echo "[$(date -Is)] $*"; }
 sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
 
 require_root(){ [[ ${EUID:-0} -eq 0 ]] || die "Bitte als root ausführen."; }
+
+require_package_file(){
+  [[ -f "$1" && -r "$1" && -s "$1" && "$(readlink -f -- "$1")" == "$1" ]] || die "Paketdatei fehlt, ist leer, verlinkt oder nicht lesbar: $1"
+}
+
+check_package(){
+  local root="$1" manifest="$1/installer-modular/package-files.txt" file
+  require_package_file "$manifest"
+  while IFS= read -r file || [[ -n "$file" ]]; do
+    # Das WireGuard-Modul wird nur bei Auswahl des Folgeinstallers benötigt.
+    [[ "$file" != installer-modular/wireguard-installer.sh ]] || continue
+    require_package_file "$root/$file"
+  done <"$manifest"
+}
+
+verify_kombi_telephony(){
+  local dir="/etc/asterisk" queue
+  grep -Fxq '[kfx-phone-queue]' "$dir/extensions-kfx-telefonie.conf" || die "Telefoniedialplan für Kienzlefon fehlt."
+  grep -Fxq '[transport-kfx-phone]' "$dir/pjsip-kfx-telefonie.conf" || die "Telefonie-PJSIP für Kienzlefon fehlt."
+  grep -Fxq '[kfx_external_capacity]' "$dir/extensions.conf" ||
+    grep -Fxq '[kfx_external_capacity]' "$dir/extensions-kfx-telefonie.conf" || die "Gemeinsamer Kapazitätsguard für Fax und Telefonie fehlt."
+  grep -Fxq '[praxis]' "$dir/queues-kfx.conf" || die "Queue [praxis] für Kienzlefon fehlt."
+  queue="$(asterisk -rx "queue show praxis")" && grep -q '^praxis has ' <<<"$queue" || die "Asterisk hat die Queue praxis nicht geladen."
+  log "[OK] Praxisqueue und Telefonieintegration für Kienzlefon geprüft."
+}
 
 ask_yes_no(){
   # usage: ask_yes_no VAR "Prompt" "y|n(default)"
@@ -311,16 +335,17 @@ maybe_fetch_one(){
 
 run_module(){
   local m="$1"
+  shift
   [[ -x "$m" ]] || die "Modul nicht ausführbar: $m"
   log "[RUN] $m"
-  "$m"
+  "$m" "$@"
   log "[OK ] $m"
 }
 
-run_remote_script(){
-  # Runs a cached remote script with a helper-function wrapper
+run_project_script(){
   local script="$1"
-  [[ -x "$script" ]] || die "Remote script nicht ausführbar: $script"
+  [[ -f "$script" && -r "$script" && -s "$script" ]] || die "Installationsmodul fehlt oder ist nicht lesbar: $script"
+  [[ -n "$package_root" || -x "$script" ]] || die "Cache-Modul nicht ausführbar: $script"
 
   (
     set -euo pipefail
@@ -483,12 +508,14 @@ UNIT
 # Local modules
 # ------------------------------------------------------------------------------
 bootstrap_local_modules(){
-  mkdir -p "$MOD_DIR" "$MOD_CACHE" "$STATE_DIR"
+  mkdir -p "$MOD_DIR" "$STATE_DIR"
 
   # 00-base: options / hostname / envfile
   cat >"${MOD_DIR}/00-base.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+readonly package_root="${1:-}"
+readonly package_wireguard="${2:-n}"
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "[$(date -Is)] $*"; }
@@ -779,6 +806,9 @@ collect_phone_options(){
     PHONE_QUEUE_ENABLED="y"
     PROVIDER_FAX_LIMIT="0"
     echo "[INFO] Queue-only: Telefoniewarteschlange wird verbindlich installiert."
+  elif [[ -n "$package_root" ]]; then
+    PHONE_QUEUE_ENABLED="y"
+    echo "[INFO] Kombi-Installation: Die Praxisqueue wird für Kienzlefon eingerichtet."
   else
     ask_yes_no PHONE_QUEUE_ENABLED "Warteschlange fuer Telefonie erstellen?" "n"
   fi
@@ -1035,22 +1065,30 @@ upsert_env_line(){
   fi
 }
 
+ask_file_refresh(){
+  local var="$1" file="$2" prompt="$3" default="n"
+  if [[ -n "$package_root" ]]; then
+    printf -v "$var" '%s' n
+  else
+    [[ -s "$file" ]] || default="y"
+    ask_yes_no "$var" "$prompt" "$default"
+  fi
+}
+
 collect_run_options(){
-  local cache_dir="/usr/local/lib/kienzlefax-installer/cache" default="" phone_enabled=""
-  default="n"; [[ -s "${cache_dir}/extensions.sh" ]] || default="y"
-  ask_yes_no REMOTE_REFRESH_EXTENSIONS "Remote-Datei extensions.sh holen/aktualisieren?" "$default"
-  default="n"; [[ -s "${cache_dir}/pjsip-provider.sh" ]] || default="y"
-  ask_yes_no REMOTE_REFRESH_PJSIP_PROVIDER "Remote-Datei pjsip-provider.sh holen/aktualisieren?" "$default"
-  default="n"; [[ -s "${cache_dir}/telefonie-queue.sh" ]] || default="y"
-  ask_yes_no REMOTE_REFRESH_TELEFONIE_QUEUE "Remote-Datei telefonie-queue.sh holen/aktualisieren?" "$default"
+  local cache_dir="/usr/local/lib/kienzlefax-installer/cache" phone_enabled=""
+  ask_file_refresh REMOTE_REFRESH_EXTENSIONS "${cache_dir}/extensions.sh" "Remote-Datei extensions.sh holen/aktualisieren?"
+  ask_file_refresh REMOTE_REFRESH_PJSIP_PROVIDER "${cache_dir}/pjsip-provider.sh" "Remote-Datei pjsip-provider.sh holen/aktualisieren?"
+  ask_file_refresh REMOTE_REFRESH_TELEFONIE_QUEUE "${cache_dir}/telefonie-queue.sh" "Remote-Datei telefonie-queue.sh holen/aktualisieren?"
   phone_enabled="${PHONE_QUEUE_ENABLED:-${KFX_PHONE_QUEUE_ENABLED:-n}}"
-  if [[ "$phone_enabled" == "y" ]]; then
+  if [[ -n "$package_root" ]]; then
+    RUN_WIREGUARD_INSTALLER="$package_wireguard"
+    REMOTE_REFRESH_WIREGUARD_INSTALLER="n"
+  elif [[ "$phone_enabled" == "y" ]]; then
     ask_yes_no RUN_WIREGUARD_INSTALLER \
       "WireGuard-Telefonie-Installer nach Abschluss separat ausfuehren?" "n"
     if [[ "$RUN_WIREGUARD_INSTALLER" == "y" ]]; then
-      default="n"; [[ -s "${cache_dir}/wireguard-installer.sh" ]] || default="y"
-      ask_yes_no REMOTE_REFRESH_WIREGUARD_INSTALLER \
-        "Remote-Datei wireguard-installer.sh holen/aktualisieren?" "$default"
+      ask_file_refresh REMOTE_REFRESH_WIREGUARD_INSTALLER "${cache_dir}/wireguard-installer.sh" "Remote-Datei wireguard-installer.sh holen/aktualisieren?"
     else
       REMOTE_REFRESH_WIREGUARD_INSTALLER="n"
     fi
@@ -1068,18 +1106,12 @@ collect_run_options(){
     WEB_REFRESH="n"
     echo "[INFO] Queue-only: Fax-, OCR-, Worker- und Webmodule werden nicht abgefragt."
   else
-    default="n"; [[ -s "${cache_dir}/pjsip-1und1.sh" ]] || default="y"
-    ask_yes_no REMOTE_REFRESH_PJSIP_1UND1 "Remote-Datei pjsip-1und1.sh holen/aktualisieren?" "$default"
-    default="n"; [[ -s "${cache_dir}/worker.sh" ]] || default="y"
-    ask_yes_no REMOTE_REFRESH_WORKER "Remote-Datei worker.sh holen/aktualisieren?" "$default"
-    default="n"; [[ -s "${cache_dir}/agi.sh" ]] || default="y"
-    ask_yes_no REMOTE_REFRESH_AGI "Remote-Datei agi.sh holen/aktualisieren?" "$default"
-    default="n"; [[ -s "${cache_dir}/pdf_with_header.sh" ]] || default="y"
-    ask_yes_no REMOTE_REFRESH_PDF_WITH_HEADER "Remote-Datei pdf_with_header.sh holen/aktualisieren?" "$default"
-    default="n"; [[ -s "${cache_dir}/scan_ocr.sh" ]] || default="y"
-    ask_yes_no REMOTE_REFRESH_SCAN_OCR "Remote-Datei scan_ocr.sh holen/aktualisieren?" "$default"
-    default="n"; [[ -s /var/www/html/kienzlefax.php ]] || default="y"
-    ask_yes_no WEB_REFRESH "Weboberflaeche neu herunterladen/aktualisieren?" "$default"
+    ask_file_refresh REMOTE_REFRESH_PJSIP_1UND1 "${cache_dir}/pjsip-1und1.sh" "Remote-Datei pjsip-1und1.sh holen/aktualisieren?"
+    ask_file_refresh REMOTE_REFRESH_WORKER "${cache_dir}/worker.sh" "Remote-Datei worker.sh holen/aktualisieren?"
+    ask_file_refresh REMOTE_REFRESH_AGI "${cache_dir}/agi.sh" "Remote-Datei agi.sh holen/aktualisieren?"
+    ask_file_refresh REMOTE_REFRESH_PDF_WITH_HEADER "${cache_dir}/pdf_with_header.sh" "Remote-Datei pdf_with_header.sh holen/aktualisieren?"
+    ask_file_refresh REMOTE_REFRESH_SCAN_OCR "${cache_dir}/scan_ocr.sh" "Remote-Datei scan_ocr.sh holen/aktualisieren?"
+    ask_file_refresh WEB_REFRESH /var/www/html/kienzlefax.php "Weboberflaeche neu herunterladen/aktualisieren?"
   fi
   ask_yes_no AST_MANUAL_MENUSELECT "Asterisk-Modulauswahl manuell zur Pruefung oeffnen? Beenden mit X" "n"
 
@@ -1162,9 +1194,18 @@ else
   RESET_OPTS="y"
 fi
 
+if [[ "$RESET_OPTS" == "n" && -n "$package_root" && "${KFX_QUEUE_ONLY:-n}" == "y" ]]; then
+  log "[INFO] Die gespeicherte Queue-only-Konfiguration enthält keine Faxbasis. Die Kombi-Vollinstallation benötigt auch die Faxdaten."
+  RESET_OPTS="y"
+fi
+
 if [[ "$RESET_OPTS" == "n" ]]; then
   if [[ -z "${KFX_QUEUE_ONLY+x}" ]]; then
-    ask_yes_no KFX_QUEUE_ONLY "Nur Telefoniewarteschlange installieren (ohne Faxfunktionen)?" "n"
+    if [[ -n "$package_root" ]]; then
+      KFX_QUEUE_ONLY="n"
+    else
+      ask_yes_no KFX_QUEUE_ONLY "Nur Telefoniewarteschlange installieren (ohne Faxfunktionen)?" "n"
+    fi
     upsert_env_line KFX_QUEUE_ONLY "$KFX_QUEUE_ONLY"
     if [[ "$KFX_QUEUE_ONLY" == "y" ]]; then
       log "[WARN] Queue-only entfernt keine bereits vorhandenen Faxkomponenten; es installiert/aktualisiert sie lediglich nicht."
@@ -1178,7 +1219,8 @@ if [[ "$RESET_OPTS" == "n" ]]; then
     RESET_OPTS="y"
   else
     log "[OK] Verwende vorhandene Grundkonfiguration aus ${ENVFILE}"
-    if [[ -z "${KFX_PHONE_QUEUE_ENABLED+x}" || -z "${KFX_PHONE_REMOTE_ACCESS_ENABLED+x}" || -z "${KFX_PHONE_ALLOWED_CIDR+x}" || -z "${KFX_PROVIDER_CHANNEL_LIMIT+x}" || -z "${KFX_PROVIDER_PHONE_LIMIT+x}" || -z "${KFX_PROVIDER_FAX_LIMIT+x}" || -z "${KFX_QUEUE_MAX_WAITING+x}" || -z "${KFX_PHONE_OUT_COUNTS_PROVIDER_LIMIT+x}" || -z "${KFX_SIPGATE_OVERFLOW_ENABLED+x}" ]]; then
+    if [[ -n "$package_root" && ( "${KFX_PHONE_QUEUE_ENABLED:-n}" != "y" || -z "${KFX_PHONE_IN_SIP_USER:-}" ) ]] ||
+       [[ -z "${KFX_PHONE_QUEUE_ENABLED+x}" || -z "${KFX_PHONE_REMOTE_ACCESS_ENABLED+x}" || -z "${KFX_PHONE_ALLOWED_CIDR+x}" || -z "${KFX_PROVIDER_CHANNEL_LIMIT+x}" || -z "${KFX_PROVIDER_PHONE_LIMIT+x}" || -z "${KFX_PROVIDER_FAX_LIMIT+x}" || -z "${KFX_QUEUE_MAX_WAITING+x}" || -z "${KFX_PHONE_OUT_COUNTS_PROVIDER_LIMIT+x}" || -z "${KFX_SIPGATE_OVERFLOW_ENABLED+x}" ]]; then
       sep "Neue Grundoptionen: Telefoniewarteschlange und Kanalgrenzen"
       collect_phone_options
       write_phone_options_to_env "$ENVFILE"
@@ -1205,7 +1247,11 @@ else
   echo -e "127.0.1.1\t${KFX_HOSTNAME}" >> /etc/hosts
 fi
 
-ask_yes_no QUEUE_ONLY "Nur Telefoniewarteschlange installieren (ohne Fax, Faxdrucker, OCR, Web und Samba)?" "n"
+if [[ -n "$package_root" ]]; then
+  QUEUE_ONLY="n"
+else
+  ask_yes_no QUEUE_ONLY "Nur Telefoniewarteschlange installieren (ohne Fax, Faxdrucker, OCR, Web und Samba)?" "n"
+fi
 KFX_QUEUE_ONLY="$QUEUE_ONLY"
 if [[ "$QUEUE_ONLY" == "y" ]]; then
   echo "[OK] Installationsmodus: nur Telefoniewarteschlange."
@@ -1791,21 +1837,7 @@ die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "[$(date -Is)] $*"; }
 sep(){ echo; echo "======================================================================"; echo "== $*"; echo "======================================================================"; }
 
-ask_yes_no(){
-  local __var="$1"; shift
-  local __prompt="$1"; shift
-  local __def="$1"; shift
-  local __val=""
-  while true; do
-    read -r -p "${__prompt} [${__def}]: " __val
-    __val="${__val:-$__def}"
-    case "$__val" in
-      y|Y|yes|YES) printf -v "$__var" "y"; return 0;;
-      n|N|no|NO)   printf -v "$__var" "n"; return 0;;
-      *) echo "Bitte y/n eingeben.";;
-    esac
-  done
-}
+readonly package_root="${1:-}"
 
 ENVFILE="/etc/kienzlefax-installer.env"
 [[ -f "$ENVFILE" ]] || die "ENV fehlt: $ENVFILE"
@@ -1820,18 +1852,24 @@ sep "Webroot bootstrappen (kienzlefax.php + faxton.mp3) + index redirect"
 mkdir -p "${WEBROOT}"
 
 KFXPHP="${WEBROOT}/kienzlefax.php"
-DO_PHP="${KFX_WEB_REFRESH:-y}"
-[[ -s "$KFXPHP" ]] || DO_PHP="y"
-if [[ "$DO_PHP" == "y" ]]; then
-  curl -fsSL -o "${KFXPHP}" "${WEB_URL_RAW}"
-  log "[OK] kienzlefax.php geladen."
+if [[ -n "$package_root" ]]; then
+  install -m 0644 "$package_root/kienzlefax.php" "$KFXPHP"
+  install -m 0644 "$package_root/faxton.mp3" "$WEBROOT/faxton.mp3"
+  log "[OK] kienzlefax.php und faxton.mp3 aus dem Kombi-Paket installiert."
 else
-  [[ -s "$KFXPHP" ]] || die "kienzlefax.php fehlt, kann nicht übersprungen werden."
-  log "[OK] kienzlefax.php unverändert."
-fi
+  DO_PHP="${KFX_WEB_REFRESH:-y}"
+  [[ -s "$KFXPHP" ]] || DO_PHP="y"
+  if [[ "$DO_PHP" == "y" ]]; then
+    curl -fsSL -o "${KFXPHP}" "${WEB_URL_RAW}"
+    log "[OK] kienzlefax.php geladen."
+  else
+    [[ -s "$KFXPHP" ]] || die "kienzlefax.php fehlt, kann nicht übersprungen werden."
+    log "[OK] kienzlefax.php unverändert."
+  fi
 
-# faxton.mp3 konservativ: immer sicherstellen
-curl -fsSL -o "${WEBROOT}/faxton.mp3" "${FAXTON_URL}"
+  # faxton.mp3 konservativ: immer sicherstellen
+  curl -fsSL -o "${WEBROOT}/faxton.mp3" "${FAXTON_URL}"
+fi
 
 cat > "${WEBROOT}/index.html" <<'HTML'
 <!doctype html>
@@ -3075,32 +3113,57 @@ EOF
 # ------------------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------------------
+package_root=""
+project_module_dir="$MOD_CACHE"
+if (( $# )); then
+  if [[ $# != 1 || "$1" != "--kombi" ]]; then
+    die "Aufruf: bash ${0##*/} [--kombi]"
+  fi
+  installer_path="$(readlink -f -- "${BASH_SOURCE[0]}")" || die "Installerpfad nicht auflösbar: ${BASH_SOURCE[0]}"
+  package_root="$(dirname -- "$(dirname -- "$installer_path")")"
+  project_module_dir="$package_root/installer-modular"
+  check_package "$package_root"
+  cd -- "$package_root"
+  log "[INFO] Kombi-Vollinstallation mit Praxisqueue aus $package_root"
+fi
+readonly package_root project_module_dir
 require_root
+package_wireguard=n
+if [[ -n "$package_root" ]]; then
+  ask_yes_no package_wireguard "WireGuard-Telefonie-Installer nach Abschluss separat ausführen?" "n"
+  if [[ "$package_wireguard" == "y" ]]; then
+    require_package_file "$project_module_dir/wireguard-installer.sh"
+  fi
+fi
 export DEBIAN_FRONTEND=noninteractive
 
 sep "Bootstrap lokale Module"
 bootstrap_local_modules
 
 sep "Optionen sammeln"
-run_module "${MOD_DIR}/00-base.sh"
+run_module "${MOD_DIR}/00-base.sh" "$package_root" "$package_wireguard"
 
 # Load ENV early so the remaining installation can run without further prompts.
 # shellcheck disable=SC1090
 source "$ENVFILE"
 
-sep "Remote Module holen/aktualisieren"
-maybe_fetch_one "extensions.sh"       "$URL_EXTENSIONS"       "${MOD_CACHE}/extensions.sh"       "${KFX_REMOTE_REFRESH_EXTENSIONS:-n}"
-maybe_fetch_one "pjsip-provider.sh"   "$URL_PJSIP_PROVIDER"   "${MOD_CACHE}/pjsip-provider.sh"   "${KFX_REMOTE_REFRESH_PJSIP_PROVIDER:-n}"
-maybe_fetch_one "telefonie-queue.sh"  "$URL_TELEFONIE_QUEUE"  "${MOD_CACHE}/telefonie-queue.sh"  "${KFX_REMOTE_REFRESH_TELEFONIE_QUEUE:-n}"
-if [[ "${KFX_RUN_WIREGUARD_INSTALLER:-n}" == "y" ]]; then
-  maybe_fetch_one "wireguard-installer.sh" "$URL_WIREGUARD_INSTALLER" "${MOD_CACHE}/wireguard-installer.sh" "${KFX_REMOTE_REFRESH_WIREGUARD_INSTALLER:-n}"
-fi
-if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]]; then
-  maybe_fetch_one "pjsip-1und1.sh"      "$URL_PJSIP_1UND1"      "${MOD_CACHE}/pjsip-1und1.sh"      "${KFX_REMOTE_REFRESH_PJSIP_1UND1:-n}"
-  maybe_fetch_one "worker.sh"           "$URL_WORKER"           "${MOD_CACHE}/worker.sh"           "${KFX_REMOTE_REFRESH_WORKER:-n}"
-  maybe_fetch_one "agi.sh"              "$URL_AGI"              "${MOD_CACHE}/agi.sh"              "${KFX_REMOTE_REFRESH_AGI:-n}"
-  maybe_fetch_one "pdf_with_header.sh"  "$URL_PDF_WITH_HEADER"  "${MOD_CACHE}/pdf_with_header.sh"  "${KFX_REMOTE_REFRESH_PDF_WITH_HEADER:-n}"
-  maybe_fetch_one "scan_ocr.sh"         "$URL_SCAN_OCR"         "${MOD_CACHE}/scan_ocr.sh"         "${KFX_REMOTE_REFRESH_SCAN_OCR:-n}"
+if [[ -z "$package_root" ]]; then
+  sep "Remote Module holen/aktualisieren"
+  maybe_fetch_one "extensions.sh"       "$URL_EXTENSIONS"       "${MOD_CACHE}/extensions.sh"       "${KFX_REMOTE_REFRESH_EXTENSIONS:-n}"
+  maybe_fetch_one "pjsip-provider.sh"   "$URL_PJSIP_PROVIDER"   "${MOD_CACHE}/pjsip-provider.sh"   "${KFX_REMOTE_REFRESH_PJSIP_PROVIDER:-n}"
+  maybe_fetch_one "telefonie-queue.sh"  "$URL_TELEFONIE_QUEUE"  "${MOD_CACHE}/telefonie-queue.sh"  "${KFX_REMOTE_REFRESH_TELEFONIE_QUEUE:-n}"
+  if [[ "${KFX_RUN_WIREGUARD_INSTALLER:-n}" == "y" ]]; then
+    maybe_fetch_one "wireguard-installer.sh" "$URL_WIREGUARD_INSTALLER" "${MOD_CACHE}/wireguard-installer.sh" "${KFX_REMOTE_REFRESH_WIREGUARD_INSTALLER:-n}"
+  fi
+  if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]]; then
+    maybe_fetch_one "pjsip-1und1.sh"      "$URL_PJSIP_1UND1"      "${MOD_CACHE}/pjsip-1und1.sh"      "${KFX_REMOTE_REFRESH_PJSIP_1UND1:-n}"
+    maybe_fetch_one "worker.sh"           "$URL_WORKER"           "${MOD_CACHE}/worker.sh"           "${KFX_REMOTE_REFRESH_WORKER:-n}"
+    maybe_fetch_one "agi.sh"              "$URL_AGI"              "${MOD_CACHE}/agi.sh"              "${KFX_REMOTE_REFRESH_AGI:-n}"
+    maybe_fetch_one "pdf_with_header.sh"  "$URL_PDF_WITH_HEADER"  "${MOD_CACHE}/pdf_with_header.sh"  "${KFX_REMOTE_REFRESH_PDF_WITH_HEADER:-n}"
+    maybe_fetch_one "scan_ocr.sh"         "$URL_SCAN_OCR"         "${MOD_CACHE}/scan_ocr.sh"         "${KFX_REMOTE_REFRESH_SCAN_OCR:-n}"
+  fi
+elif [[ "${KFX_QUEUE_ONLY:-n}" != n || "${KFX_PHONE_QUEUE_ENABLED:-n}" != y ]]; then
+  die "Die Kombi-Installation benötigt die Fax-Vollinstallation mit aktivierter Praxisqueue."
 fi
 
 sep "Module ausführen (feste Reihenfolge)"
@@ -3108,11 +3171,11 @@ run_module "${MOD_DIR}/10-packages.sh"
 if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]]; then
   run_module "${MOD_DIR}/20-dirs-acl.sh"
   run_module "${MOD_DIR}/30-admin-user.sh"
-  run_module "${MOD_DIR}/40-web-ssl.sh"
+  run_module "${MOD_DIR}/40-web-ssl.sh" "$package_root"
   run_module "${MOD_DIR}/50-cups-samba.sh"
 
-  sep "Remote Scan-OCR installieren"
-  run_remote_script "${MOD_CACHE}/scan_ocr.sh"
+  sep "Scan-OCR installieren"
+  run_project_script "${project_module_dir}/scan_ocr.sh"
 else
   log "[OK] Queue-only: Faxverzeichnisse, Admin/Samba, Web, CUPS und OCR uebersprungen."
 fi
@@ -3207,31 +3270,31 @@ if [[ "${KFX_QUEUE_ONLY:-n}" == "y" ]]; then
   log "[INFO] Queue-only: PJSIP, Dialplan und Queue werden jetzt aus ${ENVFILE} neu erzeugt."
 fi
 
-sep "Remote Provider-PJSIP (befüllt pjsip.conf)"
-run_remote_script "${MOD_CACHE}/pjsip-provider.sh"
+sep "Provider-PJSIP (befüllt pjsip.conf)"
+run_project_script "${project_module_dir}/pjsip-provider.sh"
 asterisk_rx "pjsip reload"
 
-sep "Remote Dialplan (befüllt extensions.conf)"
-run_remote_script "${MOD_CACHE}/extensions.sh"
+sep "Dialplan (befüllt extensions.conf)"
+run_project_script "${project_module_dir}/extensions.sh"
 asterisk_rx "dialplan reload"
 
-sep "Remote Telefoniewarteschlange installieren/aktualisieren"
-run_remote_script "${MOD_CACHE}/telefonie-queue.sh"
+sep "Telefoniewarteschlange installieren/aktualisieren"
+run_project_script "${project_module_dir}/telefonie-queue.sh"
 
 if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]]; then
-  sep "Remote AGI installieren"
-  run_remote_script "${MOD_CACHE}/agi.sh"
+  sep "AGI installieren"
+  run_project_script "${project_module_dir}/agi.sh"
 
-  sep "Remote Worker installieren (nur Datei/Code)"
-  run_remote_script "${MOD_CACHE}/worker.sh"
+  sep "Worker installieren (nur Datei/Code)"
+  run_project_script "${project_module_dir}/worker.sh"
 
   sep "Worker: /etc/default + systemd Unit (EnvironmentFile)"
   run_module "${MOD_DIR}/90-worker-unit.sh"
   KFX_RESTART_WORKER_ON_EXIT="n"
   trap - EXIT
 
-  sep "Remote pdf_with_header.sh installieren"
-  run_remote_script "${MOD_CACHE}/pdf_with_header.sh"
+  sep "pdf_with_header.sh installieren"
+  run_project_script "${project_module_dir}/pdf_with_header.sh"
 
   sep "Installationsbericht"
   run_module "${MOD_DIR}/95-install-report.sh"
@@ -3315,10 +3378,14 @@ if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]]; then
 else
   echo "Konfiguration und Passwoerter: /etc/kienzlefax-installer.env (0600)"
 fi
-echo "Remote module cache: ${MOD_CACHE}"
+echo "Modulquelle: ${project_module_dir}"
 
 if [[ "${KFX_RUN_WIREGUARD_INSTALLER:-n}" == "y" ]]; then
   sep "Optionaler Folgeinstaller: WireGuard-Telefonie"
   echo "[INFO] Die Hauptinstallation ist abgeschlossen. Jetzt startet der separate interaktive WireGuard-Installer."
-  run_remote_script "${MOD_CACHE}/wireguard-installer.sh"
+  run_project_script "${project_module_dir}/wireguard-installer.sh"
+fi
+
+if [[ -n "$package_root" ]]; then
+  verify_kombi_telephony
 fi
