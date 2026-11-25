@@ -486,7 +486,8 @@ echo "$*" >> "$TEST_BLOCKED"; exit 90''')
             if provider == "fonial":
                 return ["Plusnet", role, number, secret, secret, "", "", "", "420",
                         f"sip:client-{role}@other.invalid", "from-" + role]
-            return ["6", role, number, secret, secret, "custom.invalid" if role == "out" else "",
+            voip2gsm_choice = {"fax": "6", "phone": "voip2gsm", "out": "v2g"}[role]
+            return [voip2gsm_choice, role, number, secret, secret, "custom.invalid" if role == "out" else "",
                     "", "-" if role == "out" else "", ""]
 
         fax = inputs(fax_provider, "fax", fax_did)

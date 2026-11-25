@@ -2,9 +2,17 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.4.1-test.3
-# Stand:   2026-11-19
+# Version: 3.5.0
+# Stand:   2026-11-25
 # Autor:   Dr. Thomas Kienzle
+#
+# NEU in 3.5.0:
+# - voip2gsm (6, voip2gsm oder v2g) und Fonial/Plusnet (7) sind je Fax- und
+#   Telefonieleitung wählbar. Der Registrar von voip2gsm bleibt frei wählbar.
+# - Das Installationspaket enthält die Projektmodule. Der Einzelstart bietet
+#   Vollinstallation und Queue-only an. Der Universalinstaller kann die Rollen
+#   fax, fon oder fax-fon übergeben. --kombi bleibt als Kurzform für fax-fon verfügbar.
+# - Bei jedem Asterisk-Neubau werden res_fax und res_fax_spandsp mitgebaut.
 #
 # Modularer Installer (alles gehört dazu; Provider per Template-Auswahl).
 # - Fragt interaktiv:
@@ -118,7 +126,7 @@
 # NEU in 3.3.8:
 # - Anzahl Faxdrucker wird abgefragt (1-100, Default 5) und CUPS/Backend/sources.json folgen dynamisch.
 # - PDF-zu-Fax-Eingaenge werden abgefragt; Default bleibt ein unnummerierter Share `pdf-zu-fax`.
-# - Provider-Auswahl am Anfang: 1und1, 1und1-TLS, Telekom, sipgate oder manuell; Provider-Template schreibt pjsip.conf.
+# - Provider-Auswahl am Anfang: 1und1, 1und1-TLS, Telekom, sipgate, voip2gsm oder manuell; Provider-Template schreibt pjsip.conf.
 # - sources.json wird unter /srv/kienzlefax/config/sources.json erzeugt.
 # - SSH authorized_keys werden neben admin auch nach /root/.ssh/authorized_keys uebernommen.
 #
@@ -628,7 +636,7 @@ normalize_provider(){
     5|1und1-tls|1und1tls|und1tls|ionostls|11-tls|11tls) echo "1und1-tls";;
     2|telekom|deutschetelekom|tkom|t-online|tonline) echo "telekom";;
     3|sipgate) echo "sipgate";;
-    6|voip2gsm) echo "voip2gsm";;
+    6|voip2gsm|v2g) echo "voip2gsm";;
     7|fonial|plusnet|fonialplusnet) echo "fonial";;
     4|manual|manuell|manuellkonfiguration) echo "manual";;
     *) echo "";;
@@ -641,7 +649,7 @@ provider_label(){
     1und1-tls) echo "1&1 Deutschland (TLS)";;
     telekom) echo "Deutsche Telekom";;
     sipgate) echo "sipgate";;
-    voip2gsm) echo "VOIP2GSM";;
+    voip2gsm) echo "voip2gsm";;
     fonial) echo "Fonial / Plusnet";;
     manual) echo "Manuelle Konfiguration";;
     *) echo "${1:-unbekannt}";;
@@ -719,7 +727,7 @@ collect_provider_config(){
   echo "  3 = sipgate (Template; Felder bitte pruefen)"
   echo "  4 = manuell (Provider-Trunk wird nicht automatisch geschrieben)"
   echo "  5 = 1&1 Deutschland ueber TLS 1.2 und SDES-SRTP"
-  echo "  6 = VOIP2GSM (Registrar aus dem Kundencenter)"
+  echo "  6 = voip2gsm (v2g; Registrar aus dem Kundencenter, z. B. a.vsip.eu oder b.vsip.eu)"
   echo "  7 = Fonial / Plusnet"
   while true; do
     ask_default provider_in "Provider fuer ${description}" "${previous:-1und1}"

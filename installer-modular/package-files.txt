@@ -1,3 +1,4 @@
+LICENSE
 kienzlefax-installer.sh
 installer-modular/kienzlefax-install-modular.sh
 installer-modular/package-files.txt

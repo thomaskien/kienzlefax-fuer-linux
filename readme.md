@@ -2,7 +2,9 @@
 
 **Faxserver und optionale Asterisk-Telefoniewarteschlange für Arztpraxen und andere kleine Einrichtungen**
 
-**Installerstand:** 3.4.0 · **Lokales Testpaket:** 3.4.1-test.3 · **Zielsystem:** Debian Linux · **Telefonie:** Asterisk/PJSIP
+**Installerstand:** 3.5.0 · **Zielsystem:** Debian Linux · **Telefonie:** Asterisk/PJSIP
+
+[Installationspaket für KienzleFax 3.5.0 herunterladen](https://github.com/thomaskien/kienzlefax-fuer-linux/releases/download/v3.5.0/kienzlefax-3.5.0.tar.gz)
 
 https://www.kienzlefax.de
 
@@ -51,7 +53,7 @@ und Identify löscht `-` die Vorgabe. Beim ersten regulären Update auf diese Vo
   `outbound_proxy=sip:sbc.sip.plusnet.de\;lr`. Für die gemeinsame DID-Verteilung
   setzt der Installer die Zielnummer der Leitung als `contact_user`.
   [Vereinbarte Fonial-Vorlage](docs/provider/pjsip-fonial.conf.example)
-- **voip2gsm (6)** verwendet den im Kundencenter zugewiesenen Registrar, Vorgabe
+- **voip2gsm (6, auch `v2g`)** verwendet den im Kundencenter zugewiesenen Registrar, Vorgabe
   `b.vsip.eu`. Fax- und Telefoniekonto erhalten eigene Endpunkte. Eingehend
   führen `+49…` und `49…` auf dieselbe konfigurierte DID. Ausgehend wird ein
   deutsches Ziel über diesen Provider als `0…` gewählt. Bei
@@ -75,11 +77,11 @@ Dateien direkt aus dem Arbeitsverzeichnis und erfasst damit auch uncommittete un
 noch ungetrackte Änderungen.
 
 Auf dem Debian-Zielsystem in ein leeres Verzeichnis entpacken und den Installer
-als `root` starten. Beispiel für das versionierte Testpaket:
+als `root` starten. Für das Installationspaket 3.5.0 gilt folgender Aufruf.
 
 ```bash
 mkdir -p /opt/kombi
-tar -xzf /absoluter/pfad/kienzlefax-3.4.1-test.3.tar.gz -C /opt/kombi
+tar -xzf /absoluter/pfad/kienzlefax-3.5.0.tar.gz -C /opt/kombi
 bash /opt/kombi/kienzlefax/kienzlefax-installer.sh
 ```
 
