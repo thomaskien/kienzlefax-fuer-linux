@@ -2,7 +2,7 @@
 
 **Faxserver und optionale Asterisk-Telefoniewarteschlange für Arztpraxen und andere kleine Einrichtungen**
 
-**Installerstand:** 3.4.0 · **Zielsystem:** Debian Linux · **Telefonie:** Asterisk/PJSIP
+**Installerstand:** 3.4.0 · **Lokales Testpaket:** 3.4.1-test.3 · **Zielsystem:** Debian Linux · **Telefonie:** Asterisk/PJSIP
 
 https://www.kienzlefax.de
 
@@ -61,7 +61,7 @@ und Identify löscht `-` die Vorgabe. Beim ersten regulären Update auf diese Vo
   und übernimmt für `voip2gsm` das Zielformat `national` als Vorgabe.
   [voip2gsm-Vorlage](docs/provider/pjsip-voip2gsm.conf.example)
 
-### Lokales Paket für den Kombi-Installer
+### Lokales Paket mit Menüwahl oder Kombi-Installation
 
 Im Kienzlefax-Arbeitsverzeichnis auf macOS oder Linux packen.
 
@@ -74,18 +74,45 @@ Für eine neue Programmdatei den relativen Pfad ergänzen. Der Packbefehl liest 
 Dateien direkt aus dem Arbeitsverzeichnis und erfasst damit auch uncommittete und
 noch ungetrackte Änderungen.
 
-Auf dem Debian-Zielsystem in ein leeres Verzeichnis entpacken und den Hauptinstaller
-als `root` starten. Hier ist `/opt/kombi` das Entpackverzeichnis.
+Auf dem Debian-Zielsystem in ein leeres Verzeichnis entpacken und den Installer
+als `root` starten. Beispiel für das versionierte Testpaket:
 
 ```bash
 mkdir -p /opt/kombi
-tar -xzf /absoluter/pfad/kienzlefax.tar.gz -C /opt/kombi
-bash /opt/kombi/kienzlefax/installer-modular/kienzlefax-install-modular.sh --kombi
+tar -xzf /absoluter/pfad/kienzlefax-3.4.1-test.3.tar.gz -C /opt/kombi
+bash /opt/kombi/kienzlefax/kienzlefax-installer.sh
 ```
 
-Der Aufruf funktioniert aus jedem Arbeitsverzeichnis. Aus dem entpackten Ordner
-`kienzlefax/` genügt `bash installer-modular/kienzlefax-install-modular.sh --kombi`.
-Dieser Modus installiert den vollständigen Faxworkflow und richtet die Praxisqueue
+Beim Einzelstart erscheint zuerst die Betriebsartwahl. `1` wählt **Vollständiges
+Kienzlefax**, `2` wählt **Nur Telefoniewarteschlange**. Enter übernimmt die
+gespeicherte Betriebsart, auf einem neuen System die Vollinstallation. Bei der
+Vollinstallation ist die Praxisqueue separat wählbar. Beide Betriebsarten verwenden
+die mitgelieferten Projektmodule. Ein Asterisk-Neubau baut in beiden Fällen die
+Faxmodule `res_fax` und `res_fax_spandsp`.
+
+Universalinstaller 1.7 übergibt die bestätigten Rollen direkt an den Hauptinstaller.
+
+| Rollen auf diesem Server | Aufrufoption | Installation |
+|---|---|---|
+| Fax | `--rollenplan fax` | Vollständiges Kienzlefax, Praxisqueue aus |
+| Fon | `--rollenplan fon` | Nur Telefoniewarteschlange mit Praxisqueue |
+| Fax und Fon | `--rollenplan fax-fon` | Vollständiges Kienzlefax mit Praxisqueue |
+
+Der Rollenplan gilt auch bei vorhandener Grundkonfiguration. Das gemeinsame
+Testarchiv enthält Universalinstaller 1.7 und die drei zugehörigen Modulpakete.
+Im Verzeichnis mit dem Archiv einen neuen Lauf starten.
+
+```bash
+tar -xzf kienzle-universal-1.7-test.1.tar.gz
+sudo bash kienzle-universal-1.7-test.1/kienzle-installieren.sh
+```
+
+Unterbrochene Läufe verwenden ihre gespeicherten Archivkopien. Version 1.6
+übergibt keine Rollen und erfordert noch die manuelle Wahl im Fax-Menü.
+
+Für einen direkten Aufruf mit fest vorgegebener Vollinstallation und Praxisqueue lautet der Befehl
+`bash /opt/kombi/kienzlefax/installer-modular/kienzlefax-install-modular.sh --kombi`.
+Er installiert den vollständigen Faxworkflow und richtet die Praxisqueue
 für Kienzlefon ein. Fehlen Telefoniedaten, fragt der Installer sie ab. Bei einer
 bisherigen Queue-only-Konfiguration erfasst er auch die Fax-Grunddaten.
 
@@ -116,7 +143,7 @@ Samba, OCR, Worker und optionaler Telefoniewarteschlange.
 
 Setzt `KFX_QUEUE_ONLY=y` und installiert ausschließlich:
 
-- Asterisk/PJSIP und RTP
+- Asterisk/PJSIP und RTP. Bei einem Neubau werden auch die Faxmodule `res_fax` und `res_fax_spandsp` mitgebaut. Bei einer bestehenden Installation die Rebuild-Frage mit `y` beantworten, um die Module nachzurüsten.
 - lokale SIP-Nebenstellen, standardmäßig ab `201`
 - die Telefoniewarteschlange und ihre Kanalbegrenzungen
 - deutsche Positionsansagen

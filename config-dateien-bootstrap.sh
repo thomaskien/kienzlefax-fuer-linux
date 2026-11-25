@@ -457,8 +457,6 @@ echo
 echo "Nächste Schritte:"
 echo " - Nummern/Secrets oben final eintragen (oder per ENV/Secrets-Management)"
 echo " - Danach immer: systemctl restart asterisk"
-EOF
-)"
 
 # write_file nutzt Perl placeholder; wir müssen das Script selbst schreiben -> einfacher:
 # (wir haben oben write_file genutzt – hier am Ende ist nur Ausgabe)

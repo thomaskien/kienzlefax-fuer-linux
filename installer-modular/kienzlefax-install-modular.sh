@@ -2,8 +2,8 @@
 # ==============================================================================
 # kienzlefax-install-modular.sh
 #
-# Version: 3.4.0
-# Stand:   2026-07-19
+# Version: 3.4.1-test.3
+# Stand:   2026-11-19
 # Autor:   Dr. Thomas Kienzle
 #
 # Modularer Installer (alles gehört dazu; Provider per Template-Auswahl).
@@ -211,7 +211,15 @@
 # - Eine gewaehlte WireGuard-Bindung wird dauerhaft in der Installer-ENV gespeichert;
 #   Asterisk wird nur ohne aktive Kanaele kontrolliert neu gestartet und danach geprueft.
 #
-# Unveröffentlicht:
+# 3.4.1-test.3 (unveröffentlicht):
+# - --rollenplan fax|fon|fax-fon übernimmt die Auswahl des Universalinstallers.
+# - Der Einzelstart zeigt beide Betriebsarten direkt an, auch bei vorhandener ENV.
+#
+# 3.4.1-test.2 (unveröffentlicht):
+# - Jeder Asterisk-Neubau enthält res_fax und res_fax_spandsp, auch bei Queue-only.
+#
+# 3.4.1-test.1 (unveröffentlicht):
+# - Der normale Start im Paket bietet die Betriebsartwahl und verwendet die mitgelieferten Dateien.
 # - --kombi installiert Fax und Praxisqueue aus einem vollständigen lokalen Paket.
 #   Modulcache und GitHub-Updates werden dabei übersprungen.
 # - Fonial/Plusnet und voip2gsm fuer Fax und Telefonie. Vorhandene SIP-Daten
@@ -518,6 +526,8 @@ bootstrap_local_modules(){
 set -euo pipefail
 readonly package_root="${1:-}"
 readonly package_wireguard="${2:-n}"
+readonly plan_queue_only="${3:-}"
+readonly plan_phone_queue="${4:-}"
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "[$(date -Is)] $*"; }
@@ -865,9 +875,8 @@ collect_phone_options(){
     PHONE_QUEUE_ENABLED="y"
     PROVIDER_FAX_LIMIT="0"
     echo "[INFO] Queue-only: Telefoniewarteschlange wird verbindlich installiert."
-  elif [[ -n "$package_root" ]]; then
-    PHONE_QUEUE_ENABLED="y"
-    echo "[INFO] Kombi-Installation: Die Praxisqueue wird für Kienzlefon eingerichtet."
+  elif [[ -n "$plan_phone_queue" ]]; then
+    PHONE_QUEUE_ENABLED="$plan_phone_queue"
   else
     ask_yes_no PHONE_QUEUE_ENABLED "Warteschlange fuer Telefonie erstellen?" "${KFX_PHONE_QUEUE_ENABLED:-n}"
   fi
@@ -1151,7 +1160,7 @@ collect_run_options(){
   ask_file_refresh REMOTE_REFRESH_PJSIP_PROVIDER "${cache_dir}/pjsip-provider.sh" "Remote-Datei pjsip-provider.sh holen/aktualisieren?"
   ask_file_refresh REMOTE_REFRESH_TELEFONIE_QUEUE "${cache_dir}/telefonie-queue.sh" "Remote-Datei telefonie-queue.sh holen/aktualisieren?"
   phone_enabled="${PHONE_QUEUE_ENABLED:-${KFX_PHONE_QUEUE_ENABLED:-n}}"
-  if [[ -n "$package_root" ]]; then
+  if [[ "$plan_phone_queue" == y ]]; then
     RUN_WIREGUARD_INSTALLER="$package_wireguard"
     REMOTE_REFRESH_WIREGUARD_INSTALLER="n"
   elif [[ "$phone_enabled" == "y" ]]; then
@@ -1259,28 +1268,44 @@ if [[ -f "$ENVFILE" ]]; then
   # erneuten Grundkonfiguration beibehalten werden koennen.
   # shellcheck disable=SC1090
   source "$ENVFILE"
-  ask_yes_no RESET_OPTS "Vorhandene Optionen gefunden (${ENVFILE}). Neu setzen?" "n"
-else
-  RESET_OPTS="y"
 fi
 
-if [[ "$RESET_OPTS" == "n" && -n "$package_root" && "${KFX_QUEUE_ONLY:-n}" == "y" ]]; then
-  log "[INFO] Die gespeicherte Queue-only-Konfiguration enthält keine Faxbasis. Die Kombi-Vollinstallation benötigt auch die Faxdaten."
-  RESET_OPTS="y"
+if [[ -n "$plan_queue_only" ]]; then
+  QUEUE_ONLY="$plan_queue_only"
+else
+  echo "Betriebsart wählen"
+  echo "  1  Vollständiges Kienzlefax"
+  echo "  2  Nur Telefoniewarteschlange"
+  mode_default=1
+  if [[ "${KFX_QUEUE_ONLY:-n}" == y ]]; then mode_default=2; fi
+  while true; do
+    ask_default mode_choice "Betriebsart (1 oder 2)" "$mode_default"
+    case "$mode_choice" in
+      1) QUEUE_ONLY=n; break ;;
+      2) QUEUE_ONLY=y; break ;;
+      *) echo "Bitte 1 oder 2 wählen." ;;
+    esac
+  done
 fi
+
+if [[ "$QUEUE_ONLY" == y ]]; then
+  echo "[OK] Betriebsart: Nur Telefoniewarteschlange."
+  echo "[INFO] Vorhandene Faxkomponenten bleiben installiert."
+else
+  echo "[OK] Betriebsart: Vollständiges Kienzlefax."
+fi
+
+RESET_OPTS=y
+if [[ -f "$ENVFILE" ]]; then
+  ask_yes_no RESET_OPTS "Vorhandene Optionen gefunden (${ENVFILE}). Neu setzen?" "n"
+  if [[ "$RESET_OPTS" == n && "${KFX_QUEUE_ONLY:-n}" != "$QUEUE_ONLY" ]]; then
+    log "[INFO] Die Betriebsart wechselt. Die Grunddaten der gewählten Betriebsart werden erfasst."
+    RESET_OPTS=y
+  fi
+fi
+KFX_QUEUE_ONLY="$QUEUE_ONLY"
 
 if [[ "$RESET_OPTS" == "n" ]]; then
-  if [[ -z "${KFX_QUEUE_ONLY+x}" ]]; then
-    if [[ -n "$package_root" ]]; then
-      KFX_QUEUE_ONLY="n"
-    else
-      ask_yes_no KFX_QUEUE_ONLY "Nur Telefoniewarteschlange installieren (ohne Faxfunktionen)?" "n"
-    fi
-    upsert_env_line KFX_QUEUE_ONLY "$KFX_QUEUE_ONLY"
-    if [[ "$KFX_QUEUE_ONLY" == "y" ]]; then
-      log "[WARN] Queue-only entfernt keine bereits vorhandenen Faxkomponenten; es installiert/aktualisiert sie lediglich nicht."
-    fi
-  fi
   if [[ "${KFX_QUEUE_ONLY:-n}" != "y" && ( -z "${KFX_ADMIN_PASSWORD:-}" || -z "${KFX_PROVIDER:-}" || -z "${KFX_SIP_USER:-}" || -z "${KFX_FAX_PRINTER_COUNT:-}" || -z "${KFX_PDF_INPUT_COUNT:-}" ) ]]; then
     log "[INFO] Vorhandene Optionen sind aelter als 3.3.8; Eingaben werden neu gesammelt."
     RESET_OPTS="y"
@@ -1289,18 +1314,31 @@ if [[ "$RESET_OPTS" == "n" ]]; then
     RESET_OPTS="y"
   else
     log "[OK] Verwende vorhandene Grundkonfiguration aus ${ENVFILE}"
-    if [[ -n "$package_root" && ( "${KFX_PHONE_QUEUE_ENABLED:-n}" != "y" || -z "${KFX_PHONE_IN_SIP_USER:-}" ) ]] ||
+    # Rollenwahl und zugehörige Optionen gemeinsam veröffentlichen.
+    env_tmp="$(mktemp "${ENVFILE}.XXXXXX")"
+    trap 'rm -f -- "$env_tmp"' EXIT
+    cat "$ENVFILE" > "$env_tmp"
+    upsert_env_line KFX_QUEUE_ONLY "$QUEUE_ONLY" "$env_tmp"
+    if [[ "$plan_phone_queue" == n && "${KFX_PHONE_QUEUE_ENABLED:-n}" == y ]]; then
+      # Gespeicherte Telefoniezugänge für eine spätere Reaktivierung erhalten.
+      upsert_env_line KFX_PHONE_QUEUE_ENABLED n "$env_tmp"
+      KFX_PHONE_QUEUE_ENABLED=n
+    fi
+    if [[ ( "$plan_phone_queue" == y || "$QUEUE_ONLY" == y ) && ( "${KFX_PHONE_QUEUE_ENABLED:-n}" != y || -z "${KFX_PHONE_IN_SIP_USER:-}" ) ]] ||
        [[ -z "${KFX_PHONE_QUEUE_ENABLED+x}" || -z "${KFX_PHONE_REMOTE_ACCESS_ENABLED+x}" || -z "${KFX_PHONE_ALLOWED_CIDR+x}" || -z "${KFX_PROVIDER_CHANNEL_LIMIT+x}" || -z "${KFX_PROVIDER_PHONE_LIMIT+x}" || -z "${KFX_PROVIDER_FAX_LIMIT+x}" || -z "${KFX_QUEUE_MAX_WAITING+x}" || -z "${KFX_PHONE_OUT_COUNTS_PROVIDER_LIMIT+x}" || -z "${KFX_SIPGATE_OVERFLOW_ENABLED+x}" ]]; then
       sep "Neue Grundoptionen: Telefoniewarteschlange und Kanalgrenzen"
       collect_phone_options
-      write_phone_options_to_env "$ENVFILE"
+      write_phone_options_to_env "$env_tmp"
       # shellcheck disable=SC1090
-      source "$ENVFILE"
-      log "[OK] Telefonie-Grundoptionen in ${ENVFILE} ergaenzt."
+      source "$env_tmp"
+      log "[OK] Telefonie-Grundoptionen ergänzt."
     fi
     sep "Laufoptionen fuer diese Installation"
     collect_run_options
-    write_run_options_to_env
+    ENVFILE="$env_tmp" write_run_options_to_env
+    bash -n "$env_tmp"
+    mv -f -- "$env_tmp" "$ENVFILE"
+    trap - EXIT
     log "[OK] Laufoptionen aktualisiert in ${ENVFILE}"
     exit 0
   fi
@@ -1315,17 +1353,6 @@ if grep -qE '^\s*127\.0\.1\.1\s+' /etc/hosts; then
   sed -i -E "s/^\s*127\.0\.1\.1\s+.*/127.0.1.1\t${KFX_HOSTNAME}/" /etc/hosts
 else
   echo -e "127.0.1.1\t${KFX_HOSTNAME}" >> /etc/hosts
-fi
-
-if [[ -n "$package_root" ]]; then
-  QUEUE_ONLY="n"
-else
-  ask_yes_no QUEUE_ONLY "Nur Telefoniewarteschlange installieren (ohne Fax, Faxdrucker, OCR, Web und Samba)?" "${KFX_QUEUE_ONLY:-n}"
-fi
-KFX_QUEUE_ONLY="$QUEUE_ONLY"
-if [[ "$QUEUE_ONLY" == "y" ]]; then
-  echo "[OK] Installationsmodus: nur Telefoniewarteschlange."
-  echo "[INFO] Es werden keine vorhandenen Faxkomponenten entfernt."
 fi
 
 if [[ "$QUEUE_ONLY" != "y" ]]; then
@@ -1535,6 +1562,7 @@ COMMON_PACKAGES=(
   build-essential git pkg-config autoconf automake libtool
   libxml2-dev "$NCURSES_DEV_PACKAGE" libedit-dev uuid-dev
   libssl-dev libsqlite3-dev libsrtp2-dev libjansson-dev
+  libtiff-dev libspandsp-dev
 )
 FAX_PACKAGES=(
   acl apache2 libapache2-mod-php
@@ -1545,7 +1573,6 @@ FAX_PACKAGES=(
   cups cups-client avahi-daemon avahi-utils
   samba smbclient sudo
   python3-venv python3-pip python3-reportlab sox lame
-  libtiff-dev libspandsp-dev
 )
 if [[ "${KFX_QUEUE_ONLY:-n}" == "y" ]]; then
   apt-get install -y --no-install-recommends "${COMMON_PACKAGES[@]}"
@@ -1874,7 +1901,7 @@ KFXPHP="${WEBROOT}/kienzlefax.php"
 if [[ -n "$package_root" ]]; then
   install -m 0644 "$package_root/kienzlefax.php" "$KFXPHP"
   install -m 0644 "$package_root/faxton.mp3" "$WEBROOT/faxton.mp3"
-  log "[OK] kienzlefax.php und faxton.mp3 aus dem Kombi-Paket installiert."
+  log "[OK] kienzlefax.php und faxton.mp3 aus dem lokalen Paket installiert."
 else
   DO_PHP="${KFX_WEB_REFRESH:-y}"
   [[ -s "$KFXPHP" ]] || DO_PHP="y"
@@ -2387,16 +2414,14 @@ make_asterisk_with_retry(){
   make -j1
 }
 
+FAX_MODULES=(res_fax res_fax_spandsp)
 configure_asterisk_modules(){
   local ms="./menuselect/menuselect"
-  local failed=0
-  local required_modules=()
+  local failed=0 mod
+  local required_modules=("${FAX_MODULES[@]}")
   make menuselect.makeopts
   [[ -x "$ms" ]] || die "menuselect CLI fehlt: $ms"
 
-  if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]]; then
-    required_modules+=(res_fax res_fax_spandsp)
-  fi
   if [[ "${KFX_PHONE_QUEUE_ENABLED:-n}" == "y" ]]; then
     required_modules+=(app_queue res_musiconhold)
   fi
@@ -2408,13 +2433,11 @@ configure_asterisk_modules(){
     fi
   done
 
-  if [[ "${KFX_QUEUE_ONLY:-n}" != "y" ]]; then
-    for mod in app_fax format_tiff; do
-      if ! "$ms" --enable "$mod" menuselect.makeopts; then
-        log "[INFO] Asterisk-Option ist in diesem Source-Tree nicht vorhanden oder nicht separat waehlbar: $mod"
-      fi
-    done
-  fi
+  for mod in app_fax format_tiff; do
+    if ! "$ms" --enable "$mod" menuselect.makeopts; then
+      log "[INFO] Asterisk-Option ist in diesem Source-Tree nicht vorhanden oder nicht separat waehlbar: $mod"
+    fi
+  done
 
   if ! "$ms" --check-deps menuselect.makeopts; then
     log "[WARN] Asterisk-menuselect meldet fehlende Abhaengigkeiten."
@@ -2425,6 +2448,9 @@ configure_asterisk_modules(){
     echo
     echo "Manuelle Asterisk-Modulpruefung. Beenden/Speichern im Menue mit X."
     make menuselect
+    for mod in "${required_modules[@]}"; do
+      "$ms" --enable "$mod" menuselect.makeopts || die "Asterisk-Pflichtmodul fehlt nach der Menüauswahl: $mod"
+    done
     "$ms" --check-deps menuselect.makeopts
     failed=0
   fi
@@ -2442,11 +2468,7 @@ source "$ENVFILE"
 ASTERISK_SRC_DIR="/usr/src/asterisk"
 ASTERISK_GIT_URL="https://github.com/asterisk/asterisk.git"
 
-if [[ "${KFX_QUEUE_ONLY:-n}" == "y" ]]; then
-  sep "Asterisk: Source holen + Build (Telefonie/Queue)"
-else
-  sep "Asterisk: Source holen + Build (Fax-Module nichtinteraktiv)"
-fi
+sep "Asterisk: Source holen + Build mit Faxunterstützung"
 mkdir -p "$(dirname "$ASTERISK_SRC_DIR")"
 if [[ ! -d "$ASTERISK_SRC_DIR/.git" ]]; then
   rm -rf "$ASTERISK_SRC_DIR"
@@ -2464,6 +2486,9 @@ configure_asterisk_modules
 
 BUILD_JOBS="$(asterisk_build_jobs)"
 make_asterisk_with_retry "$BUILD_JOBS"
+for mod in "${FAX_MODULES[@]}"; do
+  [[ -s "res/$mod.so" ]] || die "Asterisk-Neubau unvollständig: ${ASTERISK_SRC_DIR}/res/$mod.so fehlt."
+done
 make install
 make samples || true
 if command -v timeout >/dev/null 2>&1; then
@@ -3134,21 +3159,35 @@ EOF
 # ------------------------------------------------------------------------------
 package_root=""
 project_module_dir="$MOD_CACHE"
+plan_queue_only=""
+plan_phone_queue=""
 if (( $# )); then
-  if [[ $# != 1 || "$1" != "--kombi" ]]; then
-    die "Aufruf: bash ${0##*/} [--kombi]"
+  if [[ $# == 1 && "$1" == --kombi ]]; then
+    set -- --rollenplan fax-fon
   fi
-  installer_path="$(readlink -f -- "${BASH_SOURCE[0]}")" || die "Installerpfad nicht auflösbar: ${BASH_SOURCE[0]}"
-  package_root="$(dirname -- "$(dirname -- "$installer_path")")"
+  [[ $# == 2 && "$1" == --rollenplan ]] || die "Aufruf: bash ${0##*/} [--kombi | --rollenplan fax|fon|fax-fon]"
+  case "$2" in
+    fax)     plan_queue_only=n; plan_phone_queue=n ;;
+    fon)     plan_queue_only=y; plan_phone_queue=y ;;
+    fax-fon) plan_queue_only=n; plan_phone_queue=y ;;
+    *) die "Unbekannter Rollenplan: $2 (erlaubt: fax, fon, fax-fon)" ;;
+  esac
+  log "[INFO] Übernommener Rollenplan: $2"
+fi
+installer_path="$(readlink -f -- "${BASH_SOURCE[0]}")" || die "Installerpfad nicht auflösbar: ${BASH_SOURCE[0]}"
+installer_dir="${installer_path%/*}"
+if [[ -n "$plan_queue_only" || "${installer_dir##*/}" == installer-modular ]]; then
+  package_root="$(dirname -- "$installer_dir")"
   project_module_dir="$package_root/installer-modular"
   check_package "$package_root"
   cd -- "$package_root"
-  log "[INFO] Kombi-Vollinstallation mit Praxisqueue aus $package_root"
+  log "[INFO] Lokaler Paketstand: $package_root"
 fi
-readonly package_root project_module_dir
+readonly plan_queue_only plan_phone_queue package_root project_module_dir
 require_root
 package_wireguard=n
-if [[ -n "$package_root" ]]; then
+if [[ "$plan_phone_queue" == y ]]; then
+  log "[INFO] Die Praxisqueue wird für Kienzlefon eingerichtet."
   ask_yes_no package_wireguard "WireGuard-Telefonie-Installer nach Abschluss separat ausführen?" "n"
   if [[ "$package_wireguard" == "y" ]]; then
     require_package_file "$project_module_dir/wireguard-installer.sh"
@@ -3160,7 +3199,7 @@ sep "Bootstrap lokale Module"
 bootstrap_local_modules
 
 sep "Optionen sammeln"
-run_module "${MOD_DIR}/00-base.sh" "$package_root" "$package_wireguard"
+run_module "${MOD_DIR}/00-base.sh" "$package_root" "$package_wireguard" "$plan_queue_only" "$plan_phone_queue"
 
 # Load ENV early so the remaining installation can run without further prompts.
 # shellcheck disable=SC1090
@@ -3188,8 +3227,10 @@ if [[ -z "$package_root" ]]; then
           die "Modulcache: $module unterstuetzt diesen Providerstand nicht. Installer erneut starten und diese Datei aktualisieren."
       done ;;
   esac
-elif [[ "${KFX_QUEUE_ONLY:-n}" != n || "${KFX_PHONE_QUEUE_ENABLED:-n}" != y ]]; then
-  die "Die Kombi-Installation benötigt die Fax-Vollinstallation mit aktivierter Praxisqueue."
+elif [[ -n "$plan_queue_only" && ( "${KFX_QUEUE_ONLY:-}" != "$plan_queue_only" || "${KFX_PHONE_QUEUE_ENABLED:-}" != "$plan_phone_queue" ) ]]; then
+  die "Die gespeicherte Betriebsart oder Praxisqueue weicht vom übergebenen Rollenplan ab."
+elif [[ "${KFX_RUN_WIREGUARD_INSTALLER:-n}" == y ]]; then
+  require_package_file "$project_module_dir/wireguard-installer.sh"
 fi
 
 sep "Module ausführen (feste Reihenfolge)"
@@ -3412,6 +3453,6 @@ if [[ "${KFX_RUN_WIREGUARD_INSTALLER:-n}" == "y" ]]; then
   run_project_script "${project_module_dir}/wireguard-installer.sh"
 fi
 
-if [[ -n "$package_root" ]]; then
+if [[ "$plan_phone_queue" == y ]]; then
   verify_kombi_telephony
 fi

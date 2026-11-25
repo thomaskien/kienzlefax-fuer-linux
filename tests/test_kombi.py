@@ -16,7 +16,7 @@ MANIFEST = MOD / "package-files.txt"
 PACK = Path("scripts/pack.sh")
 
 # Debian-Zielpfade für den isolierten Lauf in eine Wegwerfkopie umleiten.
-HOST_PATHS = ("/etc/", "/usr/local/", "/usr/share/", "/var/lib/", "/var/www/",
+HOST_PATHS = ("/etc/", "/usr/local/", "/usr/share/", "/usr/src/", "/var/lib/", "/var/www/",
               "/var/spool/", "/srv/")
 PHONE_ANSWERS = [
     "", "", "", "", "1",           # Kanalgrenzen, ein Empfangstelefon
@@ -52,6 +52,7 @@ class KombiTests(unittest.TestCase):
         self.trace = self.tmp / "executed"
         self.blocked = self.tmp / "downloads"
         self.envfile = self.host / "etc/kienzlefax-installer.env"
+        self.standalone = self.cwd / MAIN.name
         self.web = self.host / "var/www/html"
         self.cache = self.host / "usr/local/lib/kienzlefax-installer/cache"
         self.bin = self.tmp / "bin"
@@ -87,14 +88,17 @@ class KombiTests(unittest.TestCase):
 
     def pack(self):
         self.shell(self.work / PACK, "--output", self.archive)
+        self.unpack(self.archive)
+
+    def unpack(self, package_archive):
         expected = (self.work / MANIFEST).read_text().splitlines()
-        with tarfile.open(self.archive, "r:gz") as archive:
+        with tarfile.open(package_archive, "r:gz") as archive:
             files = [member.name for member in archive if member.isfile()]
             self.assertCountEqual(files, ["kienzlefax/" + name for name in expected])
             self.assertTrue(all(m.name.split("/")[0] == "kienzlefax" and (m.isdir() or m.isfile())
                                 for m in archive.getmembers()))
         self.package.parent.mkdir(exist_ok=True)
-        subprocess.run(["tar", "-xzf", self.archive, "-C", self.package.parent], check=True)
+        subprocess.run(["tar", "-xzf", package_archive, "-C", self.package.parent], check=True)
         for name in expected:
             self.assertEqual((self.package / name).read_bytes(), (self.work / name).read_bytes())
 
@@ -122,6 +126,16 @@ class KombiTests(unittest.TestCase):
         self.assertIn(str(self.work / "linked"), self.shell(self.work / PACK, "--output", self.archive, success=False))
         self.assertFalse(self.archive.exists())
 
+    def test_local_menu_refuses_incomplete_package(self):
+        self.pack()
+        for rel in (MOD / "extensions.sh", MANIFEST):
+            path = self.package / rel
+            path.unlink()
+            output = self.shell(self.package / "kienzlefax-installer.sh", success=False)
+            self.assertIn(str(path), output)
+            self.assertNotIn("Optionen sammeln", output)
+            shutil.copyfile(self.work / rel, path)
+
     def prepare_host(self):
         # Produktiver Pack-/Quellpfad und Modulaufrufe bleiben erhalten. Nur
         # absolute Systemziele, Root-Prüfung und externe Hostoperationen ersetzen.
@@ -133,12 +147,17 @@ class KombiTests(unittest.TestCase):
                 self.assertEqual(body.count("\nrequire_root\n"), 1)
                 body = body.replace("\nrequire_root\n", "\n:\n")
             script.write_text(body)
+        shutil.copyfile(self.package / MAIN, self.standalone)
         startup = self.tmp / "bash-env"
         write(startup, '''
 case "${0##*/}" in
   [0-9][0-9]-*.sh)
     echo "${0##*/}" >>"$TEST_TRACE"
-    case "${0##*/}" in 00-base.sh|40-web-ssl.sh) ;; *) exit 0 ;; esac ;;
+    case "${0##*/}" in
+      00-base.sh|40-web-ssl.sh) ;;
+      10-packages.sh|60-asterisk-build.sh) [ "${TEST_BUILD:-}" = y ] || exit 0 ;;
+      *) exit 0 ;;
+    esac ;;
 esac
 ''')
         self.env["BASH_ENV"] = str(startup)
@@ -172,6 +191,203 @@ esac
             write(self.cache / script.name, 'echo "ALTER CACHE"; exit 91\n')
             (self.cache / script.name).chmod(0o755)
 
+    def prepare_local_menu(self):
+        if os.environ.get("KFX_TEST_PACKAGE"):
+            self.unpack(Path(os.environ["KFX_TEST_PACKAGE"]).resolve())
+        else:
+            self.pack()
+        self.prepare_host()
+        self.env["TEST_BUILD"] = "y"
+        src = self.host / "usr/src/asterisk"
+        (src / ".git").mkdir(parents=True)
+        (src / "res").mkdir()
+        (self.host / "etc/systemd/system").mkdir(parents=True)
+        for name in ("apt-cache", "ldconfig"):
+            self.stub(name, "exit 0")
+        self.stub("apt-get", 'echo "apt-get $*" >>"$TEST_TRACE"')
+        self.stub("git", '''if [ "$PWD" = "$TEST_HOST/usr/src/asterisk" ]; then
+  case "$*" in "fetch --all --tags"|"checkout -f 20") exit 0 ;; esac
+fi
+echo "$*" >>"$TEST_BLOCKED"; exit 90''')
+        configure = src / "configure"
+        write(configure, '#!/bin/sh\n[ "$1" = --with-pjproject-bundled ]\n')
+        configure.chmod(0o755)
+        menuselect = src / "menuselect/menuselect"
+        write(menuselect, '''#!/bin/sh
+case "$1" in
+  --enable)
+    case "$2" in app_fax|format_tiff) exit 1 ;; esac
+    echo "$2" >> menuselect.makeopts ;;
+  --check-deps) exit 0 ;;
+  *) exit 1 ;;
+esac
+''')
+        menuselect.chmod(0o755)
+        self.stub("make", '''case "$1" in
+  distclean) rm -f menuselect.makeopts res/res_fax*.so ;;
+  menuselect.makeopts|menuselect) : > menuselect.makeopts ;;
+  -j*) for mod in res_fax res_fax_spandsp; do
+         if grep -Fxq "$mod" menuselect.makeopts && [ "$mod" != "${TEST_OMIT_MODULE:-}" ]; then
+           echo "Testmodul" > "res/$mod.so"
+         fi
+       done ;;
+  install) echo "make install" >>"$TEST_TRACE" ;;
+esac''')
+        self.env["TEST_MODULES"] = str(self.package / MOD)
+        # Die drei Asterisk-Konfigurationsgeneratoren laufen wirklich.
+        # Andere Projektmodule an der Grenze zur Linux-Installation protokollieren.
+        with Path(self.env["BASH_ENV"]).open("a") as f:
+            f.write('''
+case "$0" in
+  "$TEST_MODULES"/*.sh)
+    echo "$0" >>"$TEST_TRACE"
+    case "${0##*/}" in worker.sh|agi.sh|pdf_with_header.sh|scan_ocr.sh|wireguard-installer.sh) exit 0 ;; esac ;;
+esac
+''')
+
+    def test_local_menu_full_install(self):
+        self.prepare_local_menu()
+        output = self.shell(self.package / "kienzlefax-installer.sh", answers=[
+            "y", "02", "1", *FAX_ANSWERS,  # vollständiges Kienzlefax
+            "n", "", "", "", "",                  # ohne Telefoniequeue
+            "n", "y", "n", "",                    # menuselect, Build, Bericht, Git-Ref
+        ])
+        self.assertIn("1  Vollständiges Kienzlefax", output)
+        self.assertIn("2  Nur Telefoniewarteschlange", output)
+        self.assertEqual(output.count("Bitte 1 oder 2 wählen."), 2)
+        settings = self.envfile.read_text()
+        self.assertIn("KFX_QUEUE_ONLY=n", settings.splitlines())
+        self.assertIn("KFX_PHONE_QUEUE_ENABLED=n", settings)
+        trace = self.trace.read_text().splitlines()
+        self.assertIn("make install", trace)
+        for name in ("pjsip-provider.sh", "extensions.sh", "telefonie-queue.sh", "worker.sh",
+                     "agi.sh", "pdf_with_header.sh", "scan_ocr.sh"):
+            self.assertIn(str(self.package / MOD / name), trace)
+        self.assertNotIn(str(self.package / MOD / "wireguard-installer.sh"), trace)
+        self.assertIn("[fax-out]", (self.host / "etc/asterisk/extensions.conf").read_text())
+        for name in ("kienzlefax.php", "faxton.mp3"):
+            self.assertEqual((self.web / name).read_bytes(), (self.work / name).read_bytes())
+
+    def test_local_menu_queue_only(self):
+        self.prepare_local_menu()
+        self.shell(self.package / "kienzlefax-installer.sh", answers=[
+            "2", "queue-test", "", "", "", "",    # Queue-only, FQDN, SIP und RTP
+            *PHONE_ANSWERS[:2], *PHONE_ANSWERS[3:],  # ohne Fax-Kanalgrenze
+            "y", "y", "y", "",                    # WireGuard, manuelles menuselect, Build, Git-Ref
+        ])
+        settings = self.envfile.read_text()
+        self.assertIn("KFX_QUEUE_ONLY=y", settings.splitlines())
+        self.assertIn("KFX_PHONE_QUEUE_ENABLED=y", settings.splitlines())
+        trace = self.trace.read_text().splitlines()
+        self.assertIn("make install", trace)
+        packages = next(line.split() for line in trace if line.startswith("apt-get install "))
+        self.assertTrue({"libspandsp-dev", "libtiff-dev"} <= set(packages))
+        self.assertFalse({"apache2", "cups", "samba"} & set(packages))
+        selected = (self.host / "usr/src/asterisk/menuselect.makeopts").read_text().splitlines()
+        self.assertTrue({"res_fax", "res_fax_spandsp", "app_queue", "res_musiconhold"} <= set(selected))
+        for name in ("pjsip-provider.sh", "extensions.sh", "telefonie-queue.sh", "wireguard-installer.sh"):
+            self.assertIn(str(self.package / MOD / name), trace)
+        for name in ("worker.sh", "agi.sh", "pdf_with_header.sh", "scan_ocr.sh"):
+            self.assertNotIn(str(self.package / MOD / name), trace)
+        self.assertNotIn("40-web-ssl.sh", trace)
+        self.assertNotIn("50-cups-samba.sh", trace)
+        self.assertNotIn("90-worker-unit.sh", trace)
+        etc = self.host / "etc/asterisk"
+        self.assertIn("[praxis]", (etc / "queues-kfx.conf").read_text())
+        self.assertNotIn("[fax-out]", (etc / "extensions.conf").read_text())
+        self.assertEqual((self.web / "kienzlefax.php").read_text(), "ALT\n")
+        # Bei einer Wiederholung mit gespeicherten Optionen Queue-only übernehmen.
+        self.shell(self.package / MAIN, answers=["", "n", "n", "n", "y"])
+        self.assertIn("KFX_QUEUE_ONLY=y", self.envfile.read_text())
+        self.env["TEST_OMIT_MODULE"] = "res_fax_spandsp"
+        self.trace.unlink()
+        build = self.host / "usr/local/lib/kienzlefax-installer/modules/60-asterisk-build.sh"
+        self.assertIn("res/res_fax_spandsp.so fehlt", self.shell(build, success=False))
+        self.assertNotIn("make install", self.trace.read_text().splitlines())
+
+    def run_role(self, role, answers):
+        # Im Integrationstest trifft der echte Universaldialog die Auswahl und
+        # lädt seinen gespeicherten Plan vor dem Aufruf des entpackten Faxpakets.
+        universal = os.environ.get("KFX_TEST_UNIVERSAL")
+        if universal:
+            launcher = self.tmp / "kienzle-installieren.sh"
+            write(launcher, Path(universal).read_text().replace(
+                "/etc/kienzlefax-installer.env", str(self.envfile)))
+            choices = {
+                "fax": ["1", "1", "w"],
+                "fon": ["2", "4", "w", "testpraxis"],
+                "fax-fon": ["1", "1", "4", "w", "2", "testpraxis"],
+            }
+            command = """
+                source "$1"
+                fach=$2; lauf=$3
+                rollen; plan_speichern
+                unset fax fon; plan_laden
+                telefoniebasis
+            """
+            output = self.shell("-c", command, "_", launcher, self.package.parent, self.tmp,
+                                answers=[*choices[role], *answers])
+        else:
+            output = self.shell(self.package / MAIN, "--rollenplan", role, answers=answers)
+        self.assertIn("Übernommener Rollenplan: " + role, output)
+        self.assertNotIn("Betriebsart wählen", output)
+        return output
+
+    def check_role(self, role):
+        self.prepare_local_menu()
+        # Der gespeicherte Altmodus ist absichtlich entgegengesetzt.
+        queue_only = role == "fon"
+        phone = role != "fax"
+        write(self.envfile, "KFX_QUEUE_ONLY=" + ("n" if queue_only else "y") + "\n")
+        answers = ["n"] if phone else []  # WireGuard
+        answers += ["n"]                  # vorhandene Optionen wiederverwenden
+        if queue_only:
+            answers += ["queue-test", "", "", "", "", *PHONE_ANSWERS[:2], *PHONE_ANSWERS[3:],
+                        "n", "y", ""]
+        else:
+            answers += [*FAX_ANSWERS, *(PHONE_ANSWERS if phone else [""] * 4),
+                        "n", "y", "n", ""]
+        output = self.run_role(role, answers)
+        settings = self.envfile.read_text().splitlines()
+        self.assertIn("KFX_QUEUE_ONLY=" + ("y" if queue_only else "n"), settings)
+        self.assertIn("KFX_PHONE_QUEUE_ENABLED=" + ("y" if phone else "n"), settings)
+        etc = self.host / "etc/asterisk"
+        self.assertEqual("[fax-out]" in (etc / "extensions.conf").read_text(), not queue_only)
+        self.assertEqual("[praxis]" in (etc / "queues-kfx.conf").read_text(), phone)
+        self.assertEqual("Praxisqueue und Telefonieintegration für Kienzlefon geprüft." in output, phone)
+        if role == "fax-fon":
+            # Bei unveränderter Faxbetriebsart muss auch der Wechsel der Fon-Rolle greifen.
+            before = self.envfile.read_text()
+            self.shell(self.package / MAIN, "--rollenplan", "fax", answers=["n"], success=False)
+            self.assertEqual(self.envfile.read_text(), before)
+            self.run_role("fax", ["n", "n", "n", "n"])
+            settings = self.envfile.read_text()
+            self.assertIn("KFX_PHONE_QUEUE_ENABLED=n", settings.splitlines())
+            self.assertNotIn("[praxis]", (etc / "queues-kfx.conf").read_text())
+            endpoint = next(v for v in before.splitlines() if v.startswith("KFX_PHONE_ENDPOINT_201_PASSWORD="))
+            self.assertIn(endpoint, settings.splitlines())
+
+    def test_role_fax(self):
+        self.check_role("fax")
+
+    def test_role_fon(self):
+        self.check_role("fon")
+
+    def test_role_fax_and_fon(self):
+        self.check_role("fax-fon")
+
+    def test_invalid_plan_precedes_configuration(self):
+        self.pack()
+        for args in (["--rollenplan"], ["--rollenplan", "falsch"], ["--rollenplan", "fax", "fon"]):
+            with self.subTest(args=args):
+                output = self.shell(self.package / MAIN, *args, success=False)
+                self.assertIn("rollenplan", output.lower())
+                self.assertNotIn("Optionen sammeln", output)
+        bootstrap = self.cwd / "kienzlefax-installer.sh"
+        shutil.copyfile(self.package / bootstrap.name, bootstrap)
+        output = self.shell(bootstrap, "--rollenplan", "fon", success=False)
+        self.assertIn(str(self.cwd / MAIN), output)
+
     def test_public_bootstrap_and_standalone_full_install(self):
         self.pack()
         self.prepare_host()
@@ -190,8 +406,10 @@ fi
 echo "$*" >>"$TEST_BLOCKED"; exit 90''')
         for script in self.cache.glob("*.sh"):
             script.write_text('echo "$0" >>"$TEST_TRACE"\n')
-        self.shell(self.work / "kienzlefax-installer.sh", answers=[
-            FAX_ANSWERS[0], "n", *FAX_ANSWERS[1:],  # Vollinstallation
+        bootstrap = self.cwd / "kienzlefax-installer.sh"
+        shutil.copyfile(self.package / bootstrap.name, bootstrap)
+        self.shell(bootstrap, answers=[
+            "1", *FAX_ANSWERS,  # Vollinstallation
             "n", "", "", "", "",                    # Telefonie aus, Kanalgrenzen
             *([""] * 9),                             # Cache und vorhandene PHP behalten
             "n", "y", "n", "",                      # Build, Bericht, Git-Ref
@@ -274,13 +492,13 @@ echo "$*" >> "$TEST_BLOCKED"; exit 90''')
         fax = inputs(fax_provider, "fax", fax_did)
         phone = inputs(phone_provider, "phone", phone_did)
         run_options = ["", "", "", "n", *([""] * 6), "n", "y", "n"]
-        answers = ["fax-test", "n", fax[0], "", *fax[1:], "y", "", "", "1", "1",
+        answers = ["1", "fax-test", fax[0], "", *fax[1:], "y", "", "", "1", "1",
                    "", "", "", "y", "", "", "", "", "1", "n", *phone]
         if separate_provider:
             answers += ["y", *inputs(separate_provider, "out", out_did), "y"]
         else:
             answers += ["n"]
-        output = self.shell(self.package / MAIN, answers=[*answers, "n", *run_options, ""])
+        output = self.shell(self.standalone, answers=[*answers, "n", *run_options, ""])
         self.assertNotIn(secret, output)
         self.assertEqual(self.envfile.stat().st_mode & 0o777, 0o600)
         self.assertIn(f'KFX_PHONE_IN_PROVIDER="{phone_provider}"', self.envfile.read_text())
@@ -325,17 +543,17 @@ echo "$*" >> "$TEST_BLOCKED"; exit 90''')
         if separate_provider:
             stale = self.cache / "telefonie-queue.sh"
             stale.write_text("# alter Cache ohne Providerprofile\nexit 91\n")
-            output = self.shell(self.package / MAIN, answers=["n", *run_options], success=False)
+            output = self.shell(self.standalone, answers=["", "n", *run_options], success=False)
             self.assertIn("Modulcache: telefonie-queue.sh", output)
             self.assertNotIn("Module ausführen", output)
         # Regulärer Updatepfad mit separat bestätigtem Austausch der drei Generatoren.
-        self.shell(self.package / MAIN, answers=["n", "y", "y", "y", *run_options[3:]])
+        self.shell(self.standalone, answers=["", "n", "y", "y", "y", *run_options[3:]])
         for path, data in generated.items():
             self.assertEqual(path.read_bytes(), data, path.name)
         # Alle Providerwerte beim erneuten Durchlaufen des Dialogs übernehmen.
         # Erwartet: nur eine Bestätigung pro gespeichertem Passwort.
         reset = [
-            "y", "", "",                      # neu setzen, Hostname, Vollinstallation
+            "1", "y", "",                     # Vollinstallation, neu setzen, Hostname
             "", "", "", "", "",               # Faxprovider, FQDN, Auth-ID, Nummer, Passwort behalten
             "", "", "", "",                   # Registrar, Proxy, Identify, Expiration
         ]
@@ -351,7 +569,7 @@ echo "$*" >> "$TEST_BLOCKED"; exit 90''')
         reset += [""]                         # Wahl der Ausgangsleitung beibehalten
         if separate_provider:
             reset += [""] * (9 + (2 if separate_provider == "fonial" else 0))  # Phone-OUT und Kanalzählung
-        output = self.shell(self.package / MAIN, answers=[*reset, "", "", *run_options, ""])
+        output = self.shell(self.standalone, answers=[*reset, "", "", *run_options, ""])
         self.assertNotIn(secret, output)
         for path, data in generated.items():
             self.assertEqual(path.read_bytes(), data, path.name)
@@ -430,7 +648,7 @@ echo "$*" >> "$TEST_BLOCKED"; exit 90''')
             shutil.copyfile(self.package / MOD / name, self.cache / name)
         (self.package / MANIFEST).unlink()
         self.trace.unlink()
-        self.shell(self.package / MAIN, answers=["n", "", "", "", "n", "n", "y"])
+        self.shell(self.standalone, answers=["", "n", "", "", "", "n", "n", "y"])
         self.assertNotIn("40-web-ssl.sh", self.trace.read_text())
         self.assertNotIn("90-worker-unit.sh", self.trace.read_text())
         self.assertNotIn("[fax-out]", (etc / "extensions.conf").read_text())
